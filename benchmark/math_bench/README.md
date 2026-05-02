@@ -21,7 +21,8 @@ You can also place local dataset files under `--data_dir` (default: `$DELTAKV_DA
 python benchmark/math_bench/pred.py \
   --model my_model \
   --model_path /path/to/model \
-  --compressor_path /path/to/compressor_or_none \
+  --sparse_method deltakv \
+  --deltakv_checkpoint_path /path/to/compressor_or_none \
   --task gsm8k,aime2024,hmmt_nov \
   --split test \
   --data_dir /root/autodl-fs/datasets \

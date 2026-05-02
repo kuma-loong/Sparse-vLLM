@@ -56,12 +56,12 @@ llm = LLM(
     "/path/to/Qwen2.5-7B-Instruct-1M",
     tensor_parallel_size=1,
     gpu_memory_utilization=0.8,
-    chunk_prefill_size=4096,
-    vllm_sparse_method="omnikv",
+    engine_prefill_chunk_size=4096,
+    sparse_method="omnikv",
     # OmniKV knobs (simple baseline; tune as needed)
-    full_attn_layers="0,1,2,4,7,14",  # layers that run full attention (must include layer 0)
-    num_top_tokens=2096,  # top-K tokens kept for sparse layers
-    num_top_tokens_in_prefill=8192,  # top-K during prefill (defaults to num_top_tokens)
+    full_attention_layers="0,1,2,4,7,14",  # layers that run full attention (must include layer 0)
+    decode_keep_tokens=2096,  # top-K tokens kept for sparse layers
+    prefill_keep_tokens=8192,  # top-K during prefill (defaults to decode_keep_tokens)
     chunk_prefill_accel_omnikv=False,  # disable OmniKV chunk-prefill acceleration for easier comparisons
 )
 
@@ -76,10 +76,12 @@ llm.exit()
 ### Key parameters
 
 Sparse-vLLM runtime knobs are defined in `src/sparsevllm/config.py` and can be passed as keyword args to `LLM(...)`.
-For backend-agnostic DeltaKV/HF and Sparse-vLLM configs, prefer the canonical
-runtime names documented in [`docs/runtime-parameter-semantics.md`](docs/runtime-parameter-semantics.md).
-Legacy names remain supported, but canonical names fail fast on conflicting
-accuracy or speed settings.
+For backend-agnostic DeltaKV/HF and Sparse-vLLM configs, use the canonical names
+and behavior notes in the repo-wide parameter audit:
+[`docs/runtime-parameter-semantics.md`](docs/runtime-parameter-semantics.md).
+Legacy runtime names such as `chunk_prefill_size`, `vllm_sparse_method`,
+`num_top_tokens`, `model_cls`, and `compressor_path` are rejected at public
+runtime/API boundaries. Use the canonical names below.
 
 For LLaVA-OneVision visual-token experiments, see
 [`docs/llava-onevision-visual-cache-benchmarks.md`](docs/llava-onevision-visual-cache-benchmarks.md).
@@ -91,18 +93,18 @@ not DeltaKV cluster/compressor inference.
 - `tensor_parallel_size`: number of GPU ranks (processes) to spawn.
 - `gpu_memory_utilization`: fraction of total GPU memory to allocate for the KV cache.
 - `max_model_len`: max (prompt + generated) tokens allowed.
-- `engine_prefill_chunk_size`: canonical Sparse-vLLM alias for legacy `chunk_prefill_size`; controls engine prefill scheduling and memory admission.
+- `engine_prefill_chunk_size`: Sparse-vLLM prefill scheduling and memory-admission chunk size.
 - `max_num_batched_tokens`, `max_num_seqs_in_batch`, `max_decoding_seqs`: scheduler throughput/latency constraints.
 
 **Sparse knobs (method-dependent)**
 
-- `sparse_method`: canonical method selector; maps to legacy `vllm_sparse_method` on Sparse-vLLM.
-- `deltakv_checkpoint_path`: canonical DeltaKV compressor path; maps to `deltakv_path` on Sparse-vLLM and `compressor_path` on HF.
-- `sink_keep_tokens`: always-kept prefix/sink tokens; maps to `num_sink_tokens`.
-- `recent_keep_tokens`: always-kept recent tail tokens; maps to `num_recent_tokens`.
-- `decode_keep_tokens`: decode-time top/important token budget; maps to `num_top_tokens`.
-- `prefill_keep_tokens`: prefill/finalization top/important token budget; maps to `num_top_tokens_in_prefill`.
-- `full_attention_layers`: comma-separated layer indices (or list) that run full attention; maps to `full_attn_layers`.
+- `sparse_method`: method selector.
+- `deltakv_checkpoint_path`: DeltaKV compressor checkpoint directory or file.
+- `sink_keep_tokens`: always-kept prefix/sink tokens.
+- `recent_keep_tokens`: always-kept recent tail tokens.
+- `decode_keep_tokens`: decode-time top/important token budget.
+- `prefill_keep_tokens`: prefill/finalization top/important token budget.
+- `full_attention_layers`: comma-separated layer indices (or list) that run full attention.
 
 Sparse-vLLM requires explicit integer keep budgets. Ratio-style values such as
 `decode_keep_tokens=0.17` are accepted on HF paths that support ratios, but must
@@ -110,17 +112,17 @@ be converted to token counts before running Sparse-vLLM.
 
 ### Supported methods
 
-Set `vllm_sparse_method` to one of:
+Set `sparse_method` to one of:
 
-- `""` (vanilla / full attention)
+- `"vanilla"` (full attention)
 - `"streamingllm"` / `"attention-sink"` (fixed sink + recent-window physical eviction)
 - `"snapkv"`, `"pyramidkv"` (physical eviction)
 - `"omnikv"` (logical masking)
 - `"quest"` (query-aware page selection on decode; prefill stays full attention)
 - `"deltakv"` / `"deltakv-*"` (hybrid compression; optional / experimental, see [DeltaKV](#deltakv))
 
-New configs may use `sparse_method` instead; it normalizes to
-`vllm_sparse_method` for Sparse-vLLM and to `model_cls` for HF where possible.
+Sparse-vLLM internally stores this as `vllm_sparse_method`, but public commands
+and `LLM(...)` kwargs should use `sparse_method`.
 
 `quest` runtime knobs:
 
@@ -136,8 +138,8 @@ Use `scripts/bench_sparse_vllm.py` to measure TTFT, prefill throughput, decode t
 
 Notes:
 
-- Prefer `--hyper_params` to pass Sparse-vLLM `Config` values (JSON object). Flags like `--gpu_util/--chunk_size/--tp` are kept only for backward compatibility.
-- `--hyper_params` also accepts canonical runtime aliases such as `sparse_method`, `engine_prefill_chunk_size`, `decode_keep_tokens`, and `prefill_keep_tokens`; they are normalized before engine construction.
+- Prefer `--hyper_params` to pass Sparse-vLLM settings as a JSON object.
+- `--hyper_params` accepts canonical runtime names such as `sparse_method`, `engine_prefill_chunk_size`, `decode_keep_tokens`, and `prefill_keep_tokens`; legacy runtime names are rejected.
 - `--lengths` measures *prompt length*; the script sets `max_model_len = length + output_len + 100` internally.
 
 Baseline (vanilla):
@@ -167,7 +169,7 @@ python benchmark/math_bench/pred.py \
   --backend sparsevllm \
   --task aime2024 \
   --temperature 0.6 \
-  --hyper_param '{"chunk_prefill_size": 4096, "vllm_sparse_method": ""}'
+  --hyper_param '{"engine_prefill_chunk_size": 4096, "sparse_method": "vanilla"}'
 ```
 
 OmniKV:
@@ -182,7 +184,7 @@ python benchmark/math_bench/pred.py \
   --backend sparsevllm \
   --task aime2024 \
   --temperature 0.6 \
-  --hyper_param '{"chunk_prefill_size": 4096, "vllm_sparse_method": "omnikv", "chunk_prefill_accel_omnikv": false, "full_attn_layers": "0,1,2,4,7,14", "num_top_tokens": 1024}'
+  --hyper_param '{"engine_prefill_chunk_size": 4096, "sparse_method": "omnikv", "chunk_prefill_accel_omnikv": false, "full_attention_layers": "0,1,2,4,7,14", "decode_keep_tokens": 1024}'
 ```
 
 DeltaKV:
@@ -197,10 +199,11 @@ python benchmark/math_bench/pred.py \
   --backend sparsevllm \
   --task aime2024 \
   --temperature 0.6 \
-  --hyper_param '{"chunk_prefill_size": 512, "num_top_tokens_in_prefill": 16384, "max_num_batched_tokens": 8192, "max_num_seqs_in_batch": 30, "vllm_sparse_method": "deltakv-triton-v4", "chunk_prefill_accel_omnikv": true, "full_attn_layers": "0,1,2,4,7,14", "num_top_tokens": 1024, "deltakv_path": "/root/autodl-fs/checkpoints/compressor/<COMPRESSOR_DIR>", "kv_compressed_size": 256}'
+  --hyper_param '{"engine_prefill_chunk_size": 512, "prefill_keep_tokens": 16384, "max_num_batched_tokens": 8192, "max_num_seqs_in_batch": 30, "sparse_method": "deltakv-triton-v4", "chunk_prefill_accel_omnikv": true, "full_attention_layers": "0,1,2,4,7,14", "decode_keep_tokens": 1024, "deltakv_checkpoint_path": "/root/autodl-fs/checkpoints/compressor/<COMPRESSOR_DIR>", "deltakv_latent_dim": 256}'
 ```
 
-When `--backend sparsevllm`, method selection happens entirely through `--hyper_param` (`vllm_sparse_method`, `deltakv_path`, etc.). `--model_cls` and `--compressor_path` are not used by the Sparse-vLLM backend.
+When `--backend sparsevllm`, method selection happens through `sparse_method`
+and checkpoints through `deltakv_checkpoint_path`.
 
 #### LongBench with `sparsevllm` backend
 
@@ -215,10 +218,12 @@ python benchmark/long_bench/pred.py \
   --batch_size 1 \
   --backend sparsevllm \
   --task qasper,hotpotqa,multi_news \
-  --hyper_param '{"chunk_prefill_size": 4096, "vllm_sparse_method": "omnikv", "chunk_prefill_accel_omnikv": true, "num_top_tokens_in_prefill": 4096, "num_top_tokens": 2048, "full_attn_layers": "0,1,2,4,7,14", "num_recent_tokens": 128, "num_sink_tokens": 8}'
+  --hyper_param '{"engine_prefill_chunk_size": 4096, "sparse_method": "omnikv", "chunk_prefill_accel_omnikv": true, "prefill_keep_tokens": 4096, "decode_keep_tokens": 2048, "full_attention_layers": "0,1,2,4,7,14", "recent_keep_tokens": 128, "sink_keep_tokens": 8}'
 ```
 
-For a full LongBench run, simply omit `--task`. To switch to DeltaKV, keep `--backend sparsevllm` and replace the method-specific part of `--hyper_param` with `vllm_sparse_method="deltakv"` (or `deltakv-triton-v4`) plus `deltakv_path=...`.
+For a full LongBench run, omit `--task`. To switch to DeltaKV, keep
+`--backend sparsevllm` and set `sparse_method="deltakv"` (or
+`"deltakv-triton-v4"`) plus `deltakv_checkpoint_path=...`.
 
 #### LongBench with HF wrappers
 
@@ -232,12 +237,16 @@ python benchmark/long_bench/pred.py \
   --ws 1 \
   --batch_size 1 \
   --backend hf \
-  --model_cls deltakv \
-  --compressor_path "/root/autodl-fs/checkpoints/compressor/<COMPRESSOR_DIR>" \
-  --hyper_param '{"chunk_prefill_size": 2048000, "num_top_tokens_in_prefill": 4096, "chunk_prefill_accel_omnikv": true, "num_top_tokens": 0.11, "full_attn_layers": "0,1,2,4,7,14", "num_recent_tokens": 128, "num_sink_tokens": 8, "use_compression": true, "use_cluster": true, "cluster_ratio": 0.1}'
+  --sparse_method deltakv \
+  --deltakv_checkpoint_path "/root/autodl-fs/checkpoints/compressor/<COMPRESSOR_DIR>" \
+  --hyper_param '{"hf_prefill_chunk_size": 2048000, "prefill_keep_tokens": 4096, "chunk_prefill_accel_omnikv": true, "decode_keep_tokens": 0.11, "full_attention_layers": "0,1,2,4,7,14", "recent_keep_tokens": 128, "sink_keep_tokens": 8, "use_compression": true, "use_cluster": true, "deltakv_center_ratio": 0.1}'
 ```
 
-To compare other baselines, keep `--backend hf` and switch `--model_cls` / `--hyper_param`, e.g. `omnikv` with `{"chunk_prefill_size": 4096, "num_top_tokens_in_prefill": 4096, "num_top_tokens": 2048, "full_attn_layers": "0,1,2,4,7,14", "num_recent_tokens": 128, "num_sink_tokens": 8}`, `snapkv` with `{"num_top_tokens": 0.2, "pool_kernel_size": 7}`, `pyramidkv` with a similar token budget, `kivi` with `{"k_bits": 4, "v_bits": 4, "group_size": 32, "residual_length": 128}` for Llama/Mistral checkpoints, or `kvzip` with `{"ratio": 0.3, "level": "pair", "kv_type": "evict", "prefill_chunk_size": 16000}`.
+To compare other baselines, keep `--backend hf` and switch `--sparse_method` /
+`--hyper_param`, e.g. `omnikv` with
+`{"hf_prefill_chunk_size":4096,"prefill_keep_tokens":4096,"decode_keep_tokens":2048,"full_attention_layers":"0,1,2,4,7,14","recent_keep_tokens":128,"sink_keep_tokens":8}`,
+`snapkv` with `{"decode_keep_tokens":0.2,"pool_kernel_size":7}`, or `kvzip`
+with `{"ratio":0.3,"level":"pair","kv_type":"evict","prefill_chunk_size":16000}`.
 
 For `kvzip`, the vendored baseline lives in `baselines/kvzip/`. Build its CUDA extension first:
 
@@ -254,19 +263,20 @@ speed/quality/perf trade-offs are still under active iteration.
 
 ### DeltaKV inference
 
-Set `vllm_sparse_method` to one of:
+Set `sparse_method` to one of:
 
 - `"deltakv"`
 - `"deltakv-triton"`, `"deltakv-triton-v2"`, `"deltakv-triton-v3"`, `"deltakv-triton-v4"`
 - `"deltakv-triton-v3-offload"` / `"deltakv-triton-v3-cuda-offload"`
 
-For DeltaKV inference, also pass `deltakv_path="/path/to/trained_compressor_dir_or_file"`.
+For DeltaKV inference, also pass
+`deltakv_checkpoint_path="/path/to/trained_compressor_dir_or_file"`.
 
 DeltaKV knobs you may need:
 
-- `deltakv_path`: path to trained compressor weights (directory containing `*.safetensors`/`*.pt`/`*.bin`, or a single file).
-- `kv_compressed_size`: latent dimension of compressed KV.
-- `cluster_ratio`, `cluster_metric`: reference selection / clustering behavior (method variants may use these differently).
+- `deltakv_checkpoint_path`: path to trained compressor weights (directory containing `*.safetensors`/`*.pt`/`*.bin`, or a single file).
+- `deltakv_latent_dim`: latent dimension of compressed KV.
+- `deltakv_center_ratio`, `cluster_metric`: reference selection / clustering behavior.
 - `deltakv_offload_latent`: offload latent cache to CPU (enabled automatically by `*-offload` methods).
 - `deltakv_offload_cpu_threads`: CPU gather thread count for offload mode.
 
@@ -284,8 +294,9 @@ python src/deltakv/train_compressor.py \
   --model_name_or_path <PATH_TO_BASE_MODEL> \
   --dataset_path <PATH_TO_DATASET_ON_DISK> \
   --output_dir <PATH_TO_OUTPUT_CHECKPOINT_DIR> \
-  --kv_compressed_size 512 \
-  --seq_chunk_size 4 \
+  --deltakv_latent_dim 512 \
+  --compressor_token_group_size 1 \
+  --deltakv_neighbor_count 4 \
   --layer_chunk_size 1 \
   --batch_size 1 \
   --warmup_ratio 0.02 \
@@ -304,7 +315,9 @@ python src/deltakv/train_compressor.py \
 
 Common knobs:
 
-- `--kv_compressed_size`: compressed KV length (smaller = more compression)
+- `--deltakv_latent_dim`: compressed KV latent width (smaller = more compression)
+- `--compressor_token_group_size`: token grouping for non-cluster compressor references.
+- `--deltakv_neighbor_count`: number of selected ref/center tokens for cluster DeltaKV.
 - `--model_type`: `e2e`, `cluster_e2e`, `cluster_e2e_big` (see `src/deltakv/train_compressor.py`)
 - `--collect_kv_before_rope`: whether to collect KV before RoPE (model-dependent)
 
@@ -320,22 +333,22 @@ python benchmark/long_bench/pred.py \
   --ws 1 \
   --batch_size 1 \
   --backend hf \
-  --model_cls deltakv \
-  --compressor_path "<PATH_TO_TRAINED_COMPRESSOR_DIR>" \
-  --hyper_param '{"chunk_prefill_size": 2048000, "num_top_tokens_in_prefill": 4096,
-  "chunk_prefill_accel_omnikv": true, "num_top_tokens": 0.17, "full_attn_layers": "0,1,2,8,18",
-  "num_recent_tokens": 128, "num_sink_tokens": 8, "use_compression": true, "use_cluster": true, "cluster_ratio": 0.1}'
+  --sparse_method deltakv \
+  --deltakv_checkpoint_path "<PATH_TO_TRAINED_COMPRESSOR_DIR>" \
+  --hyper_param '{"hf_prefill_chunk_size": 2048000, "prefill_keep_tokens": 4096,
+  "chunk_prefill_accel_omnikv": true, "decode_keep_tokens": 0.17, "full_attention_layers": "0,1,2,8,18",
+  "recent_keep_tokens": 128, "sink_keep_tokens": 8, "use_compression": true, "use_cluster": true, "deltakv_center_ratio": 0.1}'
 ```
 
 Notes:
 
 - `--backend` supports `hf` and `sparsevllm` (see `benchmark/long_bench/pred.py`).
 - `--hyper_param` accepts either a JSON string or a path to a JSON file.
-- `full_attn_layers` is passed as a comma-separated string of layer indices (example: `"0,1,2,8,18"`).
+- `full_attention_layers` is passed as a comma-separated string of layer indices (example: `"0,1,2,8,18"`).
 
 ### DeltaKV checkpoints
 
-- `deltakv_path` can point to either a directory (the loader scans `*.safetensors` first, then `*.bin`/`*.pt`) or a single checkpoint file.
+- `deltakv_checkpoint_path` can point to either a directory (the loader scans `*.safetensors` first, then `*.bin`/`*.pt`) or a single checkpoint file.
 - Split-KV checkpoints (`k_compress_*` / `v_compress_*`) are currently not supported by the Sparse-vLLM loader.
 
 ### CUDA gather extension (only for `*-cuda-offload`)
@@ -365,7 +378,7 @@ Try one or more of:
 
 - Increase `gpu_memory_utilization`.
 - Reduce `max_model_len`, `batch_sizes`, or prompt length.
-- Reduce `num_recent_tokens` / `num_top_tokens` / `num_sink_tokens` for long-context methods.
+- Reduce `recent_keep_tokens` / `decode_keep_tokens` / `sink_keep_tokens` for long-context methods.
 
 ## Acknowledgements
 

@@ -185,9 +185,9 @@ def load_model_and_tokenizer(rank: int, args):
     generate_fn = get_generate_api(
         model_path=args.model_path,
         infer_config=infer_config,
-        compressor_path=args.compressor_path,
+        deltakv_checkpoint_path=args.deltakv_checkpoint_path,
         tokenizer_path=args.tokenizer_path,
-        model_cls=args.model_cls,
+        sparse_method=args.sparse_method,
         cuda_device=rank,
         backend=args.backend,
     )
@@ -229,7 +229,7 @@ def get_pred(rank: int, data, dataset: str, args, model, tokenizer, out_path: st
             problem = _get_problem_text(example, dataset)
             prompt = prompt_format.format(problem=problem)
 
-            if args.model_cls == "kvzip" and args.backend == "hf":
+            if args.sparse_method == "kvzip" and args.backend == "hf":
                 prompt_parts = build_kvzip_prompt_parts(tokenizer, prompt, args.no_chat_template)
                 if prompt_parts is not None:
                     query_ids = tokenizer(
@@ -376,10 +376,10 @@ def parse_args():
 
     # DeltaKV related arguments (aligned with benchmark/long_bench/pred.py)
     parser.add_argument("--model_path", type=str, required=True)
-    parser.add_argument("--compressor_path", type=str, default=None)
+    parser.add_argument("--deltakv_checkpoint_path", type=str, default=None)
     parser.add_argument("--tokenizer_path", type=str, default=None)
-    parser.add_argument("--model_cls", type=str, default="deltakv")
-    parser.add_argument("--backend", type=str, default="deltakv", choices=["hf", "sparsevllm"])
+    parser.add_argument("--sparse_method", type=str, default="deltakv")
+    parser.add_argument("--backend", type=str, default="hf", choices=["hf", "sparsevllm"])
     parser.add_argument("--num_samples", type=int, default=None, help="Limit number of samples per task")
     parser.add_argument("--batch_size", type=int, default=1, help="Batch size for inference")
     parser.add_argument("--no_chat_template", action="store_true", help="Do not use chat template")
@@ -403,13 +403,13 @@ if __name__ == "__main__":
         raise ValueError(f"--temperature must be within [0.5, 0.7], got {args.temperature}")
 
     model_name = args.model
-    compressor_name = os.path.basename(args.compressor_path.rstrip("/")) if args.compressor_path else "None"
+    compressor_name = os.path.basename(args.deltakv_checkpoint_path.rstrip("/")) if args.deltakv_checkpoint_path else "None"
 
     datasets = [d.strip() for d in args.task.split(",") if d.strip()]
-    if args.model_cls == "kvzip" and "aime2024" in datasets:
+    if args.sparse_method == "kvzip" and "aime2024" in datasets:
         raise AssertionError(
             "KVzip is disabled for aime2024 in math_bench. "
-            "Use another model_cls or remove aime2024 from --task."
+            "Use another sparse_method or remove aime2024 from --task."
         )
     time_tag = datetime.now().strftime("%m%d_%H%M")
     out_root = os.path.join(BASE_PATH, f"benchmark/math_bench/pred/{model_name}/{compressor_name}_{time_tag}")

@@ -17,7 +17,7 @@ PYTHON = "/home/haojitai/miniconda3/envs/svllm/bin/python"
 
 QWEN_MODEL_PATH = "/home/haojitai/models/Qwen2.5-7B-Instruct-1M"
 QWEN_TOKENIZER_PATH = QWEN_MODEL_PATH
-QWEN_COMPRESSOR_PATH = (
+QWEN_DELTAKV_CHECKPOINT_PATH = (
     "/home/haojitai/checkpoints/compressor/"
     "cluster_e2e_cs256_biasFalse_l2_ratio0.1_clusMean_before_rope_lr0.0002_"
     "cdownmlp_swiglud3072_cuplinear_0125_222950"
@@ -25,7 +25,7 @@ QWEN_COMPRESSOR_PATH = (
 LONG_BENCH_DATA_ROOT = "/home/haojitai/datasets/LongBench"
 
 LLAMA_MODEL_PATH = "/home/haojitai/models/Llama-3.1-8B-Instruct"
-LLAMA_COMPRESSOR_PATH = (
+LLAMA_DELTAKV_CHECKPOINT_PATH = (
     "/home/haojitai/checkpoints/compressor/"
     "cluster_e2e_cs512_biasFalse_l2_ratio0.1_clusMean_before_rope_lr0.0002_"
     "cdownmlp_swiglud3072_cuplinear_0125_051527"
@@ -76,36 +76,36 @@ def qwen_scbench_job_name(task_group: str, alpha: float) -> str:
 
 def qwen_deltakv_hyper_param(alpha: float) -> dict[str, Any]:
     return {
-        "chunk_prefill_size": 32768,
-        "num_top_tokens_in_prefill": 4096,
+        "hf_prefill_chunk_size": 32768,
+        "prefill_keep_tokens": 4096,
         "chunk_prefill_accel_omnikv": False,
         "deltakv_use_omnikv_selection": True,
-        "num_top_tokens": 0.11,
-        "full_attn_layers": QWEN_FULL_ATTN_LAYERS,
-        "num_recent_tokens": 128,
-        "num_sink_tokens": 8,
+        "decode_keep_tokens": 0.11,
+        "full_attention_layers": QWEN_FULL_ATTN_LAYERS,
+        "recent_keep_tokens": 128,
+        "sink_keep_tokens": 8,
         "use_compression": True,
         "use_cluster": True,
-        "cluster_ratio": 0.1,
+        "deltakv_center_ratio": 0.1,
         "stride_alpha": alpha,
     }
 
 
 def llama_deltakv_hyper_param(token_budget: float) -> dict[str, Any]:
     return {
-        "model_cls": "deltakv",
-        "compressor_path": LLAMA_COMPRESSOR_PATH,
-        "chunk_prefill_size": 32768,
-        "num_top_tokens_in_prefill": token_budget,
+        "sparse_method": "deltakv",
+        "deltakv_checkpoint_path": LLAMA_DELTAKV_CHECKPOINT_PATH,
+        "hf_prefill_chunk_size": 32768,
+        "prefill_keep_tokens": token_budget,
         "chunk_prefill_accel_omnikv": False,
         "deltakv_use_omnikv_selection": True,
-        "num_top_tokens": token_budget,
-        "full_attn_layers": LLAMA_FULL_ATTN_LAYERS,
-        "num_recent_tokens": 128,
-        "num_sink_tokens": 8,
+        "decode_keep_tokens": token_budget,
+        "full_attention_layers": LLAMA_FULL_ATTN_LAYERS,
+        "recent_keep_tokens": 128,
+        "sink_keep_tokens": 8,
         "use_compression": True,
         "use_cluster": True,
-        "cluster_ratio": 0.1,
+        "deltakv_center_ratio": 0.1,
         "stride_alpha": 0.0,
     }
 
@@ -200,10 +200,10 @@ def build_command(job: Job, ws: int | str) -> list[str]:
             "1",
             "--backend",
             "hf",
-            "--model_cls",
+            "--sparse_method",
             "deltakv",
-            "--compressor_path",
-            QWEN_COMPRESSOR_PATH,
+            "--deltakv_checkpoint_path",
+            QWEN_DELTAKV_CHECKPOINT_PATH,
             "--temperature",
             "0",
             "--top_p",
@@ -239,8 +239,8 @@ def build_command(job: Job, ws: int | str) -> list[str]:
             "--hyper_param",
             json.dumps(
                 {
-                    "model_cls": "deltakv",
-                    "compressor_path": QWEN_COMPRESSOR_PATH,
+                    "sparse_method": "deltakv",
+                    "deltakv_checkpoint_path": QWEN_DELTAKV_CHECKPOINT_PATH,
                     **qwen_deltakv_hyper_param(job.stride_alpha),
                 },
                 ensure_ascii=False,
@@ -273,8 +273,8 @@ def build_command(job: Job, ws: int | str) -> list[str]:
             "--hyper_param",
             json.dumps(
                 {
-                    "model_cls": "deltakv",
-                    "compressor_path": QWEN_COMPRESSOR_PATH,
+                    "sparse_method": "deltakv",
+                    "deltakv_checkpoint_path": QWEN_DELTAKV_CHECKPOINT_PATH,
                     **qwen_deltakv_hyper_param(job.stride_alpha),
                 },
                 ensure_ascii=False,
@@ -307,8 +307,8 @@ def build_command(job: Job, ws: int | str) -> list[str]:
             "--hyper_param",
             json.dumps(
                 {
-                    "model_cls": "deltakv",
-                    "compressor_path": QWEN_COMPRESSOR_PATH,
+                    "sparse_method": "deltakv",
+                    "deltakv_checkpoint_path": QWEN_DELTAKV_CHECKPOINT_PATH,
                     **qwen_deltakv_hyper_param(job.stride_alpha),
                 },
                 ensure_ascii=False,

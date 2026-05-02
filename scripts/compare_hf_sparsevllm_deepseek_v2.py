@@ -154,7 +154,7 @@ def run_sparsevllm_generation(
     max_new_tokens: int,
     batch_size: int,
     max_model_len: int,
-    chunk_prefill_size: int,
+    engine_prefill_chunk_size: int,
     gpu_memory_utilization: float,
 ) -> list[str]:
     torch.manual_seed(42)
@@ -164,7 +164,7 @@ def run_sparsevllm_generation(
         model_path,
         enforce_eager=True,
         max_model_len=max_model_len,
-        chunk_prefill_size=chunk_prefill_size,
+        engine_prefill_chunk_size=engine_prefill_chunk_size,
         gpu_memory_utilization=gpu_memory_utilization,
     )
 
@@ -198,7 +198,7 @@ def main():
     parser.add_argument("--max_new_tokens", type=int, default=32)
     parser.add_argument("--batch_size", type=int, default=8)
     parser.add_argument("--max_model_len", type=int, default=121000)
-    parser.add_argument("--chunk_prefill_size", type=int, default=16384)
+    parser.add_argument("--engine_prefill_chunk_size", type=int, default=16384)
     parser.add_argument("--target_prompt_tokens", type=int, default=None)
     parser.add_argument("--gpu_memory_utilization", type=float, default=0.8)
     parser.add_argument("--no_chat_template", action="store_true")
@@ -229,7 +229,7 @@ def main():
         max_new_tokens=args.max_new_tokens,
         batch_size=args.batch_size,
         max_model_len=args.max_model_len,
-        chunk_prefill_size=args.chunk_prefill_size,
+        engine_prefill_chunk_size=args.engine_prefill_chunk_size,
         gpu_memory_utilization=args.gpu_memory_utilization,
     )
 
@@ -262,7 +262,7 @@ def main():
         "max_new_tokens": args.max_new_tokens,
         "batch_size": args.batch_size,
         "max_model_len": args.max_model_len,
-        "chunk_prefill_size": args.chunk_prefill_size,
+        "engine_prefill_chunk_size": args.engine_prefill_chunk_size,
         "target_prompt_tokens": args.target_prompt_tokens,
         "raw_exact_matches": raw_exact_matches,
         "normalized_exact_matches": normalized_exact_matches,

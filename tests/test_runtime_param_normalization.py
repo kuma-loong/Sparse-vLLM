@@ -25,8 +25,8 @@ class RuntimeParamNormalizationTest(unittest.TestCase):
             backend="sparsevllm",
         )
 
-        self.assertIsNone(normalized.model_cls)
-        self.assertIsNone(normalized.compressor_path)
+        self.assertIsNone(normalized.hf_model_cls)
+        self.assertIsNone(normalized.hf_deltakv_checkpoint_path)
         self.assertEqual(
             normalized.infer_config,
             {
@@ -64,8 +64,8 @@ class RuntimeParamNormalizationTest(unittest.TestCase):
             backend="hf",
         )
 
-        self.assertEqual(normalized.model_cls, "deltakv")
-        self.assertEqual(normalized.compressor_path, "/tmp/compressor")
+        self.assertEqual(normalized.hf_model_cls, "deltakv")
+        self.assertEqual(normalized.hf_deltakv_checkpoint_path, "/tmp/compressor")
         self.assertEqual(
             normalized.infer_config,
             {
@@ -74,19 +74,28 @@ class RuntimeParamNormalizationTest(unittest.TestCase):
                 "num_sink_tokens": 8,
                 "num_recent_tokens": 128,
                 "full_attn_layers": "0,1,2,8,18",
-                "k_neighbors": 4,
+                "deltakv_neighbor_count": 4,
                 "cluster_ratio": 0.1,
                 "kv_compressed_size": 256,
                 "chunk_prefill_size": 32768,
             },
         )
 
-    def test_conflicting_alias_values_raise(self):
-        with self.assertRaisesRegex(ValueError, "decode_keep_tokens"):
-            normalize_runtime_params(
-                {"decode_keep_tokens": 2048, "num_top_tokens": 4096},
-                backend="sparsevllm",
-            )
+    def test_legacy_runtime_names_raise(self):
+        for key in (
+            "model_cls",
+            "vllm_sparse_method",
+            "compressor_path",
+            "deltakv_path",
+            "num_top_tokens",
+            "chunk_prefill_size",
+            "seq_chunk_size",
+            "k_neighbors",
+            "deltakv_visual_compress_only",
+        ):
+            with self.subTest(key=key):
+                with self.assertRaisesRegex(ValueError, "Legacy runtime parameter"):
+                    normalize_runtime_params({key: "x"}, backend="sparsevllm")
 
     def test_sparsevllm_vanilla_alias_maps_to_empty_method(self):
         normalized = normalize_runtime_params({"sparse_method": "vanilla"}, backend="sparsevllm")
@@ -116,24 +125,18 @@ class RuntimeParamNormalizationTest(unittest.TestCase):
         self.assertEqual(cfg.tail_token_size, 128)
         self.assertEqual(cfg.num_sink_tokens, 8)
         self.assertEqual(cfg.full_attn_layers, [0, 1, 2])
-        self.assertEqual(cfg.k_neighbors, 3)
+        self.assertEqual(cfg.deltakv_neighbor_count, 3)
         self.assertEqual(cfg.chunk_prefill_size, 32768)
         self.assertTrue(cfg.visual_token_prune_only)
         self.assertEqual(cfg.visual_token_keep_ratio, 0.1)
-        self.assertTrue(cfg.deltakv_visual_compress_only)
-        self.assertEqual(cfg.deltakv_visual_keep_ratio, 0.1)
 
-    def test_hf_config_normalizes_legacy_visual_prune_aliases(self):
+    def test_hf_config_rejects_legacy_visual_prune_aliases(self):
         cfg = KVQwen2Config()
-        cfg.set_infer_args(
-            deltakv_visual_compress_only=True,
-            deltakv_visual_keep_ratio=0.25,
-        )
-
-        self.assertTrue(cfg.visual_token_prune_only)
-        self.assertEqual(cfg.visual_token_keep_ratio, 0.25)
-        self.assertTrue(cfg.deltakv_visual_compress_only)
-        self.assertEqual(cfg.deltakv_visual_keep_ratio, 0.25)
+        with self.assertRaisesRegex(ValueError, "Legacy runtime parameter"):
+            cfg.set_infer_args(
+                deltakv_visual_compress_only=True,
+                deltakv_visual_keep_ratio=0.25,
+            )
 
 
 if __name__ == "__main__":

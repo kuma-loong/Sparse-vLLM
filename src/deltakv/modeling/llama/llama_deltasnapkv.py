@@ -443,7 +443,7 @@ class LlamaDeltaSnapKVModel(LlamaModel):
         super().__init__(config)
         full_layers = parse_full_attn_layers(config.full_attn_layers)
         assert len(full_layers) == 0, (
-            "deltasnapkv requires full_attn_layers to be empty; "
+            "deltasnapkv requires full_attention_layers to be empty; "
             "this implementation assumes all decoder layers use the same static-prune path."
         )
         config.full_attn_layers = []

@@ -1,5 +1,12 @@
 # Explanation of Code Changes in `add-baseline` Relative to `main`
 
+> Historical note: this document describes the older `add-baseline` branch
+> before the runtime-parameter cleanup. Names such as `model_cls`,
+> `compressor_path`, `vllm_sparse_method`, `chunk_prefill_size`,
+> `num_top_tokens`, `seq_chunk_size`, and `k_neighbors` are historical names in
+> this comparison document. New runtime commands and configs must use the
+> canonical names documented in `docs/runtime-parameter-semantics.md`.
+
 ## 1. Comparison Scope and Overall Conclusion
 
 This document compares the current branch `add-baseline` against `main`, specifically:

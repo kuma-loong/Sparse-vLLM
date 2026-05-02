@@ -15,7 +15,7 @@ class OriginResidualQuantCompressedKVCache(CompressedKVCache):
 
     def _build_chunk_bases(self, kv_states: torch.Tensor) -> torch.Tensor:
         bs, seq_len, kv_dim = kv_states.shape
-        kv_chunks = kv_states.view(bs, -1, self.config.seq_chunk_size, kv_dim)
+        kv_chunks = kv_states.view(bs, -1, self.config.compressor_token_group_size, kv_dim)
         if self.config.ref_mode == "avg":
             bases = kv_chunks.mean(dim=2, keepdim=True)
         elif self.config.ref_mode == "first":
@@ -36,7 +36,7 @@ class OriginResidualQuantCompressedKVCache(CompressedKVCache):
             residual = self.comp_kv_cache[layer_idx]
 
         bases = self.bases_cache[layer_idx]
-        bases = bases.repeat_interleave(self.config.seq_chunk_size, dim=1)[:, : residual.shape[1]]
+        bases = bases.repeat_interleave(self.config.compressor_token_group_size, dim=1)[:, : residual.shape[1]]
         recon_kv = (residual + bases).view(residual.shape[0], -1, 2, k_dim)
         return recon_kv[:, :, 0], recon_kv[:, :, 1]
 
@@ -80,9 +80,9 @@ class OriginResidualQuantCompressedKVCache(CompressedKVCache):
         compress_len = (buffer_len - self.tail_token_size) // self.tail_token_size * self.tail_token_size
         if compress_len <= 0:
             return
-        if compress_len % self.config.seq_chunk_size != 0:
+        if compress_len % self.config.compressor_token_group_size != 0:
             raise ValueError(
-                f"compress_len={compress_len} must be divisible by seq_chunk_size={self.config.seq_chunk_size}"
+                f"compress_len={compress_len} must be divisible by compressor_token_group_size={self.config.compressor_token_group_size}"
             )
 
         key_hist, self.buffer_key_cache[layer_idx] = (
@@ -96,7 +96,7 @@ class OriginResidualQuantCompressedKVCache(CompressedKVCache):
 
         kv_hist = torch.cat([key_hist, value_hist], dim=-1)
         bases = self._build_chunk_bases(kv_hist)
-        bases_per_token = bases.repeat_interleave(self.config.seq_chunk_size, dim=1)[:, : kv_hist.shape[1]]
+        bases_per_token = bases.repeat_interleave(self.config.compressor_token_group_size, dim=1)[:, : kv_hist.shape[1]]
         residual = kv_hist - bases_per_token
 
         if self.config.kv_quant_bits == 4:
@@ -231,7 +231,7 @@ class OriginResidualQuantClusterCompressedKVCache(ClusterCompressedKVCache):
         full_mask = torch.cat([mask_existing, mask_new], dim=1)
         scores = scores.masked_fill(~full_mask.unsqueeze(0), float("-inf"))
 
-        k = self.config.get_cluster_k_neighbors()
+        k = self.config.get_cluster_neighbor_count()
         _, topk_indices = torch.topk(scores, k=min(k, all_centers.shape[1]), dim=-1)
 
         indices = topk_indices.view(bs, -1)[:, :, None].expand(-1, -1, kv_dim)

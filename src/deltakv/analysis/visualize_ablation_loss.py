@@ -26,9 +26,9 @@ DEFAULT_BS = 8
 
 DEFAULTS = {
     'kv_size': 512,
-    'seq_chunk': 4,
+    'neighbor_count': 4,
     'inter_size': 4096,
-    'cluster_ratio': 0.1
+    'center_ratio': 0.1
 }
 
 def export_data():
@@ -68,9 +68,12 @@ def export_data():
 
         run_data.append({
             'kv_size': config.get("kv_compressed_size"),
-            'seq_chunk': config.get("k_neighbors", config.get("seq_chunk_size")),
+            'neighbor_count': config.get(
+                "deltakv_neighbor_count",
+                config.get("k_neighbors", config.get("seq_chunk_size")),
+            ),
             'inter_size': config.get("compressor_intermediate_size"),
-            'cluster_ratio': config.get("cluster_ratio"),
+            'center_ratio': config.get("deltakv_center_ratio", config.get("cluster_ratio")),
             'deltakv_path': deltakv_path,
             'final_loss': float(final_loss),
             'throughput': None
@@ -102,7 +105,7 @@ def run_benchmarks():
     subprocess.run(["git", "pull"], check=False)
 
     # 确定消融任务列表
-    ablation_params = ['kv_size', 'seq_chunk', 'inter_size', 'cluster_ratio']
+    ablation_params = ['kv_size', 'neighbor_count', 'inter_size', 'center_ratio']
     tasks = []
     # 使用 set 记录已经加入的任务 deltakv_path，避免重复测试 (比如 baseline 配置在每个维度都会出现)
     seen_paths = set()
@@ -132,16 +135,16 @@ def run_benchmarks():
         # 构造 hyper_params 参数，确保所有消融参数与训练时一致
         hp = {
             "gpu_memory_utilization": 0.9,
-            "kv_compressed_size": int(row['kv_size']),
-            "deltakv_k_neighbors": int(row['seq_chunk']),
+            "deltakv_latent_dim": int(row['kv_size']),
+            "deltakv_neighbor_count": int(row['neighbor_count']),
             "compressor_intermediate_size": int(row['inter_size']),
-            "cluster_ratio": float(row['cluster_ratio']),
-            "num_top_tokens": 2048,
-            "deltakv_path": row['deltakv_path'],
-            "full_attn_layers": "0,1,2,8,18",
+            "deltakv_center_ratio": float(row['center_ratio']),
+            "decode_keep_tokens": 2048,
+            "deltakv_checkpoint_path": row['deltakv_path'],
+            "full_attention_layers": "0,1,2,8,18",
             "deltakv_full_pool_reserve_ratio": 0.1,
             "max_num_batched_tokens": DEFAULT_BS*4096,
-            "chunk_prefill_size": 4096,
+            "engine_prefill_chunk_size": 4096,
             "max_num_seqs_in_batch": DEFAULT_BS,
         }
         
@@ -184,9 +187,9 @@ def plot_data():
     
     ablation_params = [
         ('kv_size', 'Compressed KV Size'),
-        ('seq_chunk', 'Num of Ref Tokens'),
+        ('neighbor_count', 'Num of Ref Tokens'),
         ('inter_size', 'Compressor Inter Size'),
-        ('cluster_ratio', 'Reference Stride')
+        ('center_ratio', 'Reference Center Ratio')
     ]
 
     plt.style.use('seaborn-v0_8-whitegrid')
@@ -215,7 +218,7 @@ def plot_data():
                 mask &= (df[other_col] == def_val_loop)
         
         plot_df = df[mask].copy()
-        if col == 'cluster_ratio':
+        if col == 'center_ratio':
             plot_df[col] = 1.0 / plot_df[col]
             
         plot_df = plot_df.sort_values(col)
@@ -229,7 +232,7 @@ def plot_data():
         
         # 标记默认值点
         def_val = DEFAULTS[col]
-        if col == 'cluster_ratio':
+        if col == 'center_ratio':
             def_val = 1.0 / def_val
         def_row = plot_df[plot_df[col] == def_val]
         if not def_row.empty:

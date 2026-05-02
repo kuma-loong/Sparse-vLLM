@@ -19,9 +19,7 @@ class BaseCache(DynamicCache):
         self.top_token_idx = {}
         self.token_scores = {}
         self.num_prompt_tokens = None
-        self.visual_token_prune_only = bool(
-            getattr(config, "visual_token_prune_only", getattr(config, "deltakv_visual_compress_only", False))
-        )
+        self.visual_token_prune_only = bool(getattr(config, "visual_token_prune_only", False))
         self.visual_compress_only = self.visual_token_prune_only
 
     def get_seq_length(self, layer_idx: Optional[int] = 0) -> int:
@@ -108,10 +106,7 @@ class BaseCache(DynamicCache):
         if visual_idx.numel() == 0:
             return visual_idx, visual_idx
 
-        keep_ratio = float(
-            getattr(self.config, "visual_token_keep_ratio", getattr(self.config, "deltakv_visual_keep_ratio", 1.0))
-            or 0.0
-        )
+        keep_ratio = float(getattr(self.config, "visual_token_keep_ratio", 1.0) or 0.0)
         keep_ratio = max(0.0, min(1.0, keep_ratio))
         if keep_ratio >= 1.0:
             return visual_idx, visual_idx
@@ -254,7 +249,7 @@ class CompressedKVCache(BaseCache):
         bs, seq_len, kv_dim = kv_states.shape
         # kv_states shape: (bs, seq_len, kv_dim)
         # Reshape to chunks: (bs, num_chunks, chunk_size, kv_dim)
-        kv_chunks = kv_states.view(bs, -1, self.config.seq_chunk_size, kv_dim)
+        kv_chunks = kv_states.view(bs, -1, self.config.compressor_token_group_size, kv_dim)
 
         # ref_mode='avg': use the mean of each chunk as base
         # bases_states shape: (bs, num_chunks, 1, kv_dim)
@@ -302,7 +297,7 @@ class CompressedKVCache(BaseCache):
             bases = self.bases_cache[layer_idx]
             # `comp_kv` is stored per token while `bases` is stored per chunk.
             # Expand chunk-level bases back to token resolution before reconstruction.
-            bases = bases.repeat_interleave(self.config.seq_chunk_size, dim=1)[:, : comp_kv.shape[1]]
+            bases = bases.repeat_interleave(self.config.compressor_token_group_size, dim=1)[:, : comp_kv.shape[1]]
             recon_kv = (compressor_up(comp_kv) + bases).view(bs, -1, 2, k_dim)
             return recon_kv[:, :, 0], recon_kv[:, :, 1]
 
@@ -378,7 +373,7 @@ class CompressedKVCache(BaseCache):
                     comp_kv, bases = self.comp_kv_cache[layer_idx], self.bases_cache[layer_idx]
 
                     imp_kv = comp_kv.gather(1, rel_token_idx[:, :, None].expand(-1, -1, comp_kv.shape[-1]))
-                    bases_idx = rel_token_idx // self.config.seq_chunk_size
+                    bases_idx = rel_token_idx // self.config.compressor_token_group_size
                     imp_bases = bases.gather(1, bases_idx[:, :, None].expand(-1, -1, bases.shape[-1]))
                     if os.getenv('REMOVE_COMP'):
                         recon_kv = imp_bases.view(bs, -1, 2, k_dim)
@@ -447,7 +442,7 @@ class CompressedKVCache(BaseCache):
                     device=key_states.device,
                 )
                 if self.config.use_compression:
-                    usable_len = (compress_idx.numel() // self.config.seq_chunk_size) * self.config.seq_chunk_size
+                    usable_len = (compress_idx.numel() // self.config.compressor_token_group_size) * self.config.compressor_token_group_size
                     compress_idx = compress_idx[:usable_len]
             else:
                 compress_len = (buffer_len - self.tail_token_size) // self.tail_token_size * self.tail_token_size
@@ -684,7 +679,7 @@ class ClusterCompressedKVCache(CompressedKVCache):
         scores = scores.masked_fill(~full_mask.unsqueeze(0), float('-inf'))
 
         # 4. 选取 Top-K 中心
-        k = self.config.get_cluster_k_neighbors()
+        k = self.config.get_cluster_neighbor_count()
         topk_scores, topk_indices = torch.topk(scores, k=min(k, all_centers.shape[1]), dim=-1)
 
         # 5. 计算参考基 (均值)

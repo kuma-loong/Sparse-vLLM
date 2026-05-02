@@ -4,7 +4,7 @@ set -euo pipefail
 TAG="${1:-$(date +%m%d_%H%M%S)}"
 TASKS="scbench_kv,scbench_qa_eng,scbench_summary_with_needles"
 MODEL_PATH="/root/autodl-fs/models/Qwen2.5-7B-Instruct-1M"
-COMPRESSOR_PATH="/root/autodl-fs/checkpoints/compressor/cluster_e2e_cs256_biasFalse_l2_ratio0.1_clusMean_before_rope_lr0.0002_cdownmlp_swiglud3072_cuplinear_0125_222950"
+DELTAKV_CHECKPOINT_PATH="/root/autodl-fs/checkpoints/compressor/cluster_e2e_cs256_biasFalse_l2_ratio0.1_clusMean_before_rope_lr0.0002_cdownmlp_swiglud3072_cuplinear_0125_222950"
 
 KVZIP_LOG="/root/autodl-fs/bench_logs/scbench_three_kvzip_${TAG}.log"
 DELTAKV_LOG="/root/autodl-fs/bench_logs/scbench_three_deltakv_${TAG}.log"
@@ -30,16 +30,16 @@ echo "[START] kvzip $(date)"
   --kv_type retain 2>&1 | tee "${KVZIP_LOG}"
 
 DELTAKV_HYPER_PARAM='{
-  "compressor_path": "'"${COMPRESSOR_PATH}"'",
+  "deltakv_checkpoint_path": "'"${DELTAKV_CHECKPOINT_PATH}"'",
   "use_cluster": true,
-  "cluster_ratio": 0.1,
-  "num_top_tokens": 0.11,
-  "num_top_tokens_in_prefill": 204800000,
-  "num_recent_tokens": 128,
-  "num_sink_tokens": 8,
-  "chunk_prefill_size": 204800000,
+  "deltakv_center_ratio": 0.1,
+  "decode_keep_tokens": 0.11,
+  "prefill_keep_tokens": 204800000,
+  "recent_keep_tokens": 128,
+  "sink_keep_tokens": 8,
+  "hf_prefill_chunk_size": 204800000,
   "chunk_prefill_accel_omnikv": true,
-  "full_attn_layers": "0,1,2,4,7,14"
+  "full_attention_layers": "0,1,2,4,7,14"
 }'
 
 echo "[START] deltakv $(date)"

@@ -31,7 +31,8 @@ def load_omnikv_model(model_path: str, infer_config: dict, cuda_device):
         raise ValueError(f"OmniKV does not support model type: {base_config.model_type}")
 
     config = config_cls.from_pretrained(model_path)
-    config.set_infer_args(**infer_config)
+    config.set_native_args(**infer_config)
+    config.finalize_cluster_args()
     # OmniKV is the no-compression / no-cluster path over the same runtime model family.
     config.use_compression = False
     config.use_cluster = False

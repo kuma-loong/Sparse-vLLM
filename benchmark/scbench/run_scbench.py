@@ -451,10 +451,10 @@ def load_model(
     # tok.pad_token = tok.eos_token
 
     if attn_type in ["deltakv", "full_deltakv", "origin_residual_quant", "all_origin_residual_quant", "snapkv", "pyramidkv", "palu", "quest"]:
-        compressor_path = hyper_param.get("compressor_path")
+        deltakv_checkpoint_path = hyper_param.pop("deltakv_checkpoint_path", None)
         
         infer_config = hyper_param.copy()
-        model_cls = infer_config.pop("model_cls", attn_type)
+        sparse_method = infer_config.pop("sparse_method", attn_type)
         cuda_device = infer_config.pop("cuda_device", "auto")
         
         from deltakv.get_chat_api import get_generate_api
@@ -462,8 +462,8 @@ def load_model(
         _, model = get_generate_api(
             model_path=model_name,
             infer_config=infer_config,
-            compressor_path=compressor_path,
-            model_cls=model_cls,
+            deltakv_checkpoint_path=deltakv_checkpoint_path,
+            sparse_method=sparse_method,
             cuda_device=cuda_device,
             return_model=True
         )

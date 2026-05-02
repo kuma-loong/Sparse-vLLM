@@ -7,6 +7,7 @@ from deltakv.configs.model_config_cls import KVQwen2Config, KVQwen3Config, KVLla
 from deltakv.configs.runtime_params import normalize_runtime_params
 from deltakv.baseline_adapters import load_omnikv_model, load_kivi_model
 from deltakv.quantization import build_model_load_kwargs, restore_modules_to_dtype
+from deltakv.utils.log import logger
 from safetensors.torch import load_file
 
 
@@ -192,8 +193,8 @@ def hf_gen(model, tokenizer, prompt: Union[str, List[str]], return_kv_cache, pas
     return results[0] if is_single else results
 
 
-def get_generate_api(model_path: str, infer_config: dict, compressor_path: str,
-                     tokenizer_path: str = None, model_cls: str = 'deltakv',  use_cache: bool = True,
+def get_generate_api(model_path: str, infer_config: dict, deltakv_checkpoint_path: str = None,
+                     tokenizer_path: str = None, sparse_method: str = None,  use_cache: bool = True,
                      cuda_device: Union[int, str] = 0, backend: str = 'hf', return_kv_cache: bool = False,
                      return_model: bool = False):
     """
@@ -201,34 +202,47 @@ def get_generate_api(model_path: str, infer_config: dict, compressor_path: str,
         function: 一个生成函数，输入prompt和生成参数，返回生成内容。
     """
 
-    # `model_cls="deltakv"` is the historical default for this API. Treat it as
-    # unspecified when the JSON config itself carries a method selector, so a
-    # single canonical hyper_param blob can drive both backends.
-    normalization_model_cls = (
-        None
-        if model_cls == "deltakv" and ("model_cls" in infer_config or "sparse_method" in infer_config)
-        else model_cls
-    )
+    infer_config = dict(infer_config or {})
+    if sparse_method is None and backend == "hf" and "sparse_method" not in infer_config:
+        sparse_method = "deltakv"
+    if sparse_method is not None:
+        if "sparse_method" in infer_config and infer_config["sparse_method"] != sparse_method:
+            raise ValueError(
+                f"Conflicting sparse_method values: argument={sparse_method!r}, "
+                f"infer_config={infer_config['sparse_method']!r}."
+            )
+        infer_config["sparse_method"] = sparse_method
+    if deltakv_checkpoint_path is not None:
+        if (
+            "deltakv_checkpoint_path" in infer_config
+            and infer_config["deltakv_checkpoint_path"] != deltakv_checkpoint_path
+        ):
+            raise ValueError(
+                "Conflicting deltakv_checkpoint_path values: "
+                f"argument={deltakv_checkpoint_path!r}, "
+                f"infer_config={infer_config['deltakv_checkpoint_path']!r}."
+            )
+        infer_config["deltakv_checkpoint_path"] = deltakv_checkpoint_path
+
+    public_infer_config = dict(infer_config)
     normalized_params = normalize_runtime_params(
-        infer_config,
+        public_infer_config,
         backend=backend,
-        model_cls=normalization_model_cls,
-        compressor_path=compressor_path,
     )
     for warning in normalized_params.warnings:
         logger.info(f"Runtime parameter normalization: {warning}")
-    infer_config = normalized_params.infer_config
-    model_cls = normalized_params.model_cls or model_cls
-    compressor_path = normalized_params.compressor_path
+    model_cls = normalized_params.hf_model_cls or ("deltakv" if backend == "hf" else "auto")
+    compressor_path = normalized_params.hf_deltakv_checkpoint_path
 
     if backend == 'sparsevllm':
         from sparsevllm import LLM, SamplingParams
-        # sparsevllm 内部管理 tokenizer 和设备
-        # TODO 这边逻辑稍微不太统一，不通过 compressor_path 传 compressor
+        # Sparse-vLLM's public LLM entrypoint owns the final normalization. Pass
+        # semantic names here so legacy internal field names are not exposed as
+        # user-facing kwargs.
         
         llm = LLM(
             model_path, 
-            **infer_config,
+            **public_infer_config,
         )
 
         def generate(prompt: Union[str, List[str]], past_key_values=None, **kwargs):
@@ -260,6 +274,8 @@ def get_generate_api(model_path: str, infer_config: dict, compressor_path: str,
         if return_model:
             raise ValueError('sparse vllm 不支持 return_model=True')
         return generate
+
+    infer_config = normalized_params.infer_config
 
     def _prepare_model_load(default_torch_dtype: torch.dtype):
         runtime_infer_config, model_load_kwargs, target_torch_dtype = build_model_load_kwargs(
@@ -302,7 +318,8 @@ def get_generate_api(model_path: str, infer_config: dict, compressor_path: str,
             config = config_cls.from_pretrained(compressor_path)
         else:
             config = config_cls.from_pretrained(model_path)
-        config.set_infer_args(**runtime_infer_config)
+        config.set_native_args(**runtime_infer_config)
+        config.finalize_cluster_args()
         model = KVModel.from_pretrained(
             model_path,
             config=config,
@@ -339,7 +356,8 @@ def get_generate_api(model_path: str, infer_config: dict, compressor_path: str,
             config = config_cls.from_pretrained(compressor_path)
         else:
             config = config_cls.from_pretrained(model_path)
-        config.set_infer_args(**runtime_infer_config)
+        config.set_native_args(**runtime_infer_config)
+        config.finalize_cluster_args()
         model = KVModel.from_pretrained(
             model_path,
             config=config,
@@ -376,7 +394,8 @@ def get_generate_api(model_path: str, infer_config: dict, compressor_path: str,
             config = config_cls.from_pretrained(compressor_path)
         else:
             config = config_cls.from_pretrained(model_path)
-        config.set_infer_args(**runtime_infer_config)
+        config.set_native_args(**runtime_infer_config)
+        config.finalize_cluster_args()
         model = KVModel.from_pretrained(
             model_path,
             config=config,
@@ -413,7 +432,8 @@ def get_generate_api(model_path: str, infer_config: dict, compressor_path: str,
             config = config_cls.from_pretrained(compressor_path)
         else:
             config = config_cls.from_pretrained(model_path)
-        config.set_infer_args(**runtime_infer_config)
+        config.set_native_args(**runtime_infer_config)
+        config.finalize_cluster_args()
         model = KVModel.from_pretrained(
             model_path,
             config=config,
@@ -445,7 +465,8 @@ def get_generate_api(model_path: str, infer_config: dict, compressor_path: str,
 
         print('💡💡💡 SnapKV')
         config = config_cls.from_pretrained(model_path)
-        config.set_infer_args(**runtime_infer_config)
+        config.set_native_args(**runtime_infer_config)
+        config.finalize_cluster_args()
         print(f'[Config] {config}')
         model = KVModel.from_pretrained(
             model_path,
@@ -471,12 +492,13 @@ def get_generate_api(model_path: str, infer_config: dict, compressor_path: str,
             raise ValueError(f"deltasnapkv only supports qwen2/llama models, got {base_config.model_type}")
 
         if compressor_path is None:
-            raise ValueError("deltasnapkv requires compressor_path")
+            raise ValueError("deltasnapkv requires deltakv_checkpoint_path")
 
         config = config_cls.from_pretrained(compressor_path)
-        config.set_infer_args(**runtime_infer_config)
+        config.set_native_args(**runtime_infer_config)
+        config.finalize_cluster_args()
         assert len(parse_full_attn_layers(config.full_attn_layers)) == 0, (
-            "deltasnapkv requires full_attn_layers to be empty; "
+            "deltasnapkv requires full_attention_layers to be empty; "
             "this method does not support mixed full-attention layers."
         )
         model = KVModel.from_pretrained(
@@ -509,7 +531,8 @@ def get_generate_api(model_path: str, infer_config: dict, compressor_path: str,
 
         print('💡💡💡 PyramidKV')
         config = config_cls.from_pretrained(model_path)
-        config.set_infer_args(**runtime_infer_config)
+        config.set_native_args(**runtime_infer_config)
+        config.finalize_cluster_args()
         print(f'[Config] {config}')
         model = KVModel.from_pretrained(
             model_path,
@@ -1063,7 +1086,7 @@ def get_generate_api(model_path: str, infer_config: dict, compressor_path: str,
             return generate, model
         return generate
     else:
-        raise ValueError(f"Unknown model_cls: {model_cls}")
+        raise ValueError(f"Unknown sparse_method/model backend class: {model_cls}")
 
     manual_chunk_prefill_size = int(os.environ.get('MANUAL_GEN_CHUNK_PREFILL_SIZE', 0))
     if manual_chunk_prefill_size > 0:

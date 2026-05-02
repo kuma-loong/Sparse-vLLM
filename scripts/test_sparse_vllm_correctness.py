@@ -8,7 +8,7 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--model_path", type=str, default="/root/autodl-fs/models/Qwen3-0.6B")
     parser.add_argument("--tp", type=int, default=1)
-    parser.add_argument("--vllm_sparse_method", type=str, default="")
+    parser.add_argument("--sparse_method", type=str, default="vanilla")
     parser.add_argument("--no_tqdm", action="store_true")
     args = parser.parse_args()
     
@@ -24,7 +24,7 @@ def main():
     print(f"Loading model from: {path}")
     tokenizer = AutoTokenizer.from_pretrained(path)
     # 使用 enforce_eager=True 方便调试，如果通过则可尝试 False (CUDA Graph)
-    llm = LLM(path, enforce_eager=True, tensor_parallel_size=args.tp, vllm_sparse_method=args.vllm_sparse_method)
+    llm = LLM(path, enforce_eager=True, tensor_parallel_size=args.tp, sparse_method=args.sparse_method)
     
     # 接近贪婪搜索，保证结果可复现，方便对比
     sampling_params = SamplingParams(temperature=1e-5, max_tokens=128)

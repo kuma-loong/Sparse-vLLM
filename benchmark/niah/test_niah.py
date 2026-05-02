@@ -72,27 +72,27 @@ def test(
     context_lengths: str = "16,32,64",
     max_new_tokens: int = 20,
     min_new_tokens: int = 1,
-    model_cls: str = 'deltakv',
-    compressor_path: str = None,
+    sparse_method: str = 'deltakv',
+    deltakv_checkpoint_path: str = None,
     use_cache: bool = True,
     cuda_device: int = 0,
     backend: str = 'hf',
 
     # kv compress infer config
-    num_sink_tokens: int = 64,
-    num_recent_tokens: int = 512,
-    full_attn_layers: str = '0,1,2,3,8,16,22',
-    num_top_tokens: int = 512,
-    num_top_tokens_in_prefill: int = 4096,
+    sink_keep_tokens: int = 64,
+    recent_keep_tokens: int = 512,
+    full_attention_layers: str = '0,1,2,3,8,16,22',
+    decode_keep_tokens: int = 512,
+    prefill_keep_tokens: int = 4096,
     use_compression: bool = True,
     use_cluster: bool = False,
-    cluster_ratio: float = 0.1,
+    deltakv_center_ratio: float = 0.1,
     stride_alpha: float = 0.0,
     deltakv_use_omnikv_selection: bool = False,
     chunk_prefill_accel_omnikv: bool = False,
     omnikv_score_method: str = 'last',
-    vllm_sparse_method: str = "",
-    chunk_prefill_size: int = 32768,
+    hf_prefill_chunk_size: int = 32768,
+    engine_prefill_chunk_size: int = 32768,
     gpu_memory_utilization: float = 0.8,
     max_model_len: int = 128000,
     pyramid_last_layer_ratio: float = None,
@@ -113,24 +113,24 @@ def test(
 
     评测可以从现有数据集加载，也可以在线实时生成。
     """
-    tail_token_size = num_recent_tokens
+    prefill_chunk_key = "engine_prefill_chunk_size" if backend == "sparsevllm" else "hf_prefill_chunk_size"
+    prefill_chunk_value = engine_prefill_chunk_size if backend == "sparsevllm" else hf_prefill_chunk_size
 
     infer_config = {
-        'num_sink_tokens': num_sink_tokens,
-        'num_recent_tokens': num_recent_tokens,
-        'tail_token_size': tail_token_size,
-        'full_attn_layers': full_attn_layers,
-        'num_top_tokens': num_top_tokens,
-        'num_top_tokens_in_prefill': num_top_tokens_in_prefill,
+        'sink_keep_tokens': sink_keep_tokens,
+        'recent_keep_tokens': recent_keep_tokens,
+        'full_attention_layers': full_attention_layers,
+        'decode_keep_tokens': decode_keep_tokens,
+        'prefill_keep_tokens': prefill_keep_tokens,
         'use_compression': use_compression,
         'use_cluster': use_cluster,
-        'cluster_ratio': cluster_ratio,
+        'deltakv_center_ratio': deltakv_center_ratio,
         'stride_alpha': stride_alpha,
         'deltakv_use_omnikv_selection': deltakv_use_omnikv_selection,
         'chunk_prefill_accel_omnikv': chunk_prefill_accel_omnikv,
         'omnikv_score_method': omnikv_score_method,
-        'vllm_sparse_method': vllm_sparse_method,
-        'chunk_prefill_size': chunk_prefill_size,
+        'sparse_method': sparse_method,
+        prefill_chunk_key: prefill_chunk_value,
         'gpu_memory_utilization': gpu_memory_utilization,
         'max_model_len': max_model_len,
         'pyramid_last_layer_ratio': pyramid_last_layer_ratio,
@@ -142,18 +142,18 @@ def test(
         'lt_hadamard': lt_hadamard,
     }
     chat = get_generate_api(
-        model_path, 
-        infer_config, 
-        compressor_path, 
-        tokenizer_path, 
-        model_cls=model_cls, 
+        model_path,
+        infer_config,
+        deltakv_checkpoint_path=deltakv_checkpoint_path,
+        tokenizer_path=tokenizer_path,
+        sparse_method=sparse_method,
         use_cache=use_cache,
         cuda_device=cuda_device,
         backend=backend
     )
 
-    if compressor_path is not None:
-        compressor_name = os.path.basename(compressor_path.rstrip('/'))
+    if deltakv_checkpoint_path is not None:
+        compressor_name = os.path.basename(deltakv_checkpoint_path.rstrip('/'))
     else:
         compressor_name = "None"
     

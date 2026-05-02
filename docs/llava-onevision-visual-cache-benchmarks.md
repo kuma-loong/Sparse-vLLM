@@ -7,7 +7,7 @@ This note keeps the LLaVA-OneVision benchmark naming explicit.
 When the benchmark is run with:
 
 ```bash
---compressor_path none
+--deltakv_checkpoint_path none
 --methods vanilla,visual_uniform_keep
 --visual_keep_ratio 0.1
 ```
@@ -35,7 +35,7 @@ remain in the raw KV cache.
 With:
 
 ```bash
---compressor_path none
+--deltakv_checkpoint_path none
 --quantize_visual_kv
 ```
 
@@ -50,7 +50,7 @@ visual KV tokens using direct min/max int4 packing.
 
 ## Experimental Compressor Path
 
-Supplying a real `--compressor_path` runs through the LLaVA-OneVision DeltaKV
+Supplying a real `--deltakv_checkpoint_path` runs through the LLaVA-OneVision DeltaKV
 wrapper and labels the method as:
 
 ```text
@@ -68,7 +68,7 @@ Use the explicit benchmark entrypoint for new runs:
 python scripts/bench_llava_onevision_visual_prune.py
 ```
 
-The older entrypoint remains as a compatibility wrapper:
+The older entrypoint remains as a legacy script-name wrapper:
 
 ```bash
 python scripts/bench_llava_onevision_deltakv.py

@@ -19,10 +19,10 @@ class VisualUniformPruningTest(unittest.TestCase):
         config.set_infer_args(
             use_compression=False,
             use_cluster=False,
-            kv_quant_bits=0,
-            num_sink_tokens=1,
-            num_recent_tokens=2,
-            full_attn_layers="",
+            deltakv_latent_quant_bits=0,
+            sink_keep_tokens=1,
+            recent_keep_tokens=2,
+            full_attention_layers="",
             visual_token_prune_only=True,
             visual_token_keep_ratio=0.5,
         )

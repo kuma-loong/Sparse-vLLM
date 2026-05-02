@@ -2,7 +2,7 @@ from transformers.models.qwen2.modeling_qwen2 import Qwen2Config
 from transformers.models.qwen3.configuration_qwen3 import Qwen3Config
 from transformers.models.llama.modeling_llama import LlamaConfig
 from deltakv.configs.runtime_params import normalize_runtime_params
-from deltakv.utils.log import logger, log_once
+from deltakv.utils.log import logger
 
 
 def parse_full_attn_layers(full_attn_layers):
@@ -22,8 +22,8 @@ class CustomConfigMixin:
     def __init__(
         self,
         kv_compressed_size=128,
-        seq_chunk_size=1,
-        k_neighbors=None,
+        compressor_token_group_size=1,
+        deltakv_neighbor_count=1,
         layer_chunk_size=1,
         recon_mode='delta_in_latent',
         ref_mode='avg',
@@ -69,47 +69,51 @@ class CustomConfigMixin:
         kv_quant_bits=0,
         visual_token_prune_only=None,
         visual_token_keep_ratio=None,
-        deltakv_visual_compress_only=None,
-        deltakv_visual_keep_ratio=None,
         **kwargs
     ):
-        if visual_token_prune_only is None:
-            visual_token_prune_only = (
-                bool(deltakv_visual_compress_only)
-                if deltakv_visual_compress_only is not None
-                else False
-            )
-        elif (
-            deltakv_visual_compress_only is not None
-            and bool(visual_token_prune_only) != bool(deltakv_visual_compress_only)
-        ):
+        # Saved compressor checkpoints may still contain the old config schema.
+        # Migrate those artifact fields internally so historical weights remain
+        # loadable for regression checks; runtime/API parameters are still
+        # rejected by normalize_runtime_params().
+        if "seq_chunk_size" in kwargs:
+            legacy_value = kwargs.pop("seq_chunk_size")
+            if compressor_token_group_size != 1 and compressor_token_group_size != legacy_value:
+                raise ValueError(
+                    "Conflicting checkpoint config fields: `seq_chunk_size` and "
+                    "`compressor_token_group_size` differ."
+                )
+            compressor_token_group_size = legacy_value
+        if "k_neighbors" in kwargs:
+            legacy_value = kwargs.pop("k_neighbors")
+            if deltakv_neighbor_count != 1 and deltakv_neighbor_count != legacy_value:
+                raise ValueError(
+                    "Conflicting checkpoint config fields: `k_neighbors` and "
+                    "`deltakv_neighbor_count` differ."
+                )
+            deltakv_neighbor_count = legacy_value
+        legacy_visual_keys = {
+            "deltakv_visual_compress_only": "visual_token_prune_only",
+            "deltakv_visual_keep_ratio": "visual_token_keep_ratio",
+        }
+        legacy_visual_found = sorted(key for key in kwargs if key in legacy_visual_keys)
+        if legacy_visual_found:
+            details = ", ".join(f"`{key}` -> `{legacy_visual_keys[key]}`" for key in legacy_visual_found)
             raise ValueError(
-                "Conflicting visual-token prune settings: "
-                f"visual_token_prune_only={visual_token_prune_only!r}, "
-                f"deltakv_visual_compress_only={deltakv_visual_compress_only!r}."
+                "Legacy LLaVA visual runtime config keys are no longer accepted. "
+                f"Use the split semantic names instead: {details}."
             )
 
+        if visual_token_prune_only is None:
+            visual_token_prune_only = False
+
         if visual_token_keep_ratio is None:
-            visual_token_keep_ratio = (
-                float(deltakv_visual_keep_ratio)
-                if deltakv_visual_keep_ratio is not None
-                else 1.0
-            )
-        elif (
-            deltakv_visual_keep_ratio is not None
-            and float(visual_token_keep_ratio) != float(deltakv_visual_keep_ratio)
-        ):
-            raise ValueError(
-                "Conflicting visual-token keep-ratio settings: "
-                f"visual_token_keep_ratio={visual_token_keep_ratio!r}, "
-                f"deltakv_visual_keep_ratio={deltakv_visual_keep_ratio!r}."
-            )
+            visual_token_keep_ratio = 1.0
 
         # 初始化自定义属性
         # 这个地方好像也只能设置一下默认值了，主要目的是有语法提示。
         self.kv_compressed_size = kv_compressed_size
-        self.seq_chunk_size = seq_chunk_size
-        self.k_neighbors = k_neighbors
+        self.compressor_token_group_size = compressor_token_group_size
+        self.deltakv_neighbor_count = deltakv_neighbor_count
         self.layer_chunk_size = layer_chunk_size
         self.recon_mode = recon_mode
         self.ref_mode = ref_mode
@@ -153,86 +157,47 @@ class CustomConfigMixin:
         self.kv_quant_bits = kv_quant_bits
         self.visual_token_prune_only = visual_token_prune_only
         self.visual_token_keep_ratio = visual_token_keep_ratio
-        # Backward-compatible attribute names. The canonical names above are
-        # preferred because the no-compressor path is pruning, not DeltaKV
-        # compression.
-        self.deltakv_visual_compress_only = visual_token_prune_only
-        self.deltakv_visual_keep_ratio = visual_token_keep_ratio
         
         # 调用 MRO 中的下一个 __init__ (Qwen2Config 或 LlamaConfig)
         super().__init__(**kwargs)
 
-    def finalize_cluster_args(self, *, warn_on_legacy_k_neighbors: bool = False):
+    def finalize_cluster_args(self):
         if not getattr(self, "use_cluster", False):
             return
 
-        if getattr(self, "k_neighbors", None) is None:
-            legacy_k = getattr(self, "seq_chunk_size", None)
-            if legacy_k is None:
-                legacy_k = 1
-            self.k_neighbors = int(legacy_k)
-            if warn_on_legacy_k_neighbors:
-                log_once(
-                    f"Cluster config missing `k_neighbors`; falling back to legacy "
-                    f"`seq_chunk_size={self.k_neighbors}`. Please pass `k_neighbors` explicitly.",
-                    "WARNING",
-                )
+        if getattr(self, "deltakv_neighbor_count", None) is None:
+            raise ValueError(
+                "`deltakv_neighbor_count` is required when `use_cluster=True`. "
+                "`compressor_token_group_size` no longer doubles as the cluster neighbor count."
+            )
 
-    def get_cluster_k_neighbors(self) -> int:
-        self.finalize_cluster_args(warn_on_legacy_k_neighbors=False)
-        return max(1, int(self.k_neighbors))
+    def get_cluster_neighbor_count(self) -> int:
+        self.finalize_cluster_args()
+        return max(1, int(self.deltakv_neighbor_count))
 
-    def set_extra_args(self, **kwargs):
-        normalized_params = normalize_runtime_params(kwargs, backend="hf")
-        for warning in normalized_params.warnings:
-            log_once(f"Runtime parameter normalization: {warning}", "INFO")
-        kwargs = normalized_params.infer_config
-
-        legacy_keys = {
-            "use_nonlinear_compressor",
-            "compressor_intermediate_size",
-            "compressor_linear_bias",
-        }
-        directional_keys = {
-            "compressor_down_type",
-            "compressor_up_type",
-            "compressor_down_intermediate_size",
-            "compressor_up_intermediate_size",
-        }
-        # 兼容旧版本：旧版本仅用上面 3 个参数控制“对称”的 compressor/decompressor。
-        # 若用户只传旧参数（未显式传新参数），则重置方向相关配置为默认值，让旧参数继续完全接管。
-        if legacy_keys.intersection(kwargs) and not directional_keys.intersection(kwargs):
-            defaults = {
-                "compressor_down_type": "auto",
-                "compressor_up_type": "auto",
-                "compressor_down_intermediate_size": -1,
-                "compressor_up_intermediate_size": -1,
-            }
-            for k, v in defaults.items():
-                if hasattr(self, k):
-                    kwargs[k] = v
-
+    def set_native_args(self, **kwargs):
         for key, value in kwargs.items():
             if hasattr(self, key):
                 if key == 'full_attn_layers':
                     value = parse_full_attn_layers(value)
                 setattr(self, key, value)
-                if key == 'visual_token_prune_only':
-                    self.deltakv_visual_compress_only = value
-                if key == 'visual_token_keep_ratio':
-                    self.deltakv_visual_keep_ratio = value
                 if key == 'num_recent_tokens':
                     self.tail_token_size = value
                 print(f"[Config] Setting {key} = {value}")
             else:
                 logger.error(f'There is NO {key} in Custom Config!')
                 if key == 'num_recent_tokens':
-                    logger.warning(f'为了保持兼容性，{key} 可以被映射到 tail_token_size')
                     self.tail_token_size = value
+
+    def set_extra_args(self, **kwargs):
+        normalized_params = normalize_runtime_params(kwargs, backend="hf")
+        for warning in normalized_params.warnings:
+            logger.info(f"Runtime parameter normalization: {warning}")
+        self.set_native_args(**normalized_params.infer_config)
 
     def set_infer_args(self, **kwargs):
         self.set_extra_args(**kwargs)
-        self.finalize_cluster_args(warn_on_legacy_k_neighbors="k_neighbors" not in kwargs)
+        self.finalize_cluster_args()
 
 
 class KVQwen2Config(CustomConfigMixin, Qwen2Config):

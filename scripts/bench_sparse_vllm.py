@@ -21,10 +21,14 @@ def _load_json_arg(value: str) -> dict[str, Any]:
 
     Supports:
       - Inline JSON: '{"gpu_memory_utilization": 0.9}'
+      - File JSON: '@config.json'
     """
     if value is None:
         return {}
     value = str(value).strip()
+    if value.startswith("@"):
+        path = Path(value[1:]).expanduser()
+        value = path.read_text(encoding="utf-8")
 
     try:
         parsed = json.loads(value)
@@ -41,7 +45,7 @@ def _build_engine_hyper_params(args) -> dict[str, Any]:
     hyper_params: dict[str, Any] = {
         "enforce_eager": True,
         "gpu_memory_utilization": 0.8,
-        "chunk_prefill_size": 4096,
+        "engine_prefill_chunk_size": 4096,
         "tensor_parallel_size": 1,
     }
 
@@ -51,7 +55,7 @@ def _build_engine_hyper_params(args) -> dict[str, Any]:
     for warning in normalized.warnings:
         print(f"[param-normalize] {warning}")
 
-    return normalized.infer_config
+    return hyper_params
 
 
 def benchmark_task(method, length, bs, args, results_dict):
@@ -62,24 +66,23 @@ def benchmark_task(method, length, bs, args, results_dict):
     print(f"\n>>> Starting: {method.upper()} | Context: {length} | Batch: {bs}...")
     
     base_hyper_params = args.hyper_params_dict
-    sparse_kwargs: dict[str, Any] = {"vllm_sparse_method": ""}
+    sparse_kwargs: dict[str, Any] = {"sparse_method": "vanilla"}
     if method == "vanilla":
-        sparse_kwargs["vllm_sparse_method"] = ""
+        sparse_kwargs["sparse_method"] = "vanilla"
     elif method in ("streamingllm", "attention-sink", "attention_sink", "snapkv", "pyramidkv", "omnikv", "quest", "deltakv"):
-        sparse_kwargs["vllm_sparse_method"] = method
+        sparse_kwargs["sparse_method"] = method
     elif "deltakv" in method:
-        sparse_kwargs["vllm_sparse_method"] = method
+        sparse_kwargs["sparse_method"] = method
     
     llm = None
     try:
         m_len = length + args.output_len + 100
-        # Note: max_model_len are derived from (length, bs, output_len, chunk_prefill_size).
+        # Note: max_model_len is derived from (length, bs, output_len, engine_prefill_chunk_size).
         # They can be passed in --hyper_params, but will be overwritten here to keep the benchmark consistent.
         hyper_params = dict(base_hyper_params)
         hyper_params.pop("max_model_len", None)
         hyper_params.setdefault("max_num_seqs_in_batch", int(bs))
         hyper_params.setdefault("max_decoding_seqs", int(bs))
-        chunk_prefill_size = int(hyper_params.get("chunk_prefill_size", 4096))
         
         from sparsevllm import LLM, SamplingParams
         engine_kwargs = {
@@ -258,17 +261,6 @@ def benchmark_task(method, length, bs, args, results_dict):
             llm.exit()
 
 
-def str2bool(v):
-    if isinstance(v, bool):
-        return v
-    if v.lower() in ('yes', 'true', 't', 'y', '1'):
-        return True
-    elif v.lower() in ('no', 'false', 'f', 'n', '0'):
-        return False
-    else:
-        raise argparse.ArgumentTypeError('Boolean value expected.')
-
-
 def main():
     parser = argparse.ArgumentParser(description="Professional benchmark for sparsevllm.")
     parser.add_argument("--model_path", type=str, required=True, help="Path to the model")
@@ -311,14 +303,9 @@ def main():
         default="{}",
         help=(
             "LLMEngine/Config hyper-params as JSON (string or @file.json). "
-            'Example: \'{"gpu_memory_utilization":0.9,"chunk_prefill_size":4096,"tensor_parallel_size":1,"num_top_tokens":2048}\''
+            'Example: \'{"gpu_memory_utilization":0.9,"engine_prefill_chunk_size":4096,"tensor_parallel_size":1,"decode_keep_tokens":2048}\''
         ),
     )
-    # Deprecated (kept for backward compatibility; prefer --hyper_params)
-    parser.add_argument("--gpu_util", type=float, default=None, help="[DEPRECATED] use --hyper_params.gpu_memory_utilization")
-    parser.add_argument("--chunk_size", type=int, default=None, help="[DEPRECATED] use --hyper_params.chunk_prefill_size")
-    parser.add_argument("--tp", type=int, default=None, help="[DEPRECATED] use --hyper_params.tensor_parallel_size")
-    parser.add_argument("--enforce_eager", type=str2bool, default=None, help="[DEPRECATED] use --hyper_params.enforce_eager")
     
     args = parser.parse_args()
     try:

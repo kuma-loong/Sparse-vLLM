@@ -114,9 +114,7 @@ class Qwen2AttnKVCompress(Qwen2Attention):
         sink_size = self.config.num_sink_tokens
         is_prefill, is_decode = (q_len > 1), (q_len == 1)
 
-        visual_token_prune_only = bool(
-            getattr(self.config, "visual_token_prune_only", getattr(self.config, "deltakv_visual_compress_only", False))
-        )
+        visual_token_prune_only = bool(getattr(self.config, "visual_token_prune_only", False))
         candidate_abs_idx = None
         if visual_token_prune_only:
             target_layer_idx = None

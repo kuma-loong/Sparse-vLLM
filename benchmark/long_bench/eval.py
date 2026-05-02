@@ -55,7 +55,7 @@ def parse_args(args=None):
     parser = argparse.ArgumentParser()
     parser.add_argument('--model', type=str, required=False, default=None)
     parser.add_argument('--e', action='store_true', help="Evaluate on LongBench-E")
-    parser.add_argument("--compressor_path", type=str, default=None)
+    parser.add_argument("--deltakv_checkpoint_path", type=str, default=None)
     parser.add_argument("--cfg", default=None)
     parser.add_argument("--path", type=str, default=None, help="The path to the prediction results")
     return parser.parse_args(args)
@@ -151,9 +151,9 @@ if __name__ == '__main__':
     if args.path:
         path = args.path
     else:
-        compressor_path = args.compressor_path if args.compressor_path is not None else args.cfg
-        if compressor_path is not None:
-            compressor_name = os.path.basename(compressor_path.rstrip('/'))
+        deltakv_checkpoint_path = args.deltakv_checkpoint_path if args.deltakv_checkpoint_path is not None else args.cfg
+        if deltakv_checkpoint_path is not None:
+            compressor_name = os.path.basename(deltakv_checkpoint_path.rstrip('/'))
         else:
             compressor_name = "None"
             

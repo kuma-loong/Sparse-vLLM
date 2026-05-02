@@ -14,9 +14,9 @@ def patch_model_for_chunk_avg(model):
     """
     def patched_single_tensor_comp_then_reconstruct(self, kv, prev_recon_kv, compress_down, compress_up, layer_transform, compress_alpha):
         bs, seq_len, dim = kv.shape
-        kv_chunks = kv.view(bs, -1, self.config.seq_chunk_size, dim)
+        kv_chunks = kv.view(bs, -1, self.config.compressor_token_group_size, dim)
 
-        use_seq_ref = self.config.seq_chunk_size > 1
+        use_seq_ref = self.config.compressor_token_group_size > 1
         use_layer_ref = self.config.layer_chunk_size > 1 and prev_recon_kv is not None
 
         seq_ref = None
@@ -29,7 +29,7 @@ def patch_model_for_chunk_avg(model):
         if use_seq_ref and use_layer_ref:
             a = torch.sigmoid(compress_alpha)
             # transform(kv_i-1)
-            layer_ref = layer_transform(prev_recon_kv).view(bs, -1, self.config.seq_chunk_size, dim)
+            layer_ref = layer_transform(prev_recon_kv).view(bs, -1, self.config.compressor_token_group_size, dim)
 
             # Formula: comp_kv_i = down(kv_i) - a*down(seq_ref_i) - (1-a)*down(layer_ref)
             comp_kv = compress_down(kv_chunks) - a * compress_down(seq_ref) - (1 - a) * compress_down(layer_ref)
@@ -42,7 +42,7 @@ def patch_model_for_chunk_avg(model):
             recon_kv = compress_up(comp_kv) + seq_ref
 
         elif use_layer_ref:
-            layer_ref = layer_transform(prev_recon_kv).view(bs, -1, self.config.seq_chunk_size, dim)
+            layer_ref = layer_transform(prev_recon_kv).view(bs, -1, self.config.compressor_token_group_size, dim)
             comp_kv = compress_down(kv_chunks) - compress_down(layer_ref)
             recon_kv = compress_up(comp_kv) + layer_ref
         else:
@@ -63,7 +63,7 @@ def patch_model_for_chunk_avg(model):
 
 def main(
     model_path: str,
-    compressor_path: str,
+    deltakv_checkpoint_path: str,
     dataset_path: str,
     num_samples: int = 100,
     batch_size: int = 1,
@@ -77,8 +77,8 @@ def main(
     
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     
-    print(f"Loading config from: {compressor_path}")
-    config = KVQwen2Config.from_pretrained(compressor_path)
+    print(f"Loading config from: {deltakv_checkpoint_path}")
+    config = KVQwen2Config.from_pretrained(deltakv_checkpoint_path)
     print(f'{config=}')
     
     print(f"Loading base model from: {model_path}")
@@ -89,16 +89,16 @@ def main(
         attn_implementation="flash_attention_2"
     )
     
-    print(f"Loading compressor weights from: {compressor_path}")
+    print(f"Loading compressor weights from: {deltakv_checkpoint_path}")
     # 根据 safetensors 文件名加载权重
-    sf_path = os.path.join(compressor_path, "model.safetensors")
+    sf_path = os.path.join(deltakv_checkpoint_path, "model.safetensors")
     if not os.path.exists(sf_path):
         # 兼容某些可能保存为 pytorch_model.bin 的情况
-        sf_path = os.path.join(compressor_path, "pytorch_model.bin")
+        sf_path = os.path.join(deltakv_checkpoint_path, "pytorch_model.bin")
         if os.path.exists(sf_path):
             comp_state_dict = torch.load(sf_path, map_location=device)
         else:
-            raise FileNotFoundError(f"Could not find weights in {compressor_path}")
+            raise FileNotFoundError(f"Could not find weights in {deltakv_checkpoint_path}")
     else:
         comp_state_dict = load_file(sf_path, device=str(device))
     

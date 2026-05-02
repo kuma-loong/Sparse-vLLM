@@ -13,11 +13,11 @@ exec /home/haojitai/miniconda3/envs/svllm/bin/python -u benchmark/long_bench/pre
   --ws 1 \
   --batch_size 1 \
   --backend hf \
-  --model_cls deltasnapkv \
+  --sparse_method deltasnapkv \
   --model llama31-8b-hf-deltasnapkv-longbench-b0p175-w16 \
   --model_path /home/haojitai/models/Llama-3.1-8B-Instruct \
-  --compressor_path /home/haojitai/checkpoints/compressor/cluster_e2e_cs512_biasFalse_l2_ratio0.1_clusMean_before_rope_lr0.0002_cdownmlp_swiglud3072_cuplinear_0125_051527 \
-  --hyper_param '{"deltasnapkv_total_budget":0.175,"chunk_prefill_size":4096,"snapkv_window_size":16,"full_attn_layers":""}' \
+  --deltakv_checkpoint_path /home/haojitai/checkpoints/compressor/cluster_e2e_cs512_biasFalse_l2_ratio0.1_clusMean_before_rope_lr0.0002_cdownmlp_swiglud3072_cuplinear_0125_051527 \
+  --hyper_param '{"deltasnapkv_total_budget":0.175,"hf_prefill_chunk_size":4096,"snapkv_window_size":16,"full_attention_layers":""}' \
   --temperature 0 \
   --top_p 1 \
   --top_k 0

@@ -20,6 +20,8 @@ CUSTOM_CONFIG_KEYS = {
     "kv_compressed_size",
     "seq_chunk_size",
     "k_neighbors",
+    "compressor_token_group_size",
+    "deltakv_neighbor_count",
     "layer_chunk_size",
     "recon_mode",
     "ref_mode",
@@ -61,7 +63,6 @@ VISUAL_PRUNE_METHOD_ALIASES = {
     "visual_keep",
     "visual_prune",
     "uniform_keep",
-    "deltakv",  # legacy alias; only true DeltaKV if a compressor checkpoint is supplied.
 }
 
 
@@ -69,14 +70,14 @@ def parse_args():
     parser = argparse.ArgumentParser(
         description=(
             "Benchmark HF LLaVA-OneVision with a visual-token uniform-pruning "
-            "baseline. Supplying --compressor_path enables the experimental "
-            "DeltaKV-wrapper path; --compressor_path none is not DeltaKV cluster "
+            "baseline. Supplying --deltakv_checkpoint_path enables the experimental "
+            "DeltaKV-wrapper path; --deltakv_checkpoint_path none is not DeltaKV cluster "
             "or learned compression."
         )
     )
     parser.add_argument("--model_path", default="/data2/haojitai/models/llava-onevision-qwen2-7b-ov-hf")
     parser.add_argument(
-        "--compressor_path",
+        "--deltakv_checkpoint_path",
         default="none",
         help=(
             "Use 'none' for visual-token uniform pruning. Set a trained DeltaKV "
@@ -93,20 +94,19 @@ def parse_args():
         "--methods",
         default="vanilla,visual_uniform_keep",
         help=(
-            "Comma-separated methods. Supported: vanilla, visual_uniform_keep. "
-            "'deltakv' is accepted as a legacy alias for visual_uniform_keep when "
-            "--compressor_path none."
+            "Comma-separated methods. Supported: vanilla, visual_uniform_keep, "
+            "visual_deltakv_compressor."
         ),
     )
     parser.add_argument("--torch_dtype", default="bfloat16", choices=["bfloat16", "float16"])
     parser.add_argument("--attn_implementation", default="flash_attention_2")
-    parser.add_argument("--num_recent_tokens", type=int, default=128)
-    parser.add_argument("--num_sink_tokens", type=int, default=8)
-    parser.add_argument("--num_top_tokens", type=int, default=1024)
-    parser.add_argument("--num_top_tokens_in_prefill", type=int, default=4096)
-    parser.add_argument("--chunk_prefill_size", type=int, default=100000000)
+    parser.add_argument("--recent_keep_tokens", type=int, default=128)
+    parser.add_argument("--sink_keep_tokens", type=int, default=8)
+    parser.add_argument("--decode_keep_tokens", type=int, default=1024)
+    parser.add_argument("--prefill_keep_tokens", type=int, default=4096)
+    parser.add_argument("--hf_prefill_chunk_size", type=int, default=100000000)
     parser.add_argument("--chunk_prefill_accel_omnikv", action="store_true")
-    parser.add_argument("--full_attn_layers", default="0,1,2,3,8,16,22")
+    parser.add_argument("--full_attention_layers", default="0,1,2,3,8,16,22")
     parser.add_argument("--visual_keep_ratio", type=float, default=1.0)
     parser.add_argument("--quantize_visual_kv", action="store_true")
     parser.add_argument("--limit_text_tokens", type=int, default=0)
@@ -194,14 +194,17 @@ def build_prompt(processor, question: str, limit_text_tokens: int):
 
 
 def resolve_compressor_path(args):
-    return Path(args.compressor_path) if args.compressor_path.lower() not in {"", "none", "null"} else None
+    checkpoint_path = str(args.deltakv_checkpoint_path)
+    return Path(checkpoint_path) if checkpoint_path.lower() not in {"", "none", "null"} else None
 
 
 def build_visual_cache_policy(args, infer_config, compressor_path):
     uses_compressor = compressor_path is not None
     uses_cluster = bool(infer_config.get("use_cluster", False))
     uses_learned_compressor = uses_compressor and bool(infer_config.get("use_compression", False))
-    kv_quant_bits = int(infer_config.get("kv_quant_bits", 0) or 0)
+    kv_quant_bits = int(
+        infer_config.get("deltakv_latent_quant_bits", infer_config.get("kv_quant_bits", 0)) or 0
+    )
 
     if uses_compressor:
         method = "visual_deltakv_compressor"
@@ -247,12 +250,30 @@ def load_vanilla_model(args, dtype, device):
     ).eval()
 
 
+def migrate_checkpoint_infer_config(infer_config: dict) -> dict:
+    migrated = dict(infer_config)
+    if "seq_chunk_size" in migrated:
+        value = migrated.pop("seq_chunk_size")
+        if "compressor_token_group_size" in migrated and migrated["compressor_token_group_size"] != value:
+            raise ValueError("Checkpoint config has conflicting seq_chunk_size/compressor_token_group_size.")
+        migrated["compressor_token_group_size"] = value
+    if "k_neighbors" in migrated:
+        value = migrated.pop("k_neighbors")
+        if "deltakv_neighbor_count" in migrated and migrated["deltakv_neighbor_count"] != value:
+            raise ValueError("Checkpoint config has conflicting k_neighbors/deltakv_neighbor_count.")
+        migrated["deltakv_neighbor_count"] = value
+    return migrated
+
+
 def load_visual_cache_model(args, dtype, device):
     config = LlavaOnevisionConfig.from_pretrained(args.model_path, trust_remote_code=True)
     compressor_path = resolve_compressor_path(args)
+    infer_config_is_native = compressor_path is not None
     if compressor_path is not None:
         compressor_config = json.loads((compressor_path / "config.json").read_text())
-        infer_config = {key: compressor_config[key] for key in CUSTOM_CONFIG_KEYS if key in compressor_config}
+        infer_config = migrate_checkpoint_infer_config(
+            {key: compressor_config[key] for key in CUSTOM_CONFIG_KEYS if key in compressor_config}
+        )
     else:
         # This fallback is a visual-token uniform-pruning baseline. It is not
         # DeltaKV clustering, learned compressor inference, ref-token residuals,
@@ -260,23 +281,37 @@ def load_visual_cache_model(args, dtype, device):
         infer_config = {
             "use_compression": False,
             "use_cluster": False,
-            "kv_quant_bits": 4 if args.quantize_visual_kv else 0,
-            "full_attn_layers": args.full_attn_layers,
+            "deltakv_latent_quant_bits": 4 if args.quantize_visual_kv else 0,
+            "full_attention_layers": args.full_attention_layers,
             "deltakv_use_omnikv_selection": True,
             "omnikv_score_method": "last",
         }
-    infer_config.update(
-        {
-            "visual_token_prune_only": True,
-            "visual_token_keep_ratio": args.visual_keep_ratio,
-            "num_recent_tokens": args.num_recent_tokens,
-            "num_sink_tokens": args.num_sink_tokens,
-            "num_top_tokens": args.num_top_tokens,
-            "num_top_tokens_in_prefill": args.num_top_tokens_in_prefill,
-            "chunk_prefill_size": args.chunk_prefill_size,
-            "chunk_prefill_accel_omnikv": bool(args.chunk_prefill_accel_omnikv),
-        }
-    )
+    if infer_config_is_native:
+        infer_config.update(
+            {
+                "visual_token_prune_only": True,
+                "visual_token_keep_ratio": args.visual_keep_ratio,
+                "num_recent_tokens": args.recent_keep_tokens,
+                "num_sink_tokens": args.sink_keep_tokens,
+                "num_top_tokens": args.decode_keep_tokens,
+                "num_top_tokens_in_prefill": args.prefill_keep_tokens,
+                "chunk_prefill_size": args.hf_prefill_chunk_size,
+                "chunk_prefill_accel_omnikv": bool(args.chunk_prefill_accel_omnikv),
+            }
+        )
+    else:
+        infer_config.update(
+            {
+                "visual_token_prune_only": True,
+                "visual_token_keep_ratio": args.visual_keep_ratio,
+                "recent_keep_tokens": args.recent_keep_tokens,
+                "sink_keep_tokens": args.sink_keep_tokens,
+                "decode_keep_tokens": args.decode_keep_tokens,
+                "prefill_keep_tokens": args.prefill_keep_tokens,
+                "hf_prefill_chunk_size": args.hf_prefill_chunk_size,
+                "chunk_prefill_accel_omnikv": bool(args.chunk_prefill_accel_omnikv),
+            }
+        )
     policy = build_visual_cache_policy(args, infer_config, compressor_path)
     print(
         "[visual_cache_policy] "
@@ -287,6 +322,7 @@ def load_visual_cache_model(args, dtype, device):
         flush=True,
     )
     config.deltakv_infer_config = infer_config
+    config.deltakv_infer_config_is_native = infer_config_is_native
     model = LlavaOnevisionDeltaKVForConditionalGeneration.from_pretrained(
         args.model_path,
         config=config,
@@ -398,7 +434,7 @@ def iter_requested_methods(methods: str):
         else:
             raise ValueError(
                 f"Unknown method: {raw_method}. Supported: vanilla, visual_uniform_keep "
-                "(legacy alias: deltakv)."
+                "or visual_deltakv_compressor."
             )
 
 
@@ -419,16 +455,10 @@ def main():
             method_label = "vanilla"
             policy = None
         elif method_kind == "visual_deltakv_compressor" and resolve_compressor_path(args) is None:
-            raise ValueError("visual_deltakv_compressor requires a real --compressor_path, not 'none'.")
+            raise ValueError("visual_deltakv_compressor requires a real --deltakv_checkpoint_path, not 'none'.")
         else:
             model, policy = load_visual_cache_model(args, dtype, device)
             method_label = policy["method"]
-            if requested_method.lower() == "deltakv" and resolve_compressor_path(args) is None:
-                print(
-                    "[method_alias] 'deltakv' was requested, but --compressor_path none "
-                    "runs visual_uniform_keep, not DeltaKV cluster/compressor inference.",
-                    flush=True,
-                )
 
         result = run_method(
             method_label,

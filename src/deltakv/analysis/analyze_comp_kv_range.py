@@ -351,7 +351,7 @@ def plot_distribution(layer_stats, all_values, all_raw_values, all_ideal_res_val
 
 def main(
     model_path="/root/autodl-fs/models/Qwen2.5-7B-Instruct-1M",
-    compressor_path=None,
+    deltakv_checkpoint_path=None,
     dataset_path="/root/autodl-fs/datasets/deltakv_qwen_train_num80000_seqlen8192/",
     num_samples=10,
     output_dir="/root/autodl-fs/visuals/comp_kv_range",
@@ -359,13 +359,13 @@ def main(
     device="cuda" if torch.cuda.is_available() else "cpu"
 ):
     print(f"[Init] Loading config and model from {model_path}...")
-    config = KVQwen2Config.from_pretrained(compressor_path if compressor_path else model_path)
+    config = KVQwen2Config.from_pretrained(deltakv_checkpoint_path if deltakv_checkpoint_path else model_path)
     tokenizer = AutoTokenizer.from_pretrained(model_path)
     model = Qwen2KVClusterCompress.from_pretrained(model_path, config=config, torch_dtype=torch.bfloat16, device_map=0)
     
-    if compressor_path:
-        print(f"[Init] Loading compressor weights from {compressor_path}...")
-        state_dict = load_compressor(compressor_path=compressor_path)
+    if deltakv_checkpoint_path:
+        print(f"[Init] Loading compressor weights from {deltakv_checkpoint_path}...")
+        state_dict = load_compressor(compressor_path=deltakv_checkpoint_path)
         msg = model.load_state_dict(state_dict, strict=False)
         print(f"[Init] Load Status: {msg}")
 

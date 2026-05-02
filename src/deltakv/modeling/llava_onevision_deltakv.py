@@ -30,7 +30,11 @@ def build_llava_text_deltakv_config(config) -> KVQwen2Config:
 
     text_config = KVQwen2Config(**config.text_config.to_dict())
     infer_config = getattr(config, "deltakv_infer_config", None) or {}
-    text_config.set_infer_args(**infer_config)
+    if getattr(config, "deltakv_infer_config_is_native", False):
+        text_config.set_native_args(**infer_config)
+        text_config.finalize_cluster_args()
+    else:
+        text_config.set_infer_args(**infer_config)
     return text_config
 
 

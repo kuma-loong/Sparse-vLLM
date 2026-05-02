@@ -23,7 +23,7 @@ CURRENT_RUN_MODE = None
 class LlamaAttnKVCompress(LlamaAttention):
     def __init__(self, config: KVLlamaConfig, layer_idx: int):
         super().__init__(config, layer_idx)
-        self.seq_chunk_size = config.seq_chunk_size
+        self.compressor_token_group_size = config.compressor_token_group_size
         self.ref_mode = config.ref_mode
         self.recon_mode = config.recon_mode
 
@@ -53,19 +53,19 @@ class LlamaAttnKVCompress(LlamaAttention):
         kv_rem = kv[:, sink_size:, :]
         rem_len = seq_len - sink_size
         
-        kv_chunks = kv_rem.view(bs, -1, self.config.seq_chunk_size, dim)
+        kv_chunks = kv_rem.view(bs, -1, self.config.compressor_token_group_size, dim)
 
-        use_seq_ref = self.config.seq_chunk_size > 1
+        use_seq_ref = self.config.compressor_token_group_size > 1
 
         seq_ref = None
         if use_seq_ref:
             if self.ref_mode == 'avg':
                 x = kv_rem.transpose(1, 2)
-                window_size = self.config.seq_chunk_size
+                window_size = self.config.compressor_token_group_size
                 x_padded = F.pad(x, (window_size - 1, 0))
                 y = F.avg_pool1d(x_padded, kernel_size=window_size, stride=1)
                 y = y.transpose(1, 2)
-                seq_ref = y.view(bs, -1, self.config.seq_chunk_size, dim)
+                seq_ref = y.view(bs, -1, self.config.compressor_token_group_size, dim)
             elif self.ref_mode == 'first':
                 seq_ref = kv_chunks[:, :, :1]
             else:

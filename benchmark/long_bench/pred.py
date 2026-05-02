@@ -170,9 +170,9 @@ def load_model_and_tokenizer(rank, args):
     generate_fn = get_generate_api(
         model_path=args.model_path,
         infer_config=infer_config,
-        compressor_path=args.compressor_path,
+        deltakv_checkpoint_path=args.deltakv_checkpoint_path,
         tokenizer_path=args.tokenizer_path,
-        model_cls=args.model_cls,
+        sparse_method=args.sparse_method,
         cuda_device=rank,
         backend=args.backend
     )
@@ -204,7 +204,7 @@ def get_pred(rank, data, dataset_info, args, model, tokenizer, model_max_length)
         batch_data = data[i:i + batch_size]
         prompts = []
         for json_obj in batch_data:
-            if args.model_cls == "kvzip" and args.backend == "hf":
+            if args.sparse_method == "kvzip" and args.backend == "hf":
                 use_kvzip_template = not args.no_chat_template and dataset not in NO_CHAT_TEMPLATE_DATASETS
                 prompt_parts = build_kvzip_prompt_parts(
                     prompt_format,
@@ -359,10 +359,10 @@ def parse_args():
 
     # DeltaKV related arguments
     parser.add_argument("--model_path", type=str, required=True)
-    parser.add_argument("--compressor_path", type=str, default=None)
+    parser.add_argument("--deltakv_checkpoint_path", type=str, default=None)
     parser.add_argument("--tokenizer_path", type=str, default=None)
-    parser.add_argument("--model_cls", type=str, default='deltakv')
-    parser.add_argument("--backend", type=str, default='deltakv', choices=['hf', 'sparsevllm'])
+    parser.add_argument("--sparse_method", type=str, default='deltakv')
+    parser.add_argument("--backend", type=str, default='hf', choices=['hf', 'sparsevllm'])
     parser.add_argument("--num_samples", type=int, default=None, help="Limit the number of samples to process per task")
     parser.add_argument("--batch_size", type=int, default=1, help="Batch size for inference")
     parser.add_argument("--no_chat_template", action='store_true', help="Do not use chat template")
@@ -384,7 +384,7 @@ if __name__ == '__main__':
     mp.set_start_method('spawn', force=True)
     
     model_name = args.model
-    compressor_name = os.path.basename(args.compressor_path.rstrip('/')) if args.compressor_path else "None"
+    compressor_name = os.path.basename(args.deltakv_checkpoint_path.rstrip('/')) if args.deltakv_checkpoint_path else "None"
     
     if args.e:
         datasets = ["qasper", "multifieldqa_en", "hotpotqa", "2wikimqa", "gov_report", "multi_news", "trec", "triviaqa", "samsum", "passage_count", "passage_retrieval_en", "lcc", "repobench-p"]
@@ -420,7 +420,7 @@ if __name__ == '__main__':
 
     if args.worker_rank >= 0:
         worker(args.worker_rank, args.worker_world_size, datasets, dataset2prompt, dataset2maxlen, args, out_root, max_length_limit)
-    elif args.ws > 1 and args.model_cls == "kvzip":
+    elif args.ws > 1 and args.sparse_method == "kvzip":
         launch_single_gpu_workers(args, out_root)
     elif args.ws > 1:
         processes = []

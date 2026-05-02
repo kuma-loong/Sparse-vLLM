@@ -28,9 +28,9 @@ def main(
 
     # 压缩器相关配置
     model_type: str = 'parallel',  # 'parallel', 'sequential', 'e2e' or 'cluster_e2e'
-    kv_compressed_size: int = 64,
-    seq_chunk_size: int = 1,
-    k_neighbors: int = None,
+    deltakv_latent_dim: int = 64,
+    compressor_token_group_size: int = 1,
+    deltakv_neighbor_count: int = 1,
     layer_chunk_size: int = 1,
     recon_mode: str = 'delta_in_latent',  # delta_in_origin or delta_in_latent
     ref_mode: str = 'last',  # last or avg or first
@@ -46,7 +46,7 @@ def main(
     cluster_on_kv: bool = True,
     cluster_temp: float = 10.0,
     cluster_soft_assignment: bool = True,
-    cluster_ratio: float = 0.1,
+    deltakv_center_ratio: float = 0.1,
     split_kv: bool = False,
 
     # 训练超参数
@@ -139,9 +139,9 @@ def main(
 
     config = KVConfig.from_pretrained(model_name_or_path)
     config.set_extra_args(
-        kv_compressed_size=kv_compressed_size,
-        seq_chunk_size=seq_chunk_size,
-        k_neighbors=k_neighbors,
+        deltakv_latent_dim=deltakv_latent_dim,
+        compressor_token_group_size=compressor_token_group_size,
+        deltakv_neighbor_count=deltakv_neighbor_count,
         layer_chunk_size=layer_chunk_size,
         recon_mode=recon_mode,
         ref_mode=ref_mode,
@@ -157,12 +157,12 @@ def main(
         cluster_on_kv=cluster_on_kv,
         cluster_temp=cluster_temp,
         cluster_soft_assignment=cluster_soft_assignment,
-        cluster_ratio=cluster_ratio,
+        deltakv_center_ratio=deltakv_center_ratio,
         split_kv=split_kv,
         use_cluster=model_type in ['cluster_e2e', 'cluster_e2e_big'],
         use_compression=True,
     )
-    config.finalize_cluster_args(warn_on_legacy_k_neighbors=False)
+    config.finalize_cluster_args()
     print(f'[Config]\n{config=}')
 
     # --- 2. 加载模型 ---
@@ -253,11 +253,11 @@ def main(
     # --- 5. 配置训练器 ---
     # 根据超参数创建唯一的输出目录和运行名称
     if model_type == 'e2e':
-        run_name_suffix = f"e2e_ref{ref_mode}_cs{kv_compressed_size}_scs{seq_chunk_size}_lcs{layer_chunk_size}"
+        run_name_suffix = f"e2e_ref{ref_mode}_ld{deltakv_latent_dim}_ctg{compressor_token_group_size}_lcs{layer_chunk_size}"
         if split_kv:
             run_name_suffix += "_split"
     elif model_type in ['cluster_e2e', 'cluster_e2e_big']:
-        run_name_suffix = f"{model_type}_cs{kv_compressed_size}_bias{compressor_linear_bias}_{cluster_metric}_ratio{cluster_ratio}"
+        run_name_suffix = f"{model_type}_ld{deltakv_latent_dim}_bias{compressor_linear_bias}_{cluster_metric}_ratio{deltakv_center_ratio}"
         if not cluster_on_kv:
             run_name_suffix += "_clusSoft"
         if not cluster_soft_assignment:

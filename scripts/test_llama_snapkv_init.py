@@ -11,9 +11,11 @@ def test_init():
         vocab_size=1000,
         snapkv_num_full_layers=1,
         snapkv_window_size=4,
-        tail_token_size=16,
-        num_sink_tokens=8,
-        num_top_tokens=32
+    )
+    config.set_infer_args(
+        recent_keep_tokens=16,
+        sink_keep_tokens=8,
+        decode_keep_tokens=32,
     )
     model = LlamaSnapKVForCausalLM(config)
     print("Model initialized successfully!")

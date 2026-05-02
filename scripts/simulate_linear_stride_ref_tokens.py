@@ -51,9 +51,9 @@ def main() -> None:
         default="0,0.001,0.02,0.05,0.1,0.2",
         help="Comma-separated stride_alpha values.",
     )
-    parser.add_argument("--cluster-ratio", type=float, default=0.1)
-    parser.add_argument("--num-sink-tokens", type=int, default=8)
-    parser.add_argument("--num-recent-tokens", type=int, default=128)
+    parser.add_argument("--deltakv-center-ratio", type=float, default=0.1)
+    parser.add_argument("--sink-keep-tokens", type=int, default=8)
+    parser.add_argument("--recent-keep-tokens", type=int, default=128)
     parser.add_argument(
         "--show-total-retained",
         action="store_true",
@@ -63,10 +63,10 @@ def main() -> None:
 
     ctx_lens = parse_csv_ints(args.ctx_lens)
     alphas = parse_csv_floats(args.alphas)
-    base_stride = max(1, int(1 / args.cluster_ratio))
+    base_stride = max(1, int(1 / args.deltakv_center_ratio))
 
     print(
-        f"base_stride={base_stride}, sink={args.num_sink_tokens}, recent={args.num_recent_tokens}"
+        f"base_stride={base_stride}, sink={args.sink_keep_tokens}, recent={args.recent_keep_tokens}"
     )
     print()
 
@@ -82,8 +82,8 @@ def main() -> None:
                         ctx_len,
                         alpha,
                         base_stride=base_stride,
-                        sink=args.num_sink_tokens,
-                        recent=args.num_recent_tokens,
+                        sink=args.sink_keep_tokens,
+                        recent=args.recent_keep_tokens,
                     )
                 )
             )
@@ -96,7 +96,7 @@ def main() -> None:
     header = ["alpha \\ ctx_len"] + [str(x) for x in ctx_lens]
     print("| " + " | ".join(header) + " |")
     print("|" + "|".join(["---"] * len(header)) + "|")
-    retained_prefix = args.num_sink_tokens + args.num_recent_tokens
+    retained_prefix = args.sink_keep_tokens + args.recent_keep_tokens
     for alpha in alphas:
         row = [str(alpha)]
         for ctx_len in ctx_lens:
@@ -107,8 +107,8 @@ def main() -> None:
                         ctx_len,
                         alpha,
                         base_stride=base_stride,
-                        sink=args.num_sink_tokens,
-                        recent=args.num_recent_tokens,
+                        sink=args.sink_keep_tokens,
+                        recent=args.recent_keep_tokens,
                     )
                 )
             )

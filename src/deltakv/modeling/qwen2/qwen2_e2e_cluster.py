@@ -57,7 +57,7 @@ class Qwen2AttnKVClusterCompress(Qwen2Attention):
         bs, seq_len_rem, _ = scores.shape
         num_prototypes = prototypes.shape[1]
         token_dim = prototypes.shape[-1]
-        k = self.config.get_cluster_k_neighbors()
+        k = self.config.get_cluster_neighbor_count()
         topk_scores, topk_indices = torch.topk(scores, k=min(k, num_prototypes), dim=-1)
         indices = topk_indices.view(bs, -1)[:, :, None].expand(-1, -1, token_dim)
         gathered = prototypes.gather(dim=1, index=indices).view(bs, seq_len_rem, -1, token_dim)
