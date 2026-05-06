@@ -118,3 +118,25 @@ python scripts/bench_llava_onevision_deltakv.py
 ```
 
 It delegates to the visual-pruning script and prints a deprecation warning.
+
+## Reproducibility Artifacts
+
+`scripts/bench_llava_onevision_visual_prune.py` now writes experiment artifacts
+under `--output_dir`. If `--output_dir` is omitted, it writes to `--dataset_dir`
+for compatibility with older local commands.
+
+Each method writes:
+
+- `<method>_raw_outputs.jsonl`: raw generations.
+- `<method>_parsed_outputs.jsonl`: parsed text, labels, VQA score, and explicit
+  per-sample status.
+- `<method>_per_sample_results.jsonl`: full per-sample records.
+- `<method>_aggregate_metrics.json`: aggregate speed, memory, status counts,
+  and VQA metrics.
+- `run_info.json`: command, git commit, model, dataset, decoding parameters,
+  seed, runtime parameters, and evaluated sample count.
+- `last_benchmark_result.json`: method summaries plus artifact paths.
+
+When exactly two methods are run and one is `vanilla`, the candidate aggregate
+metrics include `speedup_vs_vanilla`, `memory_delta_gb_vs_vanilla`,
+`vqa_score_delta_vs_vanilla`, and `contains_answer_delta_vs_vanilla`.

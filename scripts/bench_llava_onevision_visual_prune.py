@@ -2,9 +2,15 @@
 import argparse
 import gc
 import json
+import os
+import random
 import re
+import shlex
 import string
+import subprocess
+import sys
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 
 import pyarrow.parquet as pq
@@ -88,6 +94,11 @@ def parse_args():
     )
     parser.add_argument("--dataset_dir", default="/data2/haojitai/datasets/llava_onevision_visual_prune_bench")
     parser.add_argument("--source_vqa_dir", default="/data2/haojitai/datasets/VQAv2")
+    parser.add_argument(
+        "--output_dir",
+        default="",
+        help="Directory for benchmark artifacts. Defaults to --dataset_dir for backward-compatible local runs.",
+    )
     parser.add_argument("--num_samples", type=int, default=4)
     parser.add_argument(
         "--batch_size",
@@ -123,9 +134,117 @@ def parse_args():
     parser.add_argument("--deltakv_neighbor_count", type=int, default=1)
     parser.add_argument("--quantize_visual_kv", action="store_true")
     parser.add_argument("--limit_text_tokens", type=int, default=0)
+    parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--log_every", type=int, default=1)
     parser.add_argument("--print_records", action="store_true", help="Print per-sample records in the terminal summary.")
     return parser.parse_args()
+
+
+def validate_args(args) -> None:
+    if args.num_samples < -1:
+        raise ValueError("--num_samples must be -1 for all rows or a non-negative count.")
+    if args.num_samples == 0:
+        raise ValueError("--num_samples=0 does not evaluate any samples.")
+    if args.batch_size < 1:
+        raise ValueError("--batch_size must be >= 1.")
+    if args.max_new_tokens < 1:
+        raise ValueError("--max_new_tokens must be >= 1.")
+    if args.log_every < 1:
+        raise ValueError("--log_every must be >= 1.")
+    if args.limit_text_tokens < 0:
+        raise ValueError("--limit_text_tokens must be non-negative.")
+    if args.visual_keep_ratio <= 0.0 or args.visual_keep_ratio > 1.0:
+        raise ValueError("--visual_keep_ratio must be in (0, 1].")
+    if args.deltakv_center_ratio <= 0.0 or args.deltakv_center_ratio > 1.0:
+        raise ValueError("--deltakv_center_ratio must be in (0, 1].")
+    for name in (
+        "recent_keep_tokens",
+        "sink_keep_tokens",
+        "decode_keep_tokens",
+        "prefill_keep_tokens",
+        "deltakv_neighbor_count",
+    ):
+        if getattr(args, name) < 0:
+            raise ValueError(f"--{name} must be non-negative.")
+    if args.hf_prefill_chunk_size < 1:
+        raise ValueError("--hf_prefill_chunk_size must be >= 1.")
+
+
+def init_seed(seed: int) -> None:
+    random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
+
+def get_git_commit() -> str:
+    completed = subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        check=False,
+    )
+    if completed.returncode != 0:
+        raise RuntimeError(f"Failed to read git commit: {completed.stderr.strip()}")
+    return completed.stdout.strip()
+
+
+def build_run_info(args, output_dir: Path, row_count: int) -> dict:
+    return {
+        "created_at_utc": datetime.now(timezone.utc).isoformat(),
+        "command": " ".join(shlex.quote(part) for part in sys.argv),
+        "cwd": os.getcwd(),
+        "git_commit": get_git_commit(),
+        "model_path": args.model_path,
+        "deltakv_checkpoint_path": args.deltakv_checkpoint_path,
+        "methods": args.methods,
+        "dataset_dir": args.dataset_dir,
+        "source_vqa_dir": args.source_vqa_dir,
+        "output_dir": str(output_dir),
+        "num_samples_arg": args.num_samples,
+        "evaluated_sample_count": row_count,
+        "batch_size": args.batch_size,
+        "max_new_tokens": args.max_new_tokens,
+        "decoding": {
+            "do_sample": False,
+            "torch_dtype": args.torch_dtype,
+            "attn_implementation": args.attn_implementation,
+        },
+        "seed": args.seed,
+        "runtime_params": {
+            "recent_keep_tokens": args.recent_keep_tokens,
+            "sink_keep_tokens": args.sink_keep_tokens,
+            "decode_keep_tokens": args.decode_keep_tokens,
+            "prefill_keep_tokens": args.prefill_keep_tokens,
+            "hf_prefill_chunk_size": args.hf_prefill_chunk_size,
+            "full_attention_layers": args.full_attention_layers,
+            "visual_keep_ratio": args.visual_keep_ratio,
+            "delta_quant_bits": args.delta_quant_bits,
+            "deltakv_center_ratio": args.deltakv_center_ratio,
+            "deltakv_neighbor_count": args.deltakv_neighbor_count,
+            "quantize_visual_kv": bool(args.quantize_visual_kv),
+            "chunk_prefill_accel_omnikv": bool(args.chunk_prefill_accel_omnikv),
+            "limit_text_tokens": args.limit_text_tokens,
+        },
+    }
+
+
+def validate_vqa_row(row: dict, *, source: str) -> dict:
+    required = ("question_id", "image_id", "question", "answer", "answers", "image_path")
+    missing = [key for key in required if key not in row]
+    if missing:
+        raise ValueError(f"VQA row from {source} is missing fields: {missing}")
+    image_path = Path(row["image_path"])
+    if not image_path.exists() or image_path.stat().st_size == 0:
+        raise FileNotFoundError(f"VQA row from {source} references a missing/empty image: {image_path}")
+    if not str(row["question"]).strip():
+        raise ValueError(f"VQA row from {source} has an empty question: question_id={row['question_id']!r}")
+    if not str(row["answer"]).strip():
+        raise ValueError(f"VQA row from {source} has an empty answer: question_id={row['question_id']!r}")
+    if not isinstance(row["answers"], list) or not [answer for answer in row["answers"] if str(answer).strip()]:
+        raise ValueError(f"VQA row from {source} has no annotator answers: question_id={row['question_id']!r}")
+    return row
 
 
 def prepare_vqa_subset(source_vqa_dir: Path, dataset_dir: Path, num_samples: int):
@@ -135,7 +254,11 @@ def prepare_vqa_subset(source_vqa_dir: Path, dataset_dir: Path, num_samples: int
     use_all = num_samples < 0
     manifest_path = dataset_dir / ("vqa_validation_all.jsonl" if use_all else f"vqa_subset_{num_samples}.jsonl")
     if manifest_path.exists():
-        rows = [json.loads(line) for line in manifest_path.read_text().splitlines() if line.strip()]
+        rows = [
+            validate_vqa_row(json.loads(line), source=str(manifest_path))
+            for line in manifest_path.read_text().splitlines()
+            if line.strip()
+        ]
         if use_all:
             return rows
         if len(rows) >= num_samples:
@@ -162,16 +285,23 @@ def prepare_vqa_subset(source_vqa_dir: Path, dataset_dir: Path, num_samples: int
         ):
             if not image or image.get("bytes") is None:
                 continue
+            if answer is None or not str(answer).strip():
+                raise ValueError(f"VQAv2 row has an empty multiple_choice_answer: question_id={question_id!r}")
+            answer_list = [item["answer"] for item in answers or [] if item and item.get("answer") is not None]
+            if not [item for item in answer_list if str(item).strip()]:
+                raise ValueError(f"VQAv2 row has no annotator answers: question_id={question_id!r}")
             image_path = images_dir / f"{image_id}.jpg"
             if not image_path.exists():
                 image_path.write_bytes(image["bytes"])
+            if image_path.stat().st_size == 0:
+                raise FileNotFoundError(f"VQAv2 image is empty after materialization: {image_path}")
             rows.append(
                 {
                     "question_id": int(question_id),
                     "image_id": int(image_id),
                     "question": question,
                     "answer": answer,
-                    "answers": [item["answer"] for item in answers or [] if item and item.get("answer") is not None],
+                    "answers": answer_list,
                     "image_path": str(image_path),
                 }
             )
@@ -587,7 +717,10 @@ def run_method(method, model, processor, rows, args, dtype, device, policy=None,
 
     log_every = max(1, int(args.log_every))
     for batch_start, batch_rows in iter_batches(rows, effective_batch_size):
-        images = [Image.open(row["image_path"]).convert("RGB") for row in batch_rows]
+        images = []
+        for row in batch_rows:
+            with Image.open(row["image_path"]) as image:
+                images.append(image.convert("RGB").copy())
         prompts = [build_prompt(processor, row["question"], args.limit_text_tokens) for row in batch_rows]
         processor_kwargs = {"text": prompts, "images": images, "return_tensors": "pt"}
         if len(batch_rows) > 1:
@@ -625,14 +758,18 @@ def run_method(method, model, processor, rows, args, dtype, device, policy=None,
 
         for offset, (row, decoded) in enumerate(zip(batch_rows, decoded_batch)):
             sample_idx = batch_start + offset + 1
-            decoded = decoded.strip()
+            raw_decoded = decoded
+            decoded = raw_decoded.strip()
             answer = row["answer"]
-            answers = row.get("answers") or [answer]
+            answers = row["answers"]
             hit = normalize_text(answer) in normalize_text(decoded)
             score = vqa_score(decoded, answers)
             records.append(
                 {
+                    "status": "success",
                     "question_id": row["question_id"],
+                    "image_id": row["image_id"],
+                    "image_path": row["image_path"],
                     "input_tokens": int(input_token_counts[offset]),
                     "padded_input_tokens": input_len,
                     "visual_tokens": int(visual_token_counts[offset]),
@@ -644,6 +781,8 @@ def run_method(method, model, processor, rows, args, dtype, device, policy=None,
                     "answer": answer,
                     "answers": answers,
                     "prediction": decoded,
+                    "raw_prediction": raw_decoded,
+                    "parsed_text": decoded,
                     "contains_answer": hit,
                     "vqa_score": score,
                 }
@@ -661,6 +800,9 @@ def run_method(method, model, processor, rows, args, dtype, device, policy=None,
     peak_gb = torch.cuda.max_memory_allocated(device) / (1024 ** 3)
     contains_acc = sum(record["contains_answer"] for record in records) / max(len(records), 1)
     mean_vqa_score = sum(record["vqa_score"] for record in records) / max(len(records), 1)
+    status_counts = {}
+    for record in records:
+        status_counts[record["status"]] = status_counts.get(record["status"], 0) + 1
     uses_visual_uniform = bool(policy and policy.get("uses_visual_uniform_pruning", False))
     visual_keep_ratio = args.visual_keep_ratio if uses_visual_uniform else 1.0
     visual_storage_ratio = 1.0
@@ -675,6 +817,7 @@ def run_method(method, model, processor, rows, args, dtype, device, policy=None,
         "visual_keep_ratio": visual_keep_ratio,
         "visual_storage_ratio": visual_storage_ratio,
         "num_samples": len(records),
+        "status_counts": status_counts,
         "batch_size": effective_batch_size,
         "total_batches": total_batches,
         "total_new_tokens": total_new_tokens,
@@ -691,6 +834,79 @@ def run_method(method, model, processor, rows, args, dtype, device, policy=None,
     if policy is not None:
         result["visual_cache_policy"] = policy
     return result
+
+
+def save_method_artifacts(output_dir: Path, result: dict, run_info: dict) -> dict:
+    method = result["method"]
+    raw_path = output_dir / f"{method}_raw_outputs.jsonl"
+    parsed_path = output_dir / f"{method}_parsed_outputs.jsonl"
+    records_path = output_dir / f"{method}_per_sample_results.jsonl"
+    metrics_path = output_dir / f"{method}_aggregate_metrics.json"
+    run_info_path = output_dir / "run_info.json"
+
+    with raw_path.open("w", encoding="utf-8") as handle:
+        for record in result["records"]:
+            handle.write(
+                json.dumps(
+                    {
+                        "question_id": record["question_id"],
+                        "image_id": record["image_id"],
+                        "image_path": record["image_path"],
+                        "raw_prediction": record["raw_prediction"],
+                    },
+                    ensure_ascii=False,
+                )
+                + "\n"
+            )
+
+    with parsed_path.open("w", encoding="utf-8") as handle:
+        for record in result["records"]:
+            handle.write(
+                json.dumps(
+                    {
+                        "question_id": record["question_id"],
+                        "prediction": record["prediction"],
+                        "answer": record["answer"],
+                        "answers": record["answers"],
+                        "status": record["status"],
+                        "contains_answer": record["contains_answer"],
+                        "vqa_score": record["vqa_score"],
+                    },
+                    ensure_ascii=False,
+                )
+                + "\n"
+            )
+
+    with records_path.open("w", encoding="utf-8") as handle:
+        for record in result["records"]:
+            handle.write(json.dumps(record, ensure_ascii=False) + "\n")
+
+    metrics = {key: value for key, value in result.items() if key != "records"}
+    metrics_path.write_text(json.dumps(metrics, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+    run_info_path.write_text(json.dumps(run_info, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+
+    return {
+        "raw_outputs": str(raw_path),
+        "parsed_outputs": str(parsed_path),
+        "per_sample_results": str(records_path),
+        "aggregate_metrics": str(metrics_path),
+        "run_info": str(run_info_path),
+    }
+
+
+def add_vanilla_comparison(results: list[dict]) -> None:
+    if len(results) != 2:
+        return
+    base = next((item for item in results if item["method"] == "vanilla"), None)
+    candidate = next((item for item in results if item["method"] != "vanilla"), None)
+    if base is None or candidate is None:
+        return
+    if base["new_tokens_per_s"] <= 0:
+        raise RuntimeError("Cannot compute speedup_vs_vanilla because vanilla new_tokens_per_s is not positive.")
+    candidate["speedup_vs_vanilla"] = candidate["new_tokens_per_s"] / base["new_tokens_per_s"]
+    candidate["memory_delta_gb_vs_vanilla"] = candidate["peak_memory_gb"] - base["peak_memory_gb"]
+    candidate["vqa_score_delta_vs_vanilla"] = candidate["mean_vqa_score"] - base["mean_vqa_score"]
+    candidate["contains_answer_delta_vs_vanilla"] = candidate["contains_answer_acc"] - base["contains_answer_acc"]
 
 
 def iter_requested_methods(methods: str):
@@ -715,12 +931,19 @@ def iter_requested_methods(methods: str):
 
 def main():
     args = parse_args()
+    validate_args(args)
+    init_seed(args.seed)
+    output_dir = Path(args.output_dir) if args.output_dir else Path(args.dataset_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
     dtype = torch.bfloat16 if args.torch_dtype == "bfloat16" else torch.float16
     device = torch.device(f"cuda:{args.cuda_device}")
     torch.cuda.set_device(device)
 
     rows = prepare_vqa_subset(Path(args.source_vqa_dir), Path(args.dataset_dir), args.num_samples)
-    print(f"[dataset] rows={len(rows)} dataset_dir={args.dataset_dir}", flush=True)
+    if not rows:
+        raise RuntimeError(f"No VQA rows were prepared from source_vqa_dir={args.source_vqa_dir}")
+    print(f"[dataset] rows={len(rows)} dataset_dir={args.dataset_dir} output_dir={output_dir}", flush=True)
+    run_info = build_run_info(args, output_dir, len(rows))
     processor = LlavaOnevisionProcessor.from_pretrained(args.model_path, trust_remote_code=True)
 
     results = []
@@ -762,14 +985,11 @@ def main():
         gc.collect()
         torch.cuda.empty_cache()
 
-    if len(results) == 2:
-        base = next((item for item in results if item["method"] == "vanilla"), None)
-        candidate = next((item for item in results if item["method"] != "vanilla"), None)
-        if base and candidate:
-            candidate["speedup_vs_vanilla"] = candidate["new_tokens_per_s"] / base["new_tokens_per_s"]
-            candidate["memory_delta_gb_vs_vanilla"] = candidate["peak_memory_gb"] - base["peak_memory_gb"]
+    add_vanilla_comparison(results)
+    for result in results:
+        result["artifact_paths"] = save_method_artifacts(output_dir, result, run_info)
 
-    out_path = Path(args.dataset_dir) / "last_benchmark_result.json"
+    out_path = output_dir / "last_benchmark_result.json"
     out_path.write_text(json.dumps(results, indent=2, ensure_ascii=False) + "\n")
     print("[summary]")
     if args.print_records:

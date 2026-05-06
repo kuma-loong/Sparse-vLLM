@@ -210,6 +210,40 @@ def apply_streamingbench_profile(args):
     return args
 
 
+def validate_args(args) -> None:
+    if args.num_samples < -1:
+        raise ValueError("--num_samples must be -1 for all rows or a non-negative count.")
+    if args.num_samples == 0:
+        raise ValueError("--num_samples=0 does not evaluate any rows.")
+    if args.sample_start < 0:
+        raise ValueError("--sample_start must be non-negative.")
+    if args.batch_size < 1:
+        raise ValueError("--batch_size must be >= 1.")
+    if args.num_video_frames < 1:
+        raise ValueError("--num_video_frames must be >= 1.")
+    if args.max_new_tokens < 1:
+        raise ValueError("--max_new_tokens must be >= 1.")
+    if args.log_every < 1:
+        raise ValueError("--log_every must be >= 1.")
+    if args.context_seconds < 0 and args.context_seconds != -1:
+        raise ValueError("--context_seconds must be -1 for all context or a non-negative window in seconds.")
+    if args.visual_keep_ratio <= 0.0 or args.visual_keep_ratio > 1.0:
+        raise ValueError("--visual_keep_ratio must be in (0, 1].")
+    if args.deltakv_center_ratio <= 0.0 or args.deltakv_center_ratio > 1.0:
+        raise ValueError("--deltakv_center_ratio must be in (0, 1].")
+    for name in (
+        "recent_keep_tokens",
+        "sink_keep_tokens",
+        "decode_keep_tokens",
+        "prefill_keep_tokens",
+        "deltakv_neighbor_count",
+    ):
+        if getattr(args, name) < 0:
+            raise ValueError(f"--{name} must be non-negative.")
+    if args.hf_prefill_chunk_size < 1:
+        raise ValueError("--hf_prefill_chunk_size must be >= 1.")
+
+
 def parse_timestamp(value: str) -> float:
     parts = [part.strip() for part in str(value).split(":") if part.strip()]
     if not parts:
@@ -394,7 +428,7 @@ def load_streamingbench_rows(args):
             "when intentionally running a partial shard."
         )
 
-    start = max(0, int(args.sample_start))
+    start = int(args.sample_start)
     rows = selected_rows[start:]
     if args.num_samples >= 0:
         rows = rows[: args.num_samples]
@@ -619,6 +653,7 @@ def build_run_info(args, dataset_info: dict, row_count: int) -> dict:
         "cwd": os.getcwd(),
         "git_commit": get_git_commit(),
         "model_path": args.model_path,
+        "deltakv_checkpoint_path": args.deltakv_checkpoint_path,
         "methods": args.methods,
         "dataset_dir": args.dataset_dir,
         "csv_dir": dataset_info["csv_dir"],
@@ -642,6 +677,19 @@ def build_run_info(args, dataset_info: dict, row_count: int) -> dict:
         "num_samples_arg": args.num_samples,
         "evaluated_sample_count": row_count,
         "dataset_info": dataset_info,
+        "runtime_params": {
+            "recent_keep_tokens": args.recent_keep_tokens,
+            "sink_keep_tokens": args.sink_keep_tokens,
+            "decode_keep_tokens": args.decode_keep_tokens,
+            "prefill_keep_tokens": args.prefill_keep_tokens,
+            "hf_prefill_chunk_size": args.hf_prefill_chunk_size,
+            "full_attention_layers": args.full_attention_layers,
+            "visual_keep_ratio": args.visual_keep_ratio,
+            "delta_quant_bits": args.delta_quant_bits,
+            "deltakv_center_ratio": args.deltakv_center_ratio,
+            "deltakv_neighbor_count": args.deltakv_neighbor_count,
+            "chunk_prefill_accel_omnikv": bool(args.chunk_prefill_accel_omnikv),
+        },
     }
 
 
@@ -966,6 +1014,20 @@ def run_method(method: str, model, processor, rows: list[dict], args, dtype, dev
     return result
 
 
+def add_vanilla_comparison(results: list[dict]) -> None:
+    if len(results) != 2:
+        return
+    base = next((item for item in results if item["method"] == "vanilla"), None)
+    candidate = next((item for item in results if item["method"] != "vanilla"), None)
+    if base is None or candidate is None:
+        return
+    if base["new_tokens_per_s"] <= 0:
+        raise RuntimeError("Cannot compute speedup_vs_vanilla because vanilla new_tokens_per_s is not positive.")
+    candidate["accuracy_delta_vs_vanilla"] = candidate["accuracy"] - base["accuracy"]
+    candidate["speedup_vs_vanilla"] = candidate["new_tokens_per_s"] / base["new_tokens_per_s"]
+    candidate["memory_delta_gb_vs_vanilla"] = candidate["peak_memory_gb"] - base["peak_memory_gb"]
+
+
 def iter_methods(methods: str):
     for raw_method in [part.strip() for part in methods.split(",") if part.strip()]:
         method = raw_method.lower()
@@ -980,6 +1042,7 @@ def iter_methods(methods: str):
 def main():
     args = parse_args()
     args = apply_streamingbench_profile(args)
+    validate_args(args)
     init_seed(args.seed)
     Path(args.output_dir).mkdir(parents=True, exist_ok=True)
     dtype = torch.bfloat16 if args.torch_dtype == "bfloat16" else torch.float16
@@ -1016,21 +1079,17 @@ def main():
         result = run_method(method_label, model, processor, rows, args, dtype, device, policy=policy)
         result["requested_method"] = requested_method
         result["dataset_info"] = dataset_info
-        result["artifact_paths"] = save_method_artifacts(Path(args.output_dir), result, run_info)
         results.append(result)
         del model
         gc.collect()
         torch.cuda.empty_cache()
 
-    if len(results) == 2:
-        base = next((item for item in results if item["method"] == "vanilla"), None)
-        candidate = next((item for item in results if item["method"] != "vanilla"), None)
-        if base and candidate:
-            candidate["accuracy_delta_vs_vanilla"] = candidate["accuracy"] - base["accuracy"]
-            candidate["speedup_vs_vanilla"] = candidate["new_tokens_per_s"] / base["new_tokens_per_s"]
-            candidate["memory_delta_gb_vs_vanilla"] = candidate["peak_memory_gb"] - base["peak_memory_gb"]
+    add_vanilla_comparison(results)
+    output_dir = Path(args.output_dir)
+    for result in results:
+        result["artifact_paths"] = save_method_artifacts(output_dir, result, run_info)
 
-    out_path = Path(args.output_dir) / "last_streamingbench_result.json"
+    out_path = output_dir / "last_streamingbench_result.json"
     out_path.write_text(json.dumps(results, indent=2, ensure_ascii=False) + "\n")
     print("[summary]")
     if args.print_records:

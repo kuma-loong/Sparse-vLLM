@@ -208,6 +208,10 @@ The script writes:
 - `frame_cache/`: extracted frames keyed by video path, time window, and frame
   count.
 
+When exactly two methods are run and one is `vanilla`, the candidate
+`<method>_aggregate_metrics.json` includes accuracy, speed, and memory deltas
+against the vanilla run.
+
 LiveVLM Table 4 baseline command on physical GPU 6 after all video shards have
 been downloaded:
 

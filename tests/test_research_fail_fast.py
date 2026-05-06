@@ -1,4 +1,5 @@
 import csv
+import json
 import tempfile
 import unittest
 from pathlib import Path
@@ -9,6 +10,7 @@ import torch
 
 from scripts import audit_livevlm_table4_result as livevlm_audit
 from scripts import bench_llava_onevision_streamingbench as streamingbench
+from scripts import bench_llava_onevision_visual_prune as visual_bench
 from sparsevllm.config import Config
 
 
@@ -67,6 +69,31 @@ class ResearchFailFastTest(unittest.TestCase):
             streamingbench.parse_timestamp("")
         with self.assertRaisesRegex(ValueError, "exactly 4 choices"):
             streamingbench.parse_options("['one', 'two']")
+
+    def test_streamingbench_validates_runtime_args(self):
+        args = SimpleNamespace(
+            num_samples=1,
+            sample_start=-1,
+            batch_size=1,
+            num_video_frames=32,
+            max_new_tokens=8,
+            log_every=1,
+            context_seconds=60.0,
+            visual_keep_ratio=1.0,
+            deltakv_center_ratio=0.1,
+            recent_keep_tokens=128,
+            sink_keep_tokens=8,
+            decode_keep_tokens=1024,
+            prefill_keep_tokens=4096,
+            deltakv_neighbor_count=1,
+            hf_prefill_chunk_size=4096,
+        )
+        with self.assertRaisesRegex(ValueError, "sample_start"):
+            streamingbench.validate_args(args)
+        args.sample_start = 0
+        args.context_seconds = -2.0
+        with self.assertRaisesRegex(ValueError, "context_seconds"):
+            streamingbench.validate_args(args)
 
     def test_streamingbench_livevlm_table4_scope_and_stats(self):
         args = SimpleNamespace(
@@ -196,6 +223,61 @@ class ResearchFailFastTest(unittest.TestCase):
         metrics["livevlm_table4_stats"]["overall"]["total"] = 3999
         with self.assertRaisesRegex(RuntimeError, "Overall row count mismatch"):
             livevlm_audit.audit_metrics(metrics)
+
+    def test_visual_benchmark_saves_separate_artifacts(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            output_dir = Path(tmp)
+            result = {
+                "method": "vanilla",
+                "num_samples": 1,
+                "status_counts": {"success": 1},
+                "new_tokens_per_s": 10.0,
+                "mean_vqa_score": 1.0,
+                "contains_answer_acc": 1.0,
+                "peak_memory_gb": 1.5,
+                "records": [
+                    {
+                        "status": "success",
+                        "question_id": 1,
+                        "image_id": 2,
+                        "image_path": "/tmp/image.jpg",
+                        "raw_prediction": "cat",
+                        "prediction": "cat",
+                        "parsed_text": "cat",
+                        "answer": "cat",
+                        "answers": ["cat"],
+                        "contains_answer": True,
+                        "vqa_score": 1.0,
+                    }
+                ],
+            }
+            paths = visual_bench.save_method_artifacts(output_dir, result, {"seed": 0})
+            for path in paths.values():
+                self.assertTrue(Path(path).exists(), path)
+            metrics = json.loads(Path(paths["aggregate_metrics"]).read_text(encoding="utf-8"))
+            self.assertNotIn("records", metrics)
+            parsed = json.loads(Path(paths["parsed_outputs"]).read_text(encoding="utf-8").splitlines()[0])
+            self.assertEqual(parsed["status"], "success")
+            self.assertEqual(parsed["vqa_score"], 1.0)
+
+    def test_visual_benchmark_validates_vqa_manifest_rows(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            image_path = Path(tmp) / "image.jpg"
+            image_path.write_bytes(b"not-empty")
+            row = {
+                "question_id": 1,
+                "image_id": 2,
+                "question": "What is it?",
+                "answer": "cat",
+                "answers": ["cat"],
+                "image_path": str(image_path),
+            }
+            self.assertEqual(visual_bench.validate_vqa_row(row, source="unit")["question_id"], 1)
+
+            bad = dict(row)
+            bad["answers"] = []
+            with self.assertRaisesRegex(ValueError, "no annotator answers"):
+                visual_bench.validate_vqa_row(bad, source="unit")
 
     def test_sparsevllm_raw_config_fallback_is_opt_in(self):
         with tempfile.TemporaryDirectory() as tmp:
