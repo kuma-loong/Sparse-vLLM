@@ -95,11 +95,18 @@ class ResearchFailFastTest(unittest.TestCase):
             },
         ]
         stats = streamingbench.compute_livevlm_table4_stats(records)
-        self.assertEqual(stats["overall"]["total"], 1)
+        self.assertEqual(stats["overall"]["total"], 2)
         self.assertEqual(stats["overall"]["correct"], 1)
+        self.assertEqual(stats["overall"]["status_counts"], {"success": 1, "parse_failed": 1})
         self.assertEqual(stats["expected_llava_onevision_7b_overall_pct"], 58.85)
         self.assertEqual(stats["subtasks"][0]["abbr"], "OP")
         self.assertEqual(stats["subtasks"][0]["expected_llava_onevision_7b_pct"], 80.38)
+        self.assertEqual(stats["subtasks"][1]["status_counts"], {"parse_failed": 1})
+
+    def test_streamingbench_choice_parse_modes(self):
+        self.assertEqual(streamingbench.extract_choice(" A", "official_first_char"), "A")
+        self.assertEqual(streamingbench.extract_choice("The answer is A", "official_first_char"), "T")
+        self.assertEqual(streamingbench.extract_choice("The answer is A", "robust"), "A")
 
     def test_sparsevllm_raw_config_fallback_is_opt_in(self):
         with tempfile.TemporaryDirectory() as tmp:

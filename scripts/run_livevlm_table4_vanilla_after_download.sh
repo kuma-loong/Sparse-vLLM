@@ -144,6 +144,7 @@ CUDA_VISIBLE_DEVICES="${GPU_ID}" PYTHONPATH="${PROJECT_ROOT}/src" "${PYTHON_BIN}
   --torch_dtype float16 \
   --attn_implementation sdpa \
   --max_new_tokens 8 \
+  --choice_parse_mode official_first_char \
   --cuda_device 0 \
   --seed 0 \
   --log_every 50

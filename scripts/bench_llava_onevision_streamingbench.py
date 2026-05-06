@@ -141,6 +141,15 @@ def parse_args():
         help="Use decord uniform frame indices to match the official model adapter, or ffmpeg timestamp extraction.",
     )
     parser.add_argument("--max_new_tokens", type=int, default=8)
+    parser.add_argument(
+        "--choice_parse_mode",
+        default="official_first_char",
+        choices=["official_first_char", "robust"],
+        help=(
+            "official_first_char matches StreamingBench's count.py behavior after stripping whitespace; "
+            "robust searches for A/B/C/D anywhere in the response for diagnostic runs."
+        ),
+    )
     parser.add_argument("--cuda_device", type=int, default=7)
     parser.add_argument("--torch_dtype", default="bfloat16", choices=["bfloat16", "float16"])
     parser.add_argument("--attn_implementation", default="flash_attention_2")
@@ -534,10 +543,13 @@ def build_prompt(processor, row: dict):
     return processor.apply_chat_template(conversation, add_generation_prompt=True)
 
 
-def extract_choice(text: str) -> str:
+def extract_choice(text: str, mode: str) -> str:
     stripped = text.strip()
-    if stripped[:1].upper() in {"A", "B", "C", "D"}:
-        return stripped[:1].upper()
+    first = stripped[:1].upper()
+    if first in {"A", "B", "C", "D"}:
+        return first
+    if mode == "official_first_char":
+        return first
     match = CHOICE_RE.search(stripped)
     return match.group(1).upper() if match else ""
 
@@ -583,6 +595,7 @@ def build_run_info(args, dataset_info: dict, row_count: int) -> dict:
         "num_video_frames": args.num_video_frames,
         "context_seconds": args.context_seconds,
         "frame_sampling_backend": args.frame_sampling_backend,
+        "choice_parse_mode": args.choice_parse_mode,
         "prompt_template": PROMPT_TEMPLATE,
         "sqa_prompt_template": SQA_PROMPT_TEMPLATE,
         "decoding": {
@@ -616,19 +629,19 @@ def finalize_accuracy_stats(stats: dict):
 
 def compute_livevlm_table4_stats(records: list[dict]) -> dict:
     subtasks = []
-    overall = {"total": 0, "correct": 0}
+    overall = {"total": 0, "correct": 0, "status_counts": {}}
     by_task_type: dict[str, dict] = {}
     for record in records:
         if record["task_type"] not in LIVEVLM_TABLE4_SUBTASKS:
             continue
-        if record["status"] != "success":
-            continue
-        stats = by_task_type.setdefault(record["task_type"], {"total": 0, "correct": 0})
+        stats = by_task_type.setdefault(record["task_type"], {"total": 0, "correct": 0, "status_counts": {}})
         add_accuracy(stats, bool(record["correct"]))
         add_accuracy(overall, bool(record["correct"]))
+        stats["status_counts"][record["status"]] = stats["status_counts"].get(record["status"], 0) + 1
+        overall["status_counts"][record["status"]] = overall["status_counts"].get(record["status"], 0) + 1
 
     for task_type, (abbr, expected) in LIVEVLM_TABLE4_SUBTASKS.items():
-        stats = by_task_type.get(task_type, {"total": 0, "correct": 0})
+        stats = by_task_type.get(task_type, {"total": 0, "correct": 0, "status_counts": {}})
         accuracy = stats["correct"] / max(stats["total"], 1)
         accuracy_pct = 100.0 * accuracy
         subtasks.append(
@@ -637,6 +650,7 @@ def compute_livevlm_table4_stats(records: list[dict]) -> dict:
                 "task_type": task_type,
                 "total": stats["total"],
                 "correct": stats["correct"],
+                "status_counts": stats["status_counts"],
                 "accuracy": accuracy,
                 "accuracy_pct": accuracy_pct,
                 "expected_llava_onevision_7b_pct": expected,
@@ -648,11 +662,12 @@ def compute_livevlm_table4_stats(records: list[dict]) -> dict:
     overall_accuracy_pct = 100.0 * overall_accuracy
     return {
         "reference": LIVEVLM_TABLE4_REFERENCE,
-        "metric": "MCQA accuracy over successfully parsed predictions; parse_failed count is reported separately.",
+        "metric": "MCQA accuracy over all evaluated rows; parse_failed predictions are counted as incorrect.",
         "expected_llava_onevision_7b_overall_pct": LIVEVLM_TABLE4_EXPECTED_OVERALL,
         "overall": {
             "total": overall["total"],
             "correct": overall["correct"],
+            "status_counts": overall["status_counts"],
             "accuracy": overall_accuracy,
             "accuracy_pct": overall_accuracy_pct,
             "delta_vs_expected_pct": overall_accuracy_pct - LIVEVLM_TABLE4_EXPECTED_OVERALL
@@ -773,8 +788,9 @@ def run_method(method: str, model, processor, rows: list[dict], args, dtype, dev
 
         for offset, (row, decoded) in enumerate(zip(batch_rows, decoded_batch)):
             sample_idx = batch_start + offset + 1
-            decoded = decoded.strip()
-            prediction = extract_choice(decoded)
+            raw_decoded = decoded
+            decoded = raw_decoded.strip()
+            prediction = extract_choice(decoded, args.choice_parse_mode)
             status = status_for_prediction(prediction)
             correct = prediction == row["answer"]
             context_start, context_end = context_bounds(row, args)
@@ -799,7 +815,8 @@ def run_method(method: str, model, processor, rows: list[dict], args, dtype, dev
                     "batch_new_tokens_per_s": batch_tok_s,
                     "answer": row["answer"],
                     "prediction": prediction,
-                    "raw_prediction": decoded,
+                    "raw_prediction": raw_decoded,
+                    "parsed_text": decoded,
                     "correct": correct,
                 }
             )
@@ -835,6 +852,7 @@ def run_method(method: str, model, processor, rows: list[dict], args, dtype, dev
         "num_video_frames": args.num_video_frames,
         "context_seconds": args.context_seconds,
         "frame_sampling_backend": args.frame_sampling_backend,
+        "choice_parse_mode": args.choice_parse_mode,
         "total_batches": total_batches,
         "total_new_tokens": total_new_tokens,
         "total_seconds": total_time,

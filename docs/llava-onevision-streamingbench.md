@@ -112,6 +112,7 @@ For this repo, the LiveVLM Table 4 dense/full-attention baseline is:
 --frame_sampling_backend decord
 --torch_dtype float16
 --attn_implementation sdpa
+--choice_parse_mode official_first_char
 ```
 
 `livevlm_table4` forces:
@@ -124,7 +125,10 @@ frame_sampling_backend = decord
 ```
 
 The script reports `livevlm_table4_stats` with the 14 subitems and the expected
-LLaVA-OneVision-7B Table 4 values for direct comparison.
+LLaVA-OneVision-7B Table 4 values for direct comparison. The default
+`--choice_parse_mode official_first_char` matches StreamingBench's official
+multiple-choice counter by reading the first non-whitespace generated character;
+non-`A/B/C/D` predictions are marked `parse_failed` and counted as incorrect.
 
 The StreamingBench leaderboard also reports LLaVA-OneVision-7B with `32`
 frames. The main leaderboard setting uses 60 seconds of video context before
@@ -217,6 +221,7 @@ CUDA_VISIBLE_DEVICES=6 PYTHONPATH=$PWD/src \
   --torch_dtype float16 \
   --attn_implementation sdpa \
   --max_new_tokens 8 \
+  --choice_parse_mode official_first_char \
   --cuda_device 0 \
   --seed 0 \
   --log_every 50
