@@ -10,7 +10,8 @@ DOWNLOAD_PID="${STREAMINGBENCH_DOWNLOAD_PID:-/data2/haojitai/datasets/logs/strea
 OUTPUT_DIR="${LIVEVLM_TABLE4_OUTPUT_DIR:-/data2/haojitai/datasets/llava_onevision_streamingbench_livevlm_table4_7b_vanilla}"
 PYTHON_BIN="${PYTHON_BIN:-/home/haojitai/miniconda3/envs/svllm/bin/python}"
 MODEL_PATH="${LLAVA_ONEVISION_7B_MODEL_PATH:-/data2/haojitai/models/llava-onevision-qwen2-7b-ov-hf}"
-GPU_ID="${LIVEVLM_TABLE4_GPU_ID:-6}"
+GPU_ID="${LIVEVLM_TABLE4_GPU_ID:-}"
+GPU_IDS="${LIVEVLM_TABLE4_GPU_IDS:-${GPU_ID:-6,7}}"
 POLL_SECONDS="${LIVEVLM_TABLE4_POLL_SECONDS:-60}"
 DOWNLOAD_MAX_POLLS="${LIVEVLM_TABLE4_DOWNLOAD_MAX_POLLS:-1440}"
 GPU_MAX_POLLS="${LIVEVLM_TABLE4_GPU_MAX_POLLS:-720}"
@@ -24,7 +25,7 @@ echo "[info] dataset_root=${DATASET_ROOT}"
 echo "[info] video_dir=${VIDEO_DIR}"
 echo "[info] output_dir=${OUTPUT_DIR}"
 echo "[info] model_path=${MODEL_PATH}"
-echo "[info] gpu_id=${GPU_ID}"
+echo "[info] gpu_ids=${GPU_IDS}"
 echo "[info] audit_json=${AUDIT_JSON}"
 
 wait_for_download() {
@@ -128,17 +129,44 @@ print("[verify] LiveVLM Table 4 dataset coverage OK")
 PY
 }
 
-wait_for_gpu() {
-  for ((i = 1; i <= GPU_MAX_POLLS; i++)); do
-    local used
-    used="$(nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits -i "${GPU_ID}" | tr -d ' ')"
-    echo "[info] gpu=${GPU_ID} memory_used_mib=${used} poll=${i}/${GPU_MAX_POLLS} time=$(date -Is)"
-    if [[ "${used}" =~ ^[0-9]+$ ]] && (( used <= GPU_MEMORY_READY_MIB )); then
-      return
+candidate_gpu_ids() {
+  local raw
+  IFS=',' read -r -a raw <<< "${GPU_IDS}"
+  for gpu in "${raw[@]}"; do
+    gpu="${gpu//[[:space:]]/}"
+    if [[ -z "${gpu}" ]]; then
+      continue
     fi
+    if [[ ! "${gpu}" =~ ^[0-9]+$ ]]; then
+      echo "[error] invalid GPU id in LIVEVLM_TABLE4_GPU_IDS=${GPU_IDS}: ${gpu}" >&2
+      exit 1
+    fi
+    echo "${gpu}"
+  done
+}
+
+SELECTED_GPU_ID=""
+wait_for_gpu() {
+  mapfile -t candidates < <(candidate_gpu_ids)
+  if (( ${#candidates[@]} == 0 )); then
+    echo "[error] no candidate GPU ids from LIVEVLM_TABLE4_GPU_IDS=${GPU_IDS}" >&2
+    exit 1
+  fi
+
+  for ((i = 1; i <= GPU_MAX_POLLS; i++)); do
+    for gpu in "${candidates[@]}"; do
+      local used
+      used="$(nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits -i "${gpu}" | tr -d ' ')"
+      echo "[info] gpu=${gpu} memory_used_mib=${used} poll=${i}/${GPU_MAX_POLLS} time=$(date -Is)"
+      if [[ "${used}" =~ ^[0-9]+$ ]] && (( used <= GPU_MEMORY_READY_MIB )); then
+        SELECTED_GPU_ID="${gpu}"
+        echo "[info] selected_gpu=${SELECTED_GPU_ID}"
+        return
+      fi
+    done
     sleep "${POLL_SECONDS}"
   done
-  echo "[error] GPU ${GPU_ID} did not become ready below ${GPU_MEMORY_READY_MIB} MiB" >&2
+  echo "[error] no GPU in ${GPU_IDS} became ready below ${GPU_MEMORY_READY_MIB} MiB" >&2
   exit 1
 }
 
@@ -150,7 +178,7 @@ cd "${PROJECT_ROOT}"
 mkdir -p "${OUTPUT_DIR}"
 
 echo "[info] launching LiveVLM Table 4 vanilla baseline time=$(date -Is)"
-CUDA_VISIBLE_DEVICES="${GPU_ID}" PYTHONPATH="${PROJECT_ROOT}/src" "${PYTHON_BIN}" -u \
+CUDA_VISIBLE_DEVICES="${SELECTED_GPU_ID}" PYTHONPATH="${PROJECT_ROOT}/src" "${PYTHON_BIN}" -u \
   scripts/bench_llava_onevision_streamingbench.py \
   --model_path "${MODEL_PATH}" \
   --dataset_dir "${DATASET_ROOT}" \

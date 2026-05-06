@@ -7,7 +7,12 @@ PID_PATH="${LIVEVLM_TABLE4_RUN_PID:-/data2/haojitai/datasets/logs/livevlm_table4
 
 mkdir -p "$(dirname "${LOG_PATH}")"
 
-setsid nohup bash "${SCRIPT_DIR}/run_livevlm_table4_vanilla_after_download.sh" > "${LOG_PATH}" 2>&1 < /dev/null &
+{
+  echo
+  echo "[info] nohup_restart=$(date -Is)"
+} >> "${LOG_PATH}"
+
+setsid nohup bash "${SCRIPT_DIR}/run_livevlm_table4_vanilla_after_download.sh" >> "${LOG_PATH}" 2>&1 < /dev/null &
 pid="$!"
 echo "${pid}" > "${PID_PATH}"
 

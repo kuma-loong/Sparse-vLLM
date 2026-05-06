@@ -244,6 +244,15 @@ CUDA_VISIBLE_DEVICES=6 PYTHONPATH=$PWD/src \
   --log_every 50
 ```
 
+For the background runner, `LIVEVLM_TABLE4_GPU_IDS` can list allowed physical
+GPUs. It defaults to `6,7` in this repo so the runner still obeys the current
+card restriction while using whichever allowed GPU becomes free first:
+
+```bash
+LIVEVLM_TABLE4_GPU_IDS=6,7 \
+bash scripts/nohup_run_livevlm_table4_vanilla_after_download.sh
+```
+
 Audit the completed baseline with:
 
 ```bash
