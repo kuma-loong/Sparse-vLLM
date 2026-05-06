@@ -5,6 +5,15 @@ from pathlib import Path
 
 
 DEFAULT_OUTPUT_DIR = Path("/data2/haojitai/datasets/llava_onevision_streamingbench_livevlm_table4_7b_vanilla")
+DEFAULT_EXPECTED_MODEL_PATH = Path("/data2/haojitai/models/llava-onevision-qwen2-7b-ov-hf")
+VALID_SAMPLE_STATUSES = {
+    "success",
+    "invalid_input",
+    "model_failed",
+    "parse_failed",
+    "metric_failed",
+    "skipped_by_policy",
+}
 EXPECTED_VISIBLE_SUBTASKS = {
     "OP": ("Object Perception", 369),
     "CR": ("Causal Reasoning", 128),
@@ -42,6 +51,11 @@ def parse_args():
         default=None,
         help="Optional fail-fast threshold for |observed overall - expected overall| in percentage points.",
     )
+    parser.add_argument(
+        "--expected_model_path",
+        default=str(DEFAULT_EXPECTED_MODEL_PATH),
+        help="Expected LLaVA-OneVision-7B model path recorded in run_info.json.",
+    )
     return parser.parse_args()
 
 
@@ -67,12 +81,62 @@ def require_number(value, name: str) -> float:
     return float(value)
 
 
+def require_file(path: Path, name: str) -> Path:
+    if not path.exists():
+        raise FileNotFoundError(f"Missing {name}: {path}")
+    if not path.is_file():
+        raise FileNotFoundError(f"{name} is not a file: {path}")
+    if path.stat().st_size <= 0:
+        raise RuntimeError(f"{name} is empty: {path}")
+    return path
+
+
+def load_json(path: Path, name: str):
+    require_file(path, name)
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as e:
+        raise ValueError(f"Failed to parse {name} JSON: {path}: {e}") from e
+
+
+def load_jsonl(path: Path, name: str) -> list[dict]:
+    require_file(path, name)
+    rows = []
+    with path.open(encoding="utf-8") as handle:
+        for line_number, line in enumerate(handle, start=1):
+            stripped = line.strip()
+            if not stripped:
+                raise ValueError(f"{name} has an empty line at {path}:{line_number}")
+            try:
+                value = json.loads(stripped)
+            except json.JSONDecodeError as e:
+                raise ValueError(f"Failed to parse {name} JSONL at {path}:{line_number}: {e}") from e
+            if not isinstance(value, dict):
+                raise TypeError(f"{name} row must be a JSON object at {path}:{line_number}")
+            rows.append(value)
+    return rows
+
+
 def weighted_accuracy_pct(items: list[dict]) -> float | None:
     total = sum(int(item.get("total", 0)) for item in items)
     if total <= 0:
         return None
     correct = sum(int(item.get("correct", 0)) for item in items)
     return 100.0 * correct / total
+
+
+def expected_task_type_counts() -> dict[str, int]:
+    counts = {}
+    for task_type, count in EXPECTED_VISIBLE_SUBTASKS.values():
+        counts[task_type] = count
+    for task_type, count in EXPECTED_EXTRA_SUBTASKS.values():
+        counts[task_type] = count
+    return counts
+
+
+def assert_equal(actual, expected, name: str) -> None:
+    if actual != expected:
+        raise RuntimeError(f"{name} mismatch: got {actual!r}, expected {expected!r}")
 
 
 def audit_subtask_items(items: list[dict], expected: dict[str, tuple[str, int]], group_name: str) -> None:
@@ -109,6 +173,128 @@ def audit_subtask_items(items: list[dict], expected: dict[str, tuple[str, int]],
             }
     if mismatched:
         raise RuntimeError(f"{group_name} subtask row-count mismatch: {mismatched}")
+
+
+def audit_run_info(run_info: dict, expected_model_path: str, expected_rows: int) -> dict:
+    required = {
+        "model_path": expected_model_path,
+        "methods": "vanilla",
+        "streamingbench_profile": "livevlm_table4",
+        "tasks": "livevlm_table4",
+        "num_video_frames": 32,
+        "context_seconds": -1.0,
+        "frame_sampling_backend": "decord",
+        "choice_parse_mode": "official_first_char",
+        "sample_start": 0,
+        "num_samples_arg": -1,
+        "evaluated_sample_count": expected_rows,
+        "seed": 0,
+    }
+    for key, expected in required.items():
+        assert_equal(run_info.get(key), expected, f"run_info.{key}")
+
+    decoding = require_mapping(run_info.get("decoding"), "run_info.decoding")
+    assert_equal(decoding.get("max_new_tokens"), 8, "run_info.decoding.max_new_tokens")
+    assert_equal(decoding.get("do_sample"), False, "run_info.decoding.do_sample")
+    assert_equal(decoding.get("torch_dtype"), "float16", "run_info.decoding.torch_dtype")
+    assert_equal(decoding.get("attn_implementation"), "sdpa", "run_info.decoding.attn_implementation")
+
+    dataset_info = require_mapping(run_info.get("dataset_info"), "run_info.dataset_info")
+    task_counts = require_mapping(dataset_info.get("evaluated_task_type_counts"), "run_info.dataset_info.evaluated_task_type_counts")
+    expected_counts = expected_task_type_counts()
+    mismatched_counts = {
+        task_type: {"got": int(task_counts.get(task_type, 0)), "expected": expected}
+        for task_type, expected in expected_counts.items()
+        if int(task_counts.get(task_type, 0)) != expected
+    }
+    if mismatched_counts:
+        raise RuntimeError(f"run_info dataset task-type counts mismatch: {mismatched_counts}")
+
+    return {
+        "model_path": run_info.get("model_path"),
+        "command": run_info.get("command"),
+        "git_commit": run_info.get("git_commit"),
+        "dataset_dir": run_info.get("dataset_dir"),
+        "video_dir": run_info.get("video_dir"),
+    }
+
+
+def audit_jsonl_artifacts(output_dir: Path, expected_rows: int) -> dict:
+    raw_rows = load_jsonl(output_dir / "vanilla_raw_outputs.jsonl", "raw outputs")
+    parsed_rows = load_jsonl(output_dir / "vanilla_parsed_outputs.jsonl", "parsed outputs")
+    per_sample_rows = load_jsonl(output_dir / "vanilla_per_sample_results.jsonl", "per-sample results")
+    assert_equal(len(raw_rows), expected_rows, "raw output row count")
+    assert_equal(len(parsed_rows), expected_rows, "parsed output row count")
+    assert_equal(len(per_sample_rows), expected_rows, "per-sample row count")
+
+    parsed_status_counts: dict[str, int] = {}
+    parsed_ids = set()
+    for idx, row in enumerate(parsed_rows):
+        question_id = row.get("question_id")
+        if question_id in parsed_ids:
+            raise RuntimeError(f"Duplicate parsed question_id={question_id!r}")
+        parsed_ids.add(question_id)
+        status = row.get("status")
+        if status not in VALID_SAMPLE_STATUSES:
+            raise RuntimeError(f"Invalid parsed status at row {idx}: {status!r}")
+        parsed_status_counts[status] = parsed_status_counts.get(status, 0) + 1
+        if row.get("answer") not in {"A", "B", "C", "D"}:
+            raise RuntimeError(f"Invalid parsed answer at row {idx}: {row.get('answer')!r}")
+
+    per_sample_status_counts: dict[str, int] = {}
+    task_type_counts: dict[str, int] = {}
+    for idx, row in enumerate(per_sample_rows):
+        status = row.get("status")
+        if status not in VALID_SAMPLE_STATUSES:
+            raise RuntimeError(f"Invalid per-sample status at row {idx}: {status!r}")
+        per_sample_status_counts[status] = per_sample_status_counts.get(status, 0) + 1
+        task_type = str(row.get("task_type", ""))
+        task_type_counts[task_type] = task_type_counts.get(task_type, 0) + 1
+        if row.get("answer") not in {"A", "B", "C", "D"}:
+            raise RuntimeError(f"Invalid per-sample answer at row {idx}: {row.get('answer')!r}")
+        if "raw_prediction" not in row or "parsed_text" not in row:
+            raise RuntimeError(f"Per-sample row {idx} is missing raw/parsed prediction fields.")
+
+    if parsed_status_counts != per_sample_status_counts:
+        raise RuntimeError(
+            "Parsed/per-sample status count mismatch: "
+            f"parsed={parsed_status_counts}, per_sample={per_sample_status_counts}"
+        )
+
+    expected_counts = expected_task_type_counts()
+    mismatched_task_types = {
+        task_type: {"got": task_type_counts.get(task_type, 0), "expected": expected}
+        for task_type, expected in expected_counts.items()
+        if task_type_counts.get(task_type, 0) != expected
+    }
+    if mismatched_task_types:
+        raise RuntimeError(f"Per-sample task-type counts mismatch: {mismatched_task_types}")
+
+    return {
+        "raw_output_rows": len(raw_rows),
+        "parsed_output_rows": len(parsed_rows),
+        "per_sample_rows": len(per_sample_rows),
+        "status_counts_from_jsonl": per_sample_status_counts,
+    }
+
+
+def audit_output_artifacts(output_dir: Path, metrics: dict, expected_model_path: str) -> dict:
+    stats = require_mapping(metrics.get("livevlm_table4_stats"), "livevlm_table4_stats")
+    expected_rows = int(require_number(stats.get("expected_overall_row_count"), "expected_overall_row_count"))
+    run_info = require_mapping(load_json(output_dir / "run_info.json", "run_info"), "run_info")
+    last_result = load_json(output_dir / "last_streamingbench_result.json", "last_streamingbench_result")
+    if not isinstance(last_result, list) or len(last_result) != 1:
+        raise RuntimeError("last_streamingbench_result.json must contain exactly one method result for baseline audit.")
+    assert_equal(last_result[0].get("method"), "vanilla", "last_streamingbench_result[0].method")
+    assert_equal(last_result[0].get("num_samples"), expected_rows, "last_streamingbench_result[0].num_samples")
+
+    artifact_summary = audit_jsonl_artifacts(output_dir, expected_rows)
+    run_info_summary = audit_run_info(run_info, expected_model_path, expected_rows)
+    return {
+        "output_dir": str(output_dir),
+        **artifact_summary,
+        "run_info": run_info_summary,
+    }
 
 
 def audit_metrics(metrics: dict, require_overall_delta_within_pct: float | None = None) -> dict:
@@ -199,9 +385,17 @@ def print_summary(summary: dict) -> None:
 def main():
     args = parse_args()
     metrics_path = resolve_metrics_path(args.metrics_path, args.output_dir)
-    metrics = require_mapping(json.loads(metrics_path.read_text(encoding="utf-8")), str(metrics_path))
+    metrics = require_mapping(load_json(metrics_path, "aggregate metrics"), str(metrics_path))
     summary = audit_metrics(metrics, require_overall_delta_within_pct=args.require_overall_delta_within_pct)
+    artifact_summary = audit_output_artifacts(metrics_path.parent, metrics, args.expected_model_path)
+    summary["artifact_audit"] = artifact_summary
     print_summary(summary)
+    print(
+        "artifacts "
+        f"raw={artifact_summary['raw_output_rows']} "
+        f"parsed={artifact_summary['parsed_output_rows']} "
+        f"per_sample={artifact_summary['per_sample_rows']}"
+    )
     if args.json_out:
         Path(args.json_out).write_text(json.dumps(summary, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
 

@@ -244,6 +244,100 @@ class ResearchFailFastTest(unittest.TestCase):
         self.assertEqual(summary["overall_extra_subtask_count"], 2)
         self.assertAlmostEqual(summary["observed_extra_subtasks_accuracy_pct"], 50.0)
 
+        with tempfile.TemporaryDirectory() as tmp:
+            output_dir = Path(tmp)
+            task_counts = livevlm_audit.expected_task_type_counts()
+            rows = []
+            for task_type, count in task_counts.items():
+                for _ in range(count):
+                    question_id = f"{task_type.replace(' ', '_')}_{len(rows)}"
+                    rows.append(
+                        {
+                            "question_id": question_id,
+                            "task_type": task_type,
+                            "answer": "A",
+                            "prediction": "A",
+                            "status": "success",
+                            "correct": True,
+                            "raw_prediction": "A",
+                            "parsed_text": "A",
+                        }
+                    )
+
+            (output_dir / "vanilla_raw_outputs.jsonl").write_text(
+                "\n".join(
+                    json.dumps(
+                        {
+                            "question_id": row["question_id"],
+                            "sample_id": idx,
+                            "task": "real",
+                            "task_type": row["task_type"],
+                            "raw_prediction": row["raw_prediction"],
+                        }
+                    )
+                    for idx, row in enumerate(rows)
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            (output_dir / "vanilla_parsed_outputs.jsonl").write_text(
+                "\n".join(
+                    json.dumps(
+                        {
+                            "question_id": row["question_id"],
+                            "prediction": row["prediction"],
+                            "answer": row["answer"],
+                            "status": row["status"],
+                            "correct": row["correct"],
+                        }
+                    )
+                    for row in rows
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            (output_dir / "vanilla_per_sample_results.jsonl").write_text(
+                "\n".join(json.dumps(row) for row in rows) + "\n",
+                encoding="utf-8",
+            )
+            (output_dir / "run_info.json").write_text(
+                json.dumps(
+                    {
+                        "model_path": str(livevlm_audit.DEFAULT_EXPECTED_MODEL_PATH),
+                        "methods": "vanilla",
+                        "streamingbench_profile": "livevlm_table4",
+                        "tasks": "livevlm_table4",
+                        "num_video_frames": 32,
+                        "context_seconds": -1.0,
+                        "frame_sampling_backend": "decord",
+                        "choice_parse_mode": "official_first_char",
+                        "sample_start": 0,
+                        "num_samples_arg": -1,
+                        "evaluated_sample_count": 4000,
+                        "seed": 0,
+                        "decoding": {
+                            "max_new_tokens": 8,
+                            "do_sample": False,
+                            "torch_dtype": "float16",
+                            "attn_implementation": "sdpa",
+                        },
+                        "dataset_info": {"evaluated_task_type_counts": task_counts},
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            (output_dir / "last_streamingbench_result.json").write_text(
+                json.dumps([{"method": "vanilla", "num_samples": 4000}]) + "\n",
+                encoding="utf-8",
+            )
+            artifact_summary = livevlm_audit.audit_output_artifacts(
+                output_dir,
+                metrics,
+                str(livevlm_audit.DEFAULT_EXPECTED_MODEL_PATH),
+            )
+            self.assertEqual(artifact_summary["per_sample_rows"], 4000)
+
         metrics["livevlm_table4_stats"]["overall"]["total"] = 3999
         with self.assertRaisesRegex(RuntimeError, "Overall row count mismatch"):
             livevlm_audit.audit_metrics(metrics)

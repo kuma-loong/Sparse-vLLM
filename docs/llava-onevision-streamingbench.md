@@ -254,8 +254,14 @@ Audit the completed baseline with:
 
 The audit fails fast if the metrics file is missing, if the run is not the
 4000-row Table 4 scope, if any visible/overall-only subtask is missing, or if
-any subtask row count differs from the expected counts above. To enforce a
-numeric tolerance against the paper's `Overall=58.85`, add for example
+any subtask row count differs from the expected counts above. It also checks
+that `run_info.json`, `last_streamingbench_result.json`,
+`vanilla_raw_outputs.jsonl`, `vanilla_parsed_outputs.jsonl`, and
+`vanilla_per_sample_results.jsonl` exist, contain 4000 rows where applicable,
+and record the baseline settings: 7B model path, `vanilla`, `livevlm_table4`,
+32 frames, all prior context, decord sampling, `float16`, `sdpa`, greedy
+8-token decoding, `official_first_char`, and seed 0. To enforce a numeric
+tolerance against the paper's `Overall=58.85`, add for example
 `--require_overall_delta_within_pct 1.0`.
 
 ## Local Results
