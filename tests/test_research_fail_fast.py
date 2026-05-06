@@ -7,6 +7,7 @@ from unittest.mock import patch
 
 import torch
 
+from scripts import audit_livevlm_table4_result as livevlm_audit
 from scripts import bench_llava_onevision_streamingbench as streamingbench
 from sparsevllm.config import Config
 
@@ -149,6 +150,52 @@ class ResearchFailFastTest(unittest.TestCase):
 
         args.num_samples = 4
         streamingbench.validate_livevlm_table4_rows(args, rows)
+
+    def test_livevlm_table4_audit_requires_complete_metrics(self):
+        subtasks = []
+        for idx in range(14):
+            subtasks.append(
+                {
+                    "abbr": f"T{idx}",
+                    "task_type": f"Task {idx}",
+                    "total": 250,
+                    "correct": 125,
+                    "accuracy_pct": 50.0,
+                    "expected_llava_onevision_7b_pct": 50.0,
+                    "delta_vs_expected_pct": 0.0,
+                }
+            )
+        metrics = {
+            "method": "vanilla",
+            "num_samples": 4000,
+            "livevlm_table4_stats": {
+                "expected_llava_onevision_7b_overall_pct": 58.85,
+                "expected_overall_row_count": 4000,
+                "expected_display_weighted_accuracy_pct": 50.0,
+                "implied_expected_extra_subtasks_accuracy_pct": 120.8,
+                "overall": {
+                    "total": 4000,
+                    "correct": 2000,
+                    "accuracy_pct": 50.0,
+                    "matches_expected_row_count": True,
+                    "status_counts": {"success": 4000},
+                },
+                "subtasks": subtasks,
+                "overall_extra_subtasks": [
+                    {"abbr": "ACU", "task_type": "ACU", "total": 250, "correct": 125, "accuracy_pct": 50.0},
+                    {"abbr": "MCU", "task_type": "MCU", "total": 250, "correct": 125, "accuracy_pct": 50.0},
+                ],
+            },
+        }
+        summary = livevlm_audit.audit_metrics(metrics)
+        self.assertEqual(summary["overall_total"], 4000)
+        self.assertEqual(summary["visible_subtask_count"], 14)
+        self.assertEqual(summary["overall_extra_subtask_count"], 2)
+        self.assertAlmostEqual(summary["observed_extra_subtasks_accuracy_pct"], 50.0)
+
+        metrics["livevlm_table4_stats"]["overall"]["total"] = 3999
+        with self.assertRaisesRegex(RuntimeError, "Overall row count mismatch"):
+            livevlm_audit.audit_metrics(metrics)
 
     def test_sparsevllm_raw_config_fallback_is_opt_in(self):
         with tempfile.TemporaryDirectory() as tmp:
