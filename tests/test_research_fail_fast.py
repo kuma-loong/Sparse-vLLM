@@ -77,7 +77,7 @@ class ResearchFailFastTest(unittest.TestCase):
         )
         streamingbench.apply_streamingbench_profile(args)
         self.assertEqual(args.tasks, "livevlm_table4")
-        self.assertEqual(streamingbench.list_tasks(args.tasks), ["real", "omni"])
+        self.assertEqual(streamingbench.list_tasks(args.tasks), ["real", "omni", "contextual"])
         self.assertEqual(args.num_video_frames, 32)
         self.assertEqual(args.context_seconds, -1.0)
         self.assertEqual(args.frame_sampling_backend, "decord")
@@ -93,15 +93,23 @@ class ResearchFailFastTest(unittest.TestCase):
                 "status": "parse_failed",
                 "correct": False,
             },
+            {
+                "task_type": "Anomaly Context Understanding",
+                "status": "success",
+                "correct": False,
+            },
         ]
         stats = streamingbench.compute_livevlm_table4_stats(records)
-        self.assertEqual(stats["overall"]["total"], 2)
+        self.assertEqual(stats["overall"]["total"], 3)
         self.assertEqual(stats["overall"]["correct"], 1)
-        self.assertEqual(stats["overall"]["status_counts"], {"success": 1, "parse_failed": 1})
+        self.assertEqual(stats["overall"]["status_counts"], {"success": 2, "parse_failed": 1})
         self.assertEqual(stats["expected_llava_onevision_7b_overall_pct"], 58.85)
+        self.assertEqual(stats["expected_overall_row_count"], 4000)
         self.assertEqual(stats["subtasks"][0]["abbr"], "OP")
         self.assertEqual(stats["subtasks"][0]["expected_llava_onevision_7b_pct"], 80.38)
         self.assertEqual(stats["subtasks"][1]["status_counts"], {"parse_failed": 1})
+        self.assertEqual(stats["overall_extra_subtasks"][0]["abbr"], "ACU")
+        self.assertTrue(stats["overall_extra_subtasks"][0]["used_for_paper_overall"])
 
     def test_streamingbench_choice_parse_modes(self):
         self.assertEqual(streamingbench.extract_choice(" A", "official_first_char"), "A")

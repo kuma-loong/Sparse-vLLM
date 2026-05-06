@@ -79,6 +79,12 @@ for path in video_dir.rglob("*"):
 checks = {
     "real": "Real_Time_Visual_Understanding.csv",
     "omni": "Omni_Source_Understanding.csv",
+    "contextual": "Contextual_Understanding.csv",
+}
+task_hints = {
+    "real": ("real", "visual", "real-time"),
+    "omni": ("omni", "emotion", "alignment", "source", "scene"),
+    "contextual": ("context", "anomaly", "misleading"),
 }
 total_rows = 0
 missing = []
@@ -95,15 +101,16 @@ for task, filename in checks.items():
             if not match:
                 raise ValueError(f"Cannot parse sample id from question_id={question_id!r}")
             sample_id = int(match.group(1))
-            if sample_id not in video_index:
+            candidates = video_index.get(sample_id, [])
+            if not any(any(hint in str(path).lower() for hint in task_hints[task]) for path in candidates):
                 missing.append({"task": task, "question_id": question_id, "sample_id": sample_id})
     total_rows += rows
     print(f"[verify] {task} rows={rows}")
 
 if missing:
     raise FileNotFoundError(f"Missing videos for LiveVLM Table 4 rows: first={missing[:10]} total={len(missing)}")
-if total_rows != 3500:
-    raise RuntimeError(f"Expected 3500 LiveVLM Table 4 MCQA rows, got {total_rows}")
+if total_rows != 4000:
+    raise RuntimeError(f"Expected 4000 LiveVLM Table 4 overall rows, got {total_rows}")
 print(f"[verify] video_sample_ids={len(video_index)} video_files={sum(len(v) for v in video_index.values())}")
 print("[verify] LiveVLM Table 4 dataset coverage OK")
 PY

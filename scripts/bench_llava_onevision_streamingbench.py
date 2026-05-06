@@ -39,8 +39,8 @@ TASK_CSV_FILES = {
     "sqa": "Sequential_Question_Answering.csv",
 }
 
-LIVEVLM_TABLE4_TASKS = ("real", "omni")
-LIVEVLM_TABLE4_SUBTASKS = {
+LIVEVLM_TABLE4_TASKS = ("real", "omni", "contextual")
+LIVEVLM_TABLE4_DISPLAY_SUBTASKS = {
     "Object Perception": ("OP", 80.38),
     "Causal Reasoning": ("CR", 74.22),
     "Clips Summarize": ("CS", 76.03),
@@ -56,13 +56,22 @@ LIVEVLM_TABLE4_SUBTASKS = {
     "Source Discrimination": ("SD", 33.60),
     "Multimodal Alignment": ("MA", 44.80),
 }
+LIVEVLM_TABLE4_OVERALL_EXTRA_SUBTASKS = {
+    "Anomaly Context Understanding": ("ACU", None),
+    "Misleading Context Recognition": ("MCU", None),
+}
+LIVEVLM_TABLE4_OVERALL_SUBTASKS = {
+    **LIVEVLM_TABLE4_DISPLAY_SUBTASKS,
+    **LIVEVLM_TABLE4_OVERALL_EXTRA_SUBTASKS,
+}
 LIVEVLM_TABLE4_EXPECTED_OVERALL = 58.85
+LIVEVLM_TABLE4_EXPECTED_OVERALL_ROWS = 4000
 LIVEVLM_TABLE4_REFERENCE = "LiveVLM arXiv:2505.15269 Table 4, LLaVA-OneVision-7B row"
 
 TASK_VIDEO_HINTS = {
     "real": ("real", "visual", "real-time"),
-    "omni": ("omni", "emotion", "alignment", "source"),
-    "contextual": ("context", "anomaly", "misleading", "scene"),
+    "omni": ("omni", "emotion", "alignment", "source", "scene"),
+    "contextual": ("context", "anomaly", "misleading"),
     "sqa": ("sqa", "sequential"),
 }
 
@@ -629,10 +638,11 @@ def finalize_accuracy_stats(stats: dict):
 
 def compute_livevlm_table4_stats(records: list[dict]) -> dict:
     subtasks = []
+    overall_extra_subtasks = []
     overall = {"total": 0, "correct": 0, "status_counts": {}}
     by_task_type: dict[str, dict] = {}
     for record in records:
-        if record["task_type"] not in LIVEVLM_TABLE4_SUBTASKS:
+        if record["task_type"] not in LIVEVLM_TABLE4_OVERALL_SUBTASKS:
             continue
         stats = by_task_type.setdefault(record["task_type"], {"total": 0, "correct": 0, "status_counts": {}})
         add_accuracy(stats, bool(record["correct"]))
@@ -640,7 +650,7 @@ def compute_livevlm_table4_stats(records: list[dict]) -> dict:
         stats["status_counts"][record["status"]] = stats["status_counts"].get(record["status"], 0) + 1
         overall["status_counts"][record["status"]] = overall["status_counts"].get(record["status"], 0) + 1
 
-    for task_type, (abbr, expected) in LIVEVLM_TABLE4_SUBTASKS.items():
+    for task_type, (abbr, expected) in LIVEVLM_TABLE4_DISPLAY_SUBTASKS.items():
         stats = by_task_type.get(task_type, {"total": 0, "correct": 0, "status_counts": {}})
         accuracy = stats["correct"] / max(stats["total"], 1)
         accuracy_pct = 100.0 * accuracy
@@ -658,23 +668,48 @@ def compute_livevlm_table4_stats(records: list[dict]) -> dict:
             }
         )
 
+    for task_type, (abbr, expected) in LIVEVLM_TABLE4_OVERALL_EXTRA_SUBTASKS.items():
+        stats = by_task_type.get(task_type, {"total": 0, "correct": 0, "status_counts": {}})
+        accuracy = stats["correct"] / max(stats["total"], 1)
+        accuracy_pct = 100.0 * accuracy
+        overall_extra_subtasks.append(
+            {
+                "abbr": abbr,
+                "task_type": task_type,
+                "total": stats["total"],
+                "correct": stats["correct"],
+                "status_counts": stats["status_counts"],
+                "accuracy": accuracy,
+                "accuracy_pct": accuracy_pct,
+                "expected_llava_onevision_7b_pct": expected,
+                "used_for_paper_overall": True,
+            }
+        )
+
     overall_accuracy = overall["correct"] / max(overall["total"], 1)
     overall_accuracy_pct = 100.0 * overall_accuracy
     return {
         "reference": LIVEVLM_TABLE4_REFERENCE,
-        "metric": "MCQA accuracy over all evaluated rows; parse_failed predictions are counted as incorrect.",
+        "metric": (
+            "MCQA accuracy over all evaluated rows; parse_failed predictions are counted as incorrect. "
+            "The displayed subtask list mirrors LiveVLM Table 4. The overall score also includes ACU/MCU "
+            "rows from the current StreamingBench contextual split to match the paper's 4000-row scope."
+        ),
         "expected_llava_onevision_7b_overall_pct": LIVEVLM_TABLE4_EXPECTED_OVERALL,
+        "expected_overall_row_count": LIVEVLM_TABLE4_EXPECTED_OVERALL_ROWS,
         "overall": {
             "total": overall["total"],
             "correct": overall["correct"],
             "status_counts": overall["status_counts"],
             "accuracy": overall_accuracy,
             "accuracy_pct": overall_accuracy_pct,
+            "matches_expected_row_count": overall["total"] == LIVEVLM_TABLE4_EXPECTED_OVERALL_ROWS,
             "delta_vs_expected_pct": overall_accuracy_pct - LIVEVLM_TABLE4_EXPECTED_OVERALL
             if overall["total"] > 0
             else None,
         },
         "subtasks": subtasks,
+        "overall_extra_subtasks": overall_extra_subtasks,
     }
 
 

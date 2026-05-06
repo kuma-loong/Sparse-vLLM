@@ -37,6 +37,7 @@ if [[ "${DOWNLOAD_SCOPE}" == "table4" ]]; then
   DOWNLOAD_FILES=(
     "StreamingBench/Real_Time_Visual_Understanding.csv"
     "StreamingBench/Omni_Source_Understanding.csv"
+    "StreamingBench/Contextual_Understanding.csv"
     "Real-Time Visual Understanding_1-50.zip"
     "Real-Time Visual Understanding_51-100.zip"
     "Real-Time Visual Understanding_101-150.zip"
@@ -52,6 +53,8 @@ if [[ "${DOWNLOAD_SCOPE}" == "table4" ]]; then
     "Scene Understanding_1-25.zip"
     "Scene Understanding_26-50.zip"
     "Source Discrimination.zip"
+    "Anomaly Context Understanding.zip"
+    "Misleading Context Understanding.zip"
   )
 elif [[ "${DOWNLOAD_SCOPE}" != "full" ]]; then
   echo "[error] unsupported STREAMINGBENCH_DOWNLOAD_SCOPE=${DOWNLOAD_SCOPE}; expected full or table4" >&2

@@ -19,8 +19,11 @@ requires polling a video stream and scoring both trigger time and generated
 content. Use this script for accuracy, throughput, and memory comparisons on
 the multiple-choice QA tasks.
 
-LiveVLM Table 4 only reports the `real` and `omni` MCQA portions. Use
-`--streamingbench_profile livevlm_table4` for that exact scope.
+LiveVLM Table 4 displays the `real` and four `omni` MCQA subitems. Its
+`Overall=58.85` is consistent with the older StreamingBench 4000-row scope:
+all `real` rows plus the full Omni-Source split, where ACU/MCU now live in the
+current dataset's `contextual` CSV. Use `--streamingbench_profile
+livevlm_table4` for that paper-aligned scope.
 
 ## ReKV on StreamingBench
 
@@ -118,7 +121,7 @@ For this repo, the LiveVLM Table 4 dense/full-attention baseline is:
 `livevlm_table4` forces:
 
 ```text
-tasks = real,omni
+tasks = real,omni,contextual
 num_video_frames = 32
 context_seconds = -1
 frame_sampling_backend = decord
@@ -129,6 +132,8 @@ LLaVA-OneVision-7B Table 4 values for direct comparison. The default
 `--choice_parse_mode official_first_char` matches StreamingBench's official
 multiple-choice counter by reading the first non-whitespace generated character;
 non-`A/B/C/D` predictions are marked `parse_failed` and counted as incorrect.
+The `overall_extra_subtasks` field records the ACU/MCU rows that are not printed
+as Table 4 subitems but are included in the paper's `Overall` denominator.
 
 The StreamingBench leaderboard also reports LLaVA-OneVision-7B with `32`
 frames. The main leaderboard setting uses 60 seconds of video context before
