@@ -353,6 +353,118 @@ Two rows for `sample_332` used an explicitly recorded frame-cache fallback
 because the local video file is corrupt after roughly 250 seconds; this can
 affect at most `0.05` percentage points.
 
+### 7B, Full 4000-Row DeltaKV KR/CR Sweep
+
+This sweep uses the same full 4000-row `official_60s` StreamingBench scope as
+the dense baseline above:
+
+```text
+model_path = /data2/haojitai/models/llava-onevision-qwen2-7b-ov-hf
+dataset_dir = /data2/haojitai/datasets/StreamingBench_hf
+video_dir = /data2/haojitai/datasets/StreamingBench_hf/videos
+methods = deltakv_delta_quant
+deltakv_checkpoint_path = none
+tasks = livevlm_table4
+streamingbench_profile = official_60s
+num_video_frames = 32
+frame_sampling_backend = decord
+batch_size = 8
+torch_dtype = float16
+attn_implementation = flash_attention_2
+choice_parse_mode = official_first_char
+max_new_tokens = 8
+seed = 0
+frame_cache_dir = /data2/haojitai/datasets/llava_onevision_streamingbench_livevlm_table4_7b_vanilla_ctx60/frame_cache
+```
+
+The commands were launched on physical GPUs 6 and 7 with
+`CUDA_VISIBLE_DEVICES=6` or `CUDA_VISIBLE_DEVICES=7`; `run_info.json` records
+`cuda_device=0` after that remapping. All runs reused the same official 60s
+decord frame cache rather than re-extracting frames.
+
+For the no-compressor `deltakv_delta_quant` path, KR is estimated with the same
+formula used in the QAEGO4D note:
+
+```text
+KR = Lfull / L + Lsparse / L * (deltakv_center_ratio + 0.25)
+```
+
+where `0.25` is direct int4 residual storage relative to fp16 KV. Approximate CR
+below uses the measured full-run mean input length `6445.82625` tokens and
+counts `decode_keep_tokens + sink_keep_tokens + recent_keep_tokens` for sparse
+layers.
+
+| Config | Full layers | Center ratio | Decode keep | KR | Approx CR | Correct | Accuracy | New tok/s | Examples/s | E2E examples/s |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| `kr30_cr1024_full` | `0` | `0.03` | 1024 | `30.57%` | `20.92%` | 2405 / 4000 | `60.125%` | `4.314` | `2.121` | `1.168` |
+| `kr30_cr2048_full` | `0` | `0.03` | 2048 | `30.57%` | `36.24%` | 2405 / 4000 | `60.125%` | `4.292` | `2.123` | `1.146` |
+| `kr33_center005_full` | `0` | `0.05` | 1024 | `32.50%` | `20.92%` | 2405 / 4000 | `60.125%` | `4.313` | `2.120` | `1.151` |
+| `kr33_full01_full` | `0,1` | `0.03` | 1024 | `33.14%` | `23.85%` | 2405 / 4000 | `60.125%` | `4.122` | `2.035` | `1.130` |
+
+The best accuracy among these full runs is tied across all four configurations.
+Use the lowest-budget tied configuration by default:
+
+```bash
+CUDA_VISIBLE_DEVICES=6 PYTHONPATH=$PWD/src \
+/home/haojitai/miniconda3/envs/svllm/bin/python -u \
+  scripts/bench_llava_onevision_streamingbench.py \
+  --model_path /data2/haojitai/models/llava-onevision-qwen2-7b-ov-hf \
+  --dataset_dir /data2/haojitai/datasets/StreamingBench_hf \
+  --video_dir /data2/haojitai/datasets/StreamingBench_hf/videos \
+  --output_dir /data2/haojitai/datasets/llava_onevision_streamingbench_deltakv_7b_official60_kr30_cr1024_full \
+  --methods deltakv_delta_quant \
+  --deltakv_checkpoint_path none \
+  --num_samples -1 \
+  --batch_size 8 \
+  --tasks livevlm_table4 \
+  --streamingbench_profile official_60s \
+  --frame_sampling_backend decord \
+  --torch_dtype float16 \
+  --attn_implementation flash_attention_2 \
+  --max_new_tokens 8 \
+  --choice_parse_mode official_first_char \
+  --cuda_device 0 \
+  --seed 0 \
+  --log_every 400 \
+  --reuse_frame_cache \
+  --frame_cache_dir /data2/haojitai/datasets/llava_onevision_streamingbench_livevlm_table4_7b_vanilla_ctx60/frame_cache \
+  --frame_load_workers 4 \
+  --full_attention_layers 0 \
+  --deltakv_center_ratio 0.03 \
+  --deltakv_neighbor_count 1 \
+  --decode_keep_tokens 1024 \
+  --prefill_keep_tokens 4096
+```
+
+Result paths:
+
+```text
+/data2/haojitai/datasets/llava_onevision_streamingbench_deltakv_7b_official60_kr30_cr1024_full
+/data2/haojitai/datasets/llava_onevision_streamingbench_deltakv_7b_official60_kr30_cr2048_full
+/data2/haojitai/datasets/llava_onevision_streamingbench_deltakv_7b_official60_kr33_center005_full
+/data2/haojitai/datasets/llava_onevision_streamingbench_deltakv_7b_official60_kr33_full01_full
+```
+
+For each full run, `raw_outputs.jsonl`, `parsed_outputs.jsonl`, and
+`per_sample_results.jsonl` contain 4000 rows, and `status_counts` is
+`{"success": 4000}`. Against the dense official 60s baseline, the recommended
+DeltaKV configuration keeps the same row order and has 3994 identical
+predictions, 1 `false -> true` transition, and 2 `true -> false` transitions.
+The net difference is therefore `-1 / 4000`, or `-0.025` accuracy points:
+
+```text
+vanilla official_60s: 2406 / 4000 = 60.150%
+DeltaKV recommended: 2405 / 4000 = 60.125%
+```
+
+Task-level comparison for the recommended DeltaKV run:
+
+| Task group | Vanilla | DeltaKV | Delta |
+| --- | ---: | ---: | ---: |
+| real | `73.52%` | `73.48%` | `-0.04` |
+| omni | `40.70%` | `40.70%` | `+0.00` |
+| contextual | `32.20%` | `32.20%` | `+0.00` |
+
 ### 7B, Official 60s/32-Frame Real-Time Visual Understanding, sample 201-250 shard
 
 Local data currently contains only this shard:
