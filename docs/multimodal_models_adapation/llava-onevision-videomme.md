@@ -29,7 +29,7 @@ Download metadata only:
 
 ```bash
 VIDEOMME_DOWNLOAD_SCOPE=metadata \
-bash scripts/download_videomme_full.sh
+bash scripts/data/download_videomme_full.sh
 ```
 
 Download the full dataset in the background:
@@ -38,7 +38,7 @@ Download the full dataset in the background:
 VIDEOMME_ROOT=/data2/haojitai/datasets/Video-MME_hf \
 HF_MAX_WORKERS=1 \
 PROXY_URL=http://localhost:7890 \
-bash scripts/tmux_download_videomme_full.sh
+bash scripts/data/tmux_download_videomme_full.sh
 ```
 
 The script uses `hf download`, keeps Hugging Face cache under

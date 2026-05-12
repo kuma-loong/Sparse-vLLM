@@ -149,7 +149,7 @@ def run_benchmarks():
         }
         
         cmd = [
-            "python", "scripts/bench_sparse_vllm.py",
+            "python", "scripts/benchmarks/bench_sparse_vllm.py",
             "--model_path", DEFAULT_MODEL,
             "--lengths", str(DEFAULT_LENGTH),
             "--batch_sizes", str(DEFAULT_BS),

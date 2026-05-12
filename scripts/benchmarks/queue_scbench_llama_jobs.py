@@ -12,7 +12,7 @@ from pathlib import Path
 from typing import Any
 
 
-REPO_ROOT = Path(__file__).resolve().parents[1]
+REPO_ROOT = Path(__file__).resolve().parents[2]
 PYTHON = "/home/haojitai/miniconda3/envs/svllm/bin/python"
 
 QWEN_MODEL_PATH = "/home/haojitai/models/Qwen2.5-7B-Instruct-1M"

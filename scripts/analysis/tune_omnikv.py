@@ -1,4 +1,4 @@
-from scripts._exp_lst import omnikv_lst
+from scripts.analysis._exp_lst import omnikv_lst
 
 # example of omnikv_lst
 # omnikv_lst = [

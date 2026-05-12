@@ -77,7 +77,7 @@ There are four main runtime entry paths.
 
 | Entry | Parameter container | Normalization | Main consumers |
 | --- | --- | --- | --- |
-| `scripts/bench_sparse_vllm.py` | `--hyper_params` JSON | `normalize_runtime_params(..., backend="sparsevllm")` | `sparsevllm.Config`, `Scheduler`, `CacheManager`, `SparseController` |
+| `scripts/benchmarks/bench_sparse_vllm.py` | `--hyper_params` JSON | `normalize_runtime_params(..., backend="sparsevllm")` | `sparsevllm.Config`, `Scheduler`, `CacheManager`, `SparseController` |
 | `benchmark/long_bench/pred.py` and `benchmark/math_bench/pred.py` | `--hyper_param` JSON or file | `get_generate_api(...)` normalizes after merge | HF wrappers or Sparse-vLLM engine |
 | `benchmark/scbench/run_scbench.py` DeltaKV branch | `--hyper_param` JSON dict | `get_generate_api(...)` normalizes | HF wrappers |
 | `benchmark/multimodal/visual_cache/run_visual_cache.py` | dedicated CLI args | no global normalizer; builds `config.deltakv_infer_config` | LLaVA wrapper and `KVQwen2Config` |
@@ -505,7 +505,7 @@ Example Sparse-vLLM smoke command:
 
 ```bash
 CUDA_VISIBLE_DEVICES=7 PYTHONPATH=$PWD/src \
-python scripts/bench_sparse_vllm.py \
+python scripts/benchmarks/bench_sparse_vllm.py \
   --model_path /data2/haojitai/models/Qwen2.5-7B-Instruct-1M \
   --lengths 1024 \
   --batch_sizes 2 \
@@ -546,9 +546,9 @@ queueing, and whether a benchmark measures the intended batch.
 | `gpu_memory_utilization` | Sparse-vLLM | Fraction of total GPU memory used for cache planning. |
 | `tensor_parallel_size` | Sparse-vLLM | Number of TP ranks/processes. |
 | `num_kvcache_slots` | Sparse-vLLM | Optional explicit KV slot override. |
-| `admission_wave_size` | `scripts/bench_sparse_vllm.py` | Benchmark-only staged admission. |
-| `wave_decode_gap_steps` | `scripts/bench_sparse_vllm.py` | Benchmark-only delay before adding next wave. |
-| `max_decode_steps_after_full` | `scripts/bench_sparse_vllm.py` | Benchmark-only decode window cap after full admission. |
+| `admission_wave_size` | `scripts/benchmarks/bench_sparse_vllm.py` | Benchmark-only staged admission. |
+| `wave_decode_gap_steps` | `scripts/benchmarks/bench_sparse_vllm.py` | Benchmark-only delay before adding next wave. |
+| `max_decode_steps_after_full` | `scripts/benchmarks/bench_sparse_vllm.py` | Benchmark-only decode window cap after full admission. |
 | `enable_profiler` | Sparse-vLLM | Enables repo profiler. Also enabled by `PROFILER_SVLLM` env var. |
 | `throughput_log_interval_s` | Sparse-vLLM | Periodic throughput logging interval. |
 
@@ -573,7 +573,7 @@ Do not copy the same numeric value across backends.
 
 ### 10.2 Benchmark Queueing And Wave Admission
 
-`scripts/bench_sparse_vllm.py` reports:
+`scripts/benchmarks/bench_sparse_vllm.py` reports:
 
 - TTFT.
 - Prefill throughput.
@@ -591,7 +591,7 @@ Wave admission is intended for methods that can host more decode requests after
 prefill eviction:
 
 ```bash
-python scripts/bench_sparse_vllm.py \
+python scripts/benchmarks/bench_sparse_vllm.py \
   --model_path <MODEL> \
   --lengths 131072 \
   --batch_sizes 24 \
@@ -612,7 +612,7 @@ For fair speed comparisons, compare:
 - same actual full-admission status,
 - same decode measurement scope.
 
-## 11. `scripts/bench_sparse_vllm.py` Specific Notes
+## 11. `scripts/benchmarks/bench_sparse_vllm.py` Specific Notes
 
 The benchmark sets stable defaults before applying `--hyper_params`:
 
@@ -826,7 +826,7 @@ Full-attention baseline example:
 
 ```bash
 CUDA_VISIBLE_DEVICES=7 PYTHONPATH=$PWD/src:$PYTHONPATH \
-python scripts/bench_sparse_vllm.py \
+python scripts/benchmarks/bench_sparse_vllm.py \
   --model_path <MODEL> \
   --lengths 131072 \
   --batch_sizes 6 \
@@ -838,7 +838,7 @@ Sparse wave-admission example:
 
 ```bash
 CUDA_VISIBLE_DEVICES=7 PYTHONPATH=$PWD/src:$PYTHONPATH \
-python scripts/bench_sparse_vllm.py \
+python scripts/benchmarks/bench_sparse_vllm.py \
   --model_path <MODEL> \
   --lengths 131072 \
   --batch_sizes 24 \
@@ -894,7 +894,7 @@ PYTHONPATH=$PWD/src:$PYTHONPATH \
 LOG_LEVEL=DEBUG \
 PROFILER_SVLLM=1 \
 CUDA_SYNC_SVLLM=1 \
-python scripts/bench_sparse_vllm.py \
+python scripts/benchmarks/bench_sparse_vllm.py \
   --model_path <MODEL> \
   --lengths 131072 \
   --batch_sizes 6 \

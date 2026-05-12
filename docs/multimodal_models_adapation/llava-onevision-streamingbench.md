@@ -252,15 +252,6 @@ CUDA_VISIBLE_DEVICES=6 PYTHONPATH=$PWD/src \
   --frame_cache_dir /data2/haojitai/datasets/llava_onevision_streamingbench_livevlm_table4_7b_vanilla/frame_cache
 ```
 
-For the background runner, `LIVEVLM_TABLE4_GPU_IDS` can list allowed physical
-GPUs. It defaults to `6,7` in this repo so the runner still obeys the current
-card restriction while using whichever allowed GPU becomes free first:
-
-```bash
-LIVEVLM_TABLE4_GPU_IDS=6,7 \
-bash scripts/nohup_run_livevlm_table4_vanilla_after_download.sh
-```
-
 Audit the completed baseline with:
 
 ```bash

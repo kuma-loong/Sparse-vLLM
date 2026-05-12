@@ -165,7 +165,7 @@ Rules that matter for experiment reliability:
 | `benchmark/scbench/run_scbench.py` | SCBench generation/eval driver | HF-oriented plus DeltaKV branch | Supports canonical DeltaKV args, but includes several silent `except/pass` blocks inherited from research code. |
 | `benchmark/scbench/run_scbench_preprocessed.py` | SCBench preprocessed path | SCBench-specific | Needs separate validation if used as the main reporting path. |
 | `benchmark/niah/test_niah.py` | Needle-in-a-haystack probe | `hf`, `sparsevllm` | Uses canonical args and backend-specific prefill chunk names. |
-| `scripts/bench_sparse_vllm.py` | Sparse-VLLM throughput/latency driver | Sparse-VLLM | Normalizes params and rejects legacy runtime names. |
+| `scripts/benchmarks/bench_sparse_vllm.py` | Sparse-VLLM throughput/latency driver | Sparse-VLLM | Normalizes params and rejects legacy runtime names. |
 | `benchmark/multimodal/video_qa/streamingbench.py` | LLaVA-OneVision StreamingBench | LLaVA/HF model path | Stronger artifact discipline: raw, parsed, per-sample, metrics, run info. Missing videos fail fast unless opt-in. |
 | `benchmark/multimodal/video_qa/videomme.py` | LLaVA-OneVision VideoMME | Wraps StreamingBench runner | Adds VideoMME prompt/eval layer and preserves dry-run metadata. |
 | `benchmark/multimodal/video_qa/qaego4d.py` | LLaVA-OneVision QA-Ego4D/ReKV-style eval | LLaVA/HF model path | Supports `vanilla` and `deltakv_delta_quant` style visual-cache comparisons. |

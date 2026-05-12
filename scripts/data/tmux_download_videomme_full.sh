@@ -7,7 +7,7 @@ LOG_DIR="${VIDEOMME_LOG_DIR:-${ROOT}/logs}"
 mkdir -p "${LOG_DIR}"
 
 log_path="${LOG_DIR}/download_videomme_full_tmux.log"
-project_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+project_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 
 if tmux has-session -t "${SESSION}" 2>/dev/null; then
   echo "[error] tmux session already exists: ${SESSION}" >&2
@@ -16,7 +16,7 @@ if tmux has-session -t "${SESSION}" 2>/dev/null; then
 fi
 
 tmux new-session -d -s "${SESSION}" \
-  "cd '${project_dir}' && VIDEOMME_ROOT='${ROOT}' bash scripts/download_videomme_full.sh >>'${log_path}' 2>&1"
+  "cd '${project_dir}' && VIDEOMME_ROOT='${ROOT}' bash scripts/data/download_videomme_full.sh >>'${log_path}' 2>&1"
 
 echo "[info] session=${SESSION}"
 echo "[info] log=${log_path}"

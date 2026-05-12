@@ -77,7 +77,7 @@ python -m py_compile \
 Benchmark after correctness is established.
 
 ```bash
-python scripts/bench_sparse_vllm.py \
+python scripts/benchmarks/bench_sparse_vllm.py \
   --model_path <MODEL_PATH> \
   --methods <method> \
   --lengths 128000 \

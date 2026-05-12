@@ -134,7 +134,7 @@ and `LLM(...)` kwargs should use `sparse_method`.
 
 ### Throughput benchmark
 
-Use `scripts/bench_sparse_vllm.py` to measure TTFT, prefill throughput, decode throughput, and GPU memory.
+Use `scripts/benchmarks/bench_sparse_vllm.py` to measure TTFT, prefill throughput, decode throughput, and GPU memory.
 
 Notes:
 
@@ -145,7 +145,7 @@ Notes:
 Baseline (vanilla):
 
 ```bash
-python scripts/bench_sparse_vllm.py \
+python scripts/benchmarks/bench_sparse_vllm.py \
   --model_path <PATH_TO_BASE_MODEL> \
   --lengths 512000 \
   --batch_sizes 2 \
@@ -304,7 +304,7 @@ Quick throughput smoke:
 
 ```bash
 CUDA_VISIBLE_DEVICES=7 PYTHONPATH=$PWD/src \
-python scripts/bench_sparse_vllm.py \
+python scripts/benchmarks/bench_sparse_vllm.py \
   --model_path /data2/haojitai/models/Qwen2.5-7B-Instruct-1M \
   --lengths 1024 \
   --batch_sizes 2 \
