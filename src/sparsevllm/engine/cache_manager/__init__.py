@@ -10,14 +10,11 @@ __all__ = [
     "SnapKVCacheManager",
     "QuestCacheManager",
     "OmniKVCacheManager",
-    "DeepSeekMLACacheManager",
     "DeltaKVCacheManager",
     "DeltaKVCacheTritonManager",
     "DeltaKVCacheTritonManagerV2",
     "DeltaKVCacheTritonManagerV3",
     "DeltaKVCacheTritonManagerV4",
-    "DeltaKVCacheTritonManagerV3WithOffload",
-    "DeltaKVCacheTritonManagerV3WithCUDAOffload",
     "DeltaKVDeltaQuantCacheManager",
     "DeltaKVStandaloneCacheManager",
     "DeltaKVSnapKVCacheManager",
@@ -45,19 +42,12 @@ def __getattr__(name: str):
         from .omnikv import OmniKVCacheManager
 
         return OmniKVCacheManager
-    if name == "DeepSeekMLACacheManager":
-        from .deepseek_mla import DeepSeekMLACacheManager
-
-        return DeepSeekMLACacheManager
-
     if name in {
         "DeltaKVCacheManager",
         "DeltaKVCacheTritonManager",
         "DeltaKVCacheTritonManagerV2",
         "DeltaKVCacheTritonManagerV3",
         "DeltaKVCacheTritonManagerV4",
-        "DeltaKVCacheTritonManagerV3WithOffload",
-        "DeltaKVCacheTritonManagerV3WithCUDAOffload",
     }:
         from . import deltakv as _deltakv
 

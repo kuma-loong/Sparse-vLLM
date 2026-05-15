@@ -11,72 +11,6 @@ def default_weight_loader(param: nn.Parameter, loaded_weight: torch.Tensor):
     param.data.copy_(loaded_weight)
 
 
-def _translate_deepseek_weight_name(model: nn.Module, weight_name: str) -> str | None:
-    if getattr(model, "hf_model_type", "") not in ("deepseek_v2", "deepseek_v32"):
-        return None
-
-    if weight_name == "model.embed_tokens.weight":
-        return "tok_embeddings.weight"
-    if weight_name == "model.norm.weight":
-        return "norm.weight"
-    if weight_name == "lm_head.weight":
-        return "output.weight"
-
-    if not weight_name.startswith("model.layers."):
-        return None
-
-    parts = weight_name.split(".")
-    if len(parts) < 5:
-        return None
-    layer_idx = parts[2]
-    tail = parts[3:]
-    prefix = f"layers.{layer_idx}."
-
-    if tail == ["input_layernorm", "weight"]:
-        return prefix + "attn_norm.weight"
-    if tail == ["post_attention_layernorm", "weight"]:
-        return prefix + "ffn_norm.weight"
-
-    if tail[:2] == ["self_attn", "q_proj"] and getattr(getattr(model, "args", None), "q_lora_rank", 0) <= 0:
-        return prefix + "attn.wq.weight"
-    if tail[:2] == ["self_attn", "kv_a_proj_with_mqa"]:
-        return prefix + "attn.wkv_a.weight"
-    if tail[:2] == ["self_attn", "kv_a_layernorm"]:
-        return prefix + "attn.kv_norm.weight"
-    if tail[:2] == ["self_attn", "kv_b_proj"]:
-        return prefix + "attn.wkv_b.weight"
-    if tail[:2] == ["self_attn", "o_proj"]:
-        return prefix + "attn.wo.weight"
-
-    if tail[:2] == ["mlp", "gate_proj"]:
-        return prefix + "ffn.w1.weight"
-    if tail[:2] == ["mlp", "up_proj"]:
-        return prefix + "ffn.w3.weight"
-    if tail[:2] == ["mlp", "down_proj"]:
-        return prefix + "ffn.w2.weight"
-    if tail[:2] == ["mlp", "gate"] and len(tail) == 3 and tail[2] == "weight":
-        return prefix + "ffn.gate.weight"
-    if tail[:2] == ["mlp", "shared_experts"] and len(tail) == 4:
-        proj = tail[2]
-        if proj == "gate_proj":
-            return prefix + "ffn.shared_experts.w1.weight"
-        if proj == "up_proj":
-            return prefix + "ffn.shared_experts.w3.weight"
-        if proj == "down_proj":
-            return prefix + "ffn.shared_experts.w2.weight"
-    if tail[:2] == ["mlp", "experts"] and len(tail) == 5:
-        expert_idx = tail[2]
-        proj = tail[3]
-        if proj == "gate_proj":
-            return prefix + f"ffn.experts.{expert_idx}.w1.weight"
-        if proj == "up_proj":
-            return prefix + f"ffn.experts.{expert_idx}.w3.weight"
-        if proj == "down_proj":
-            return prefix + f"ffn.experts.{expert_idx}.w2.weight"
-
-    return None
-
-
 def _iter_deltakv_compressor_items(state_dict: dict[str, torch.Tensor]):
     for key, weight in state_dict.items():
         parts = key.split(".")
@@ -448,9 +382,9 @@ def load_model(model: nn.Module, path: str, *, rank: int | None = None, world_si
     files = sorted(glob(os.path.join(path, "*.safetensors")))
     assert len(files) > 0, f"No safetensors found in {path}"
 
-    # DeepSeek official converters often emit one file per rank:
+    # Some tensor-parallel converters emit one file per rank:
     #   model{rank}-mp{world_size}.safetensors
-    # In that case we should only load the local rank shard.
+    # In that case load only the local rank shard.
     if rank is not None and world_size is not None:
         shard = os.path.join(path, f"model{rank}-mp{world_size}.safetensors")
         if os.path.isfile(shard):
@@ -467,7 +401,7 @@ def load_model(model: nn.Module, path: str, *, rank: int | None = None, world_si
     for file in files:
         with safe_open(file, "pt", "cpu") as f:
             for source_weight_name in f.keys():
-                param_name = _translate_deepseek_weight_name(model, source_weight_name) or source_weight_name
+                param_name = source_weight_name
                 for k in packed_modules_mapping:
                     if k in param_name:
                         v, shard_id = packed_modules_mapping[k]

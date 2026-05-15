@@ -78,8 +78,6 @@ _SPARSE_METHOD_TO_HF_MODEL_CLS: dict[str, str] = {
     "deltakv-triton-v2": "deltakv",
     "deltakv-triton-v3": "deltakv",
     "deltakv-triton-v4": "deltakv",
-    "deltakv-triton-v3-offload": "deltakv",
-    "deltakv-triton-v3-cuda-offload": "deltakv",
     "deltakv-standalone": "deltakv",
     "deltakv-snapkv": "deltasnapkv",
     "snapkv": "snapkv",

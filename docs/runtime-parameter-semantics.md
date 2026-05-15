@@ -189,12 +189,9 @@ Known Sparse-vLLM method strings:
 | `deltakv-triton-v2` | Triton reconstruction plus eviction. Internally rewrites method to `deltakv`. |
 | `deltakv-triton-v3` | Adds blockwise L2 top-k. Internally rewrites method to `deltakv`. |
 | `deltakv-triton-v4` | Adds more kernel fusions. Internally rewrites method to `deltakv`. |
-| `deltakv-triton-v3-offload` | DeltaKV V3 with CPU latent offload. |
-| `deltakv-triton-v3-cuda-offload` | DeltaKV V3 offload with custom CUDA gather path. |
 | `deltakv-delta-quant`, `deltakv_delta_quant` | No-checkpoint DeltaKV center selection plus direct token-space residual storage. Internally rewrites method to `deltakv` for controller semantics. |
 | `deltakv-standalone` | DeltaKV standalone manager; clears full-attention and observation-layer routing. |
 | `deltakv-snapkv` | DeltaKV plus SnapKV-style cache manager; clears full-attention and observation-layer routing. |
-| `dsa` | DeepSeek sparse attention placeholder. Currently restricted and disabled for most model types. |
 
 Sparse-vLLM currently rejects Qwen3 plus DeltaKV in `CacheManager.create(...)`
 because of qk-norm/runtime mismatch. Use HF for Qwen3 DeltaKV runs in this repo.
@@ -453,11 +450,8 @@ Key Sparse-vLLM public names and internal fields:
 | `deltakv_latent_dim` | `kv_compressed_size` | `128` | Latent dimension. |
 | `deltakv_latent_quant_bits` | `kv_quant_bits` | `4` | Quantization bits for DeltaKV-style state. |
 | `deltakv_full_pool_reserve_ratio` | `0.1` | Fraction of KV memory reserved for full-KV pool. |
-| `deltakv_offload_latent` | `False` | CPU latent offload switch. |
-| `deltakv_offload_*` | varies | Offload prefetch/threading/gather controls. |
 | `deltakv_triton_*_heads_per_program` | `4` | Triton grouping controls. |
 | `allow_unknown_config_keys` | `False` | Explicit opt-in for ignoring unknown Sparse-vLLM config keys. |
-| `allow_raw_config_fallback` | `False` | Explicit opt-in for raw `config.json` fallback when `AutoConfig` fails. Currently restricted to validated DeepSeek configs. |
 | `allow_missing_deltakv_path` | `False` | Explicit opt-in for no-checkpoint DeltaKV ablations that intentionally omit compressor weights. |
 
 `bitsandbytes` is a declared package dependency because 4-bit and 8-bit
@@ -467,8 +461,7 @@ it; manually curated environments need to include it explicitly.
 ### 9.1 Compressor-Backed DeltaKV
 
 Methods `deltakv`, `deltakv-triton`, `deltakv-triton-v2`,
-`deltakv-triton-v3`, `deltakv-triton-v4`,
-`deltakv-triton-v3-offload`, and `deltakv-triton-v3-cuda-offload` are
+`deltakv-triton-v3`, and `deltakv-triton-v4` are
 compressor-backed DeltaKV methods. They require
 `deltakv_checkpoint_path` unless an explicit ablation opts into
 `allow_missing_deltakv_path=True`.
@@ -524,7 +517,7 @@ Important differences from HF:
 - `decode_keep_tokens` and `prefill_keep_tokens` must be integer budgets.
 - `full_attention_layers` may derive observation layers.
 - `deltakv-standalone` and `deltakv-snapkv` clear full/obs layer routing.
-- Unknown Sparse-vLLM config keys, raw config fallback, and missing DeltaKV
+- Unknown Sparse-vLLM config keys and missing DeltaKV
   compressor paths fail fast by default. Use the `allow_*` switches only for
   explicitly documented compatibility or ablation runs.
 - Sparse-vLLM methods can physically evict or re-map cache slots during prefill

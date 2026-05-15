@@ -6,7 +6,7 @@ from abc import ABC, abstractmethod
 
 import torch
 
-from sparsevllm.config import Config
+from sparsevllm.config import Config, SUPPORTED_SPARSE_METHODS
 from sparsevllm.engine.sequence import Sequence
 from sparsevllm.constant import REDUNDANCY_BATCH_SIZE_FACTOR
 from sparsevllm.utils.log import logger, log_level
@@ -51,31 +51,10 @@ class CacheManager(ABC):
         sparse_method = config.vllm_sparse_method
         model_type = getattr(getattr(config, "hf_config", None), "model_type", "") or ""
 
-        # DeepSeek MLA cache layout (required for DeepSeek-V2 / V3.2 model wiring).
-        if model_type == "deepseek_v32":
-            raise NotImplementedError(
-                "DeepSeek-V3.2 sparsevllm support is disabled. "
-                "Use DeepSeek-V2 or another backend for now."
-            )
-        if model_type == "deepseek_v2":
-            if sparse_method not in ("", "dsa"):
-                raise ValueError(
-                    f"DeepSeek MLA cache does not support vllm_sparse_method={sparse_method!r}. "
-                    "Use vanilla mode (empty string) or `dsa` where supported."
-                )
-            if sparse_method == "dsa" and model_type != "deepseek_v32":
-                raise ValueError(
-                    "vllm_sparse_method='dsa' is currently only supported for DeepSeek-V3.2 "
-                    f"(model_type={model_type!r})."
-                )
-            from .deepseek_mla import DeepSeekMLACacheManager
-
-            return DeepSeekMLACacheManager(config, rank, world_size)
-        if sparse_method == "dsa":
-            raise ValueError(
-                "vllm_sparse_method='dsa' is currently only supported for DeepSeek-V3.2 "
-                f"(model_type={model_type!r})."
-            )
+        if model_type in {"deepseek_v2", "deepseek_v32"}:
+            raise NotImplementedError(f"Unsupported Sparse-vLLM model_type={model_type!r}.")
+        if sparse_method not in SUPPORTED_SPARSE_METHODS:
+            raise ValueError(f"Unsupported vllm_sparse_method={sparse_method!r}.")
         if model_type == "qwen3" and isinstance(sparse_method, str) and sparse_method.startswith("deltakv"):
             raise NotImplementedError(
                 "sparsevllm qwen3 + deltakv is disabled for now due to qk-norm/runtime mismatch. "
@@ -126,22 +105,6 @@ class CacheManager(ABC):
             from .deltakv_snapkv import DeltaKVSnapKVCacheManager
 
             return DeltaKVSnapKVCacheManager(config, rank, world_size)
-        if sparse_method in ("deltakv-triton-v3-offload", "deltakv-triton-v3-with-offload"):
-            # Run DeltaKV logic, with Triton for reconstruction + eviction + blockwise L2-topk,
-            # and offload latent cache to CPU.
-            config.vllm_sparse_method = "deltakv"
-            config.deltakv_offload_latent = True
-            from .deltakv import DeltaKVCacheTritonManagerV3WithOffload
-
-            return DeltaKVCacheTritonManagerV3WithOffload(config, rank, world_size)
-        if sparse_method in ("deltakv-triton-v3-cuda-offload", "deltakv-triton-v3-with-cuda-offload"):
-            # Run DeltaKV logic, and offload latents to CPU, but gather them back to GPU via
-            # the custom CUDA kernel under `sparsevllm/cuda_kernel` (ShadowKV-style).
-            config.vllm_sparse_method = "deltakv"
-            config.deltakv_offload_latent = True
-            from .deltakv import DeltaKVCacheTritonManagerV3WithCUDAOffload
-
-            return DeltaKVCacheTritonManagerV3WithCUDAOffload(config, rank, world_size)
         if sparse_method in ("streamingllm", "attention-sink", "attention_sink"):
             from .streamingllm import StreamingLLMCacheManager
 

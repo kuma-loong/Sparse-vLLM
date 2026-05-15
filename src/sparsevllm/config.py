@@ -1,11 +1,27 @@
 import os
-import json
 from dataclasses import dataclass
-from types import SimpleNamespace
-import torch
 from transformers import AutoConfig, Qwen3Config
 from typing import Union
 from sparsevllm.utils.log import logger
+
+
+SUPPORTED_SPARSE_METHODS = {
+    "",
+    "streamingllm",
+    "snapkv",
+    "pyramidkv",
+    "omnikv",
+    "quest",
+    "deltakv",
+    "deltakv-triton",
+    "deltakv-triton-v2",
+    "deltakv-triton-v3",
+    "deltakv-triton-v4",
+    "deltakv-delta-quant",
+    "deltakv_delta_quant",
+    "deltakv-standalone",
+    "deltakv-snapkv",
+}
 
 
 @dataclass
@@ -25,7 +41,7 @@ class Config:
     num_kvcache_slots: int | list = -1
 
     # Sparse Attention Config
-    vllm_sparse_method: str = ""  # "", "streamingllm", "attention-sink", "attention_sink", "snapkv", "omnikv", "quest", "deltakv", "deltakv-triton", "deltakv-triton-v2", "deltakv-triton-v3", "deltakv-triton-v4", "deltakv-triton-v3-offload", "deltakv-triton-v3-cuda-offload", "deltakv-delta-quant", "deltakv_delta_quant", "deltakv-standalone", "deltakv-snapkv", "pyramidkv", "dsa"
+    vllm_sparse_method: str = ""  # "", "streamingllm", "attention-sink", "attention_sink", "snapkv", "omnikv", "quest", "deltakv", "deltakv-triton", "deltakv-triton-v2", "deltakv-triton-v3", "deltakv-triton-v4", "deltakv-delta-quant", "deltakv_delta_quant", "deltakv-standalone", "deltakv-snapkv", "pyramidkv"
 
     # General Sparse Config
     num_sink_tokens: int = 64
@@ -76,36 +92,12 @@ class Config:
     # (centers + buffer + temp reconstruction slots). Larger values reduce full/latent capacity
     # but improve robustness at large batch sizes / long contexts.
     deltakv_full_pool_reserve_ratio: float = 0.1
-    # DeltaKV offload: store per-layer latent cache on CPU (reduce VRAM, add PCIe overhead).
-    deltakv_offload_latent: bool = False
-    # Keep the first N sparse layers after each obs layer on GPU (to overlap compute with prefetch).
-    # Default to 0 to avoid large GPU latent allocations; set to 1-2 to test overlap.
-    deltakv_offload_keep_after_obs_layers: int = 0
-    # Prefetch the next N offloaded sparse layers' latents asynchronously.
-    deltakv_offload_prefetch_distance: int = 1
-    # CPU gather threading (index_select/index_copy_) for latent offload path.
-    deltakv_offload_cpu_threads: int = 8
-    # CUDA offload gather: chunk size (map_size). Supported by provided kernel: 128/256/512/1024.
-    deltakv_cuda_offload_map_size: int = 256
     # Triton kernels: group multiple KV heads per program to reduce redundant loads.
     deltakv_triton_gather_heads_per_program: int = 4
     deltakv_triton_reconstruct_heads_per_program: int = 4
-
-    # --- DeepSeek Sparse Attention (DSA) / FlashMLA knobs (optional) ---
-    # NOTE: These are primarily for DeepSeek-V3.2 style DSA, which uses a Lightning Indexer
-    # to select top-k KV entries per query token, and then runs sparse attention kernels.
-    dsa_topk: int = 2048
-    dsa_index_n_heads: int = 64
-    dsa_index_head_dim: int = 128
-    # DeepSeek-V3.2 uses YARN-style RoPE scaling in their public inference code.
-    dsa_rope_factor: float = 40.0
-    dsa_original_seq_len: int = 4096
-    # Use FlashMLA kernels; missing FlashMLA fails fast when this is enabled.
-    dsa_use_flash_mla: bool = True
     
     enable_profiler: bool = False
     throughput_log_interval_s: float = 10.0
-    allow_raw_config_fallback: bool = False
     allow_missing_deltakv_path: bool = False
     allow_unknown_config_keys: bool = False
 
@@ -116,8 +108,16 @@ class Config:
             
         if self.vllm_sparse_method is None:
             self.vllm_sparse_method = ""
+        elif self.vllm_sparse_method == "vanilla":
+            self.vllm_sparse_method = ""
         elif self.vllm_sparse_method in ("attention-sink", "attention_sink"):
             self.vllm_sparse_method = "streamingllm"
+        if self.vllm_sparse_method not in SUPPORTED_SPARSE_METHODS:
+            supported = ", ".join(repr(method) for method in sorted(SUPPORTED_SPARSE_METHODS) if method)
+            raise ValueError(
+                f"Unsupported vllm_sparse_method={self.vllm_sparse_method!r}. "
+                f"Supported methods: '', {supported}."
+            )
         
         if self.num_top_tokens_in_prefill is None:
             self.num_top_tokens_in_prefill = self.num_top_tokens
@@ -129,46 +129,18 @@ class Config:
         if isinstance(self.deltakv_path, str):
             deltakv_path = self.deltakv_path.strip()
             self.deltakv_path = None if deltakv_path.lower() in {"", "none", "null"} else deltakv_path
-        cfg_path = os.path.join(self.model, "config.json")
         try:
-            # `trust_remote_code=True` keeps DeepSeek-like configs usable when the local model
-            # folder vendors config/modeling files.
             self.hf_config = AutoConfig.from_pretrained(self.model, trust_remote_code=True)
         except Exception as e:
-            if not self.allow_raw_config_fallback:
-                raise RuntimeError(
-                    "AutoConfig.from_pretrained failed. Refusing to silently fall back to raw "
-                    "`config.json`; pass allow_raw_config_fallback=True only for explicitly "
-                    f"validated local configs. model={self.model} error={type(e).__name__}: {e}"
-                ) from e
-            with open(cfg_path, "r", encoding="utf-8") as f:
-                cfg = json.load(f)
-            model_type = cfg.get("model_type")
-            if model_type not in {"deepseek_v2", "deepseek_v32"}:
-                raise RuntimeError(
-                    "Raw config fallback is only allowed for validated DeepSeek configs; "
-                    f"got model_type={model_type!r} at {cfg_path}."
-                ) from e
-            td = cfg.get("torch_dtype", None)
-            if isinstance(td, str):
-                td_l = td.lower()
-                if td_l in ("bfloat16", "bf16"):
-                    cfg["torch_dtype"] = torch.bfloat16
-                elif td_l in ("float16", "fp16", "half"):
-                    cfg["torch_dtype"] = torch.float16
-                elif td_l in ("float32", "fp32"):
-                    cfg["torch_dtype"] = torch.float32
-            if cfg.get("torch_dtype", None) is None:
-                raise RuntimeError(
-                    f"Raw config fallback requires explicit torch_dtype in {cfg_path}; "
-                    "refusing to default to bfloat16."
-                )
-            self.hf_config = SimpleNamespace(**cfg)
-
-        # DeepSeek-V3.2 defaults: keep engine-side DSA knobs aligned unless explicitly set.
-        if getattr(self.hf_config, "model_type", "") == "deepseek_v32":
-            if self.dsa_topk == 2048 and hasattr(self.hf_config, "index_topk"):
-                self.dsa_topk = int(self.hf_config.index_topk)
+            raise RuntimeError(
+                "AutoConfig.from_pretrained failed. Refusing to silently fall back to raw "
+                f"`config.json`. model={self.model} error={type(e).__name__}: {e}"
+            ) from e
+        if getattr(self.hf_config, "model_type", "") in {"deepseek_v2", "deepseek_v32"}:
+            raise NotImplementedError(
+                f"Unsupported Sparse-vLLM model_type={self.hf_config.model_type!r}. "
+                "Supported model types: qwen2, qwen3."
+            )
         if self.max_model_len > self.hf_config.max_position_embeddings:
             logger.warning('max_model_len > model.max_position_embeddings 输出可能不正常')
             self.hf_config.max_position_embeddings = self.max_model_len

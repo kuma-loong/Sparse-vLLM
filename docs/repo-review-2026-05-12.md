@@ -91,7 +91,7 @@ Strengths:
 
 Risks:
 
-- DeltaKV Triton/offload methods rewrite `config.vllm_sparse_method` to
+- DeltaKV Triton methods rewrite `config.vllm_sparse_method` to
   `deltakv` during cache-manager selection. This keeps the controller path
   simple, but downstream logs can lose the originally requested method unless it
   is recorded before routing.
@@ -109,8 +109,6 @@ Risks:
 | `deltakv-triton-v2` | Maps to HF `deltakv` | `DeltaKVCacheTritonManagerV2` | Reconstruction plus eviction kernel path. |
 | `deltakv-triton-v3` | Maps to HF `deltakv` | `DeltaKVCacheTritonManagerV3` | Adds blockwise L2 top-k path. |
 | `deltakv-triton-v4` | Maps to HF `deltakv` | `DeltaKVCacheTritonManagerV4` | Adds grouped-head reconstruction and related fusions. |
-| `deltakv-triton-v3-offload` | Maps to HF `deltakv` | `DeltaKVCacheTritonManagerV3WithOffload` | Enables CPU latent offload. |
-| `deltakv-triton-v3-cuda-offload` | Maps to HF `deltakv` | `DeltaKVCacheTritonManagerV3WithCUDAOffload` | Requires custom CUDA extension under `src/sparsevllm/cuda_kernel/`. |
 | `deltakv-delta-quant` or `deltakv_delta_quant` | Not a distinct HF path | `DeltaKVDeltaQuantCacheManager` | No-checkpoint direct residual quantization path. Prefer hyphenated spelling. |
 | `deltakv-standalone` | Maps to HF `deltakv` | `DeltaKVStandaloneCacheManager` | Sparse-vLLM standalone variant. |
 | `deltakv-snapkv` | HF `deltasnapkv` | `DeltaKVSnapKVCacheManager` | DeltaKV/SnapKV hybrid path. |
@@ -119,7 +117,6 @@ Risks:
 | `streamingllm`, `attention-sink`, `attention_sink` | HF StreamingLLM mapping | `StreamingLLMCacheManager` | Alias forms are accepted. |
 | `quest` | HF Quest mapping | `QuestCacheManager` | Sparse-VLLM token budget must be a token count, not a ratio. |
 | `omnikv` | HF OmniKV adapter | `OmniKVCacheManager` | Includes kernel and tuning utilities. |
-| `dsa` | Not a general HF path | Currently gated to disabled DeepSeek-V3.2 path | Sparse-vLLM raises for normal model types. |
 
 ## Parameter System
 
@@ -238,8 +235,8 @@ No warnings were emitted by the final compile check.
    `prefill_keep_tokens`, `hf_prefill_chunk_size`, and
    `engine_prefill_chunk_size`.
 3. Keep fail-fast behavior for experiment parameters. Compatibility flags such
-   as `allow_unknown_config_keys`, `allow_raw_config_fallback`, and
-   `allow_missing_deltakv_path` should remain explicit opt-ins.
+   as `allow_unknown_config_keys` and `allow_missing_deltakv_path` should
+   remain explicit opt-ins.
 4. Preserve benchmark artifact separation: raw model output, parsed answer,
    per-sample records, aggregate metrics, and run info should not overwrite one
    another.

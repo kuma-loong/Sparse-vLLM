@@ -10,7 +10,6 @@ from sparsevllm.config import Config
 from sparsevllm.engine.sequence import Sequence
 from sparsevllm.models.qwen2 import Qwen2ForCausalLM
 from sparsevllm.models.qwen3 import Qwen3ForCausalLM
-from sparsevllm.models.deepseek_v2 import DeepSeekV2ForCausalLM
 from sparsevllm.layers.sampler import Sampler
 from sparsevllm.utils.context import set_context, get_context, reset_context
 from sparsevllm.utils.loader import load_model, sync_deltakv_config_from_checkpoint
@@ -56,19 +55,10 @@ class ModelRunner:
         # 加载对应的模型分片 (Shards)
         if hf_config.model_type == "qwen2":
             self.model = Qwen2ForCausalLM(hf_config)
-        elif hf_config.model_type == "deepseek_v2":
-            self.model = DeepSeekV2ForCausalLM(
-                hf_config,
-                dsa_topk=config.dsa_topk,
-                use_flash_mla=config.dsa_use_flash_mla,
-            )
-        elif hf_config.model_type == "deepseek_v32":
-            raise NotImplementedError(
-                "DeepSeek-V3.2 sparsevllm support is disabled. "
-                "Use DeepSeek-V2 or another backend for now."
-            )
-        else:
+        elif hf_config.model_type == "qwen3":
             self.model = Qwen3ForCausalLM(hf_config)
+        else:
+            raise NotImplementedError(f"Unsupported Sparse-vLLM model_type={hf_config.model_type!r}.")
         load_model(self.model, config.model, rank=rank, world_size=self.world_size)
         
         self.sampler = Sampler()
@@ -82,7 +72,7 @@ class ModelRunner:
 
         # 初始化稀疏控制器
         self.sparse_controller = SparseController(config, self.cache_manager)
-        # 注入模型 (Qwen-style models only; DeepSeek MLA does not use SparseController callbacks)
+        # 注入模型
         if hasattr(self.model, "model") and hasattr(self.model.model, "layers"):
             self.model.model.sparse_controller = self.sparse_controller
             self.sparse_controller.set_modules(self.model.model.layers)

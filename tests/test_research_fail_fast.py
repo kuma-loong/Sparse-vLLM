@@ -443,7 +443,7 @@ class ResearchFailFastTest(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "no annotator answers"):
                 visual_bench.validate_vqa_row(bad, source="unit")
 
-    def test_sparsevllm_raw_config_fallback_is_opt_in(self):
+    def test_sparsevllm_raw_config_fallback_is_not_allowed(self):
         with tempfile.TemporaryDirectory() as tmp:
             model_dir = Path(tmp)
             (model_dir / "config.json").write_text(
@@ -453,6 +453,19 @@ class ResearchFailFastTest(unittest.TestCase):
             with patch("sparsevllm.config.AutoConfig.from_pretrained", side_effect=RuntimeError("boom")):
                 with self.assertRaisesRegex(RuntimeError, "Refusing to silently fall back"):
                     Config(model=str(model_dir))
+
+    def test_sparsevllm_rejects_unsupported_model_type(self):
+        hf_config = SimpleNamespace(
+            model_type="deepseek_v2",
+            torch_dtype=torch.float16,
+            max_position_embeddings=32768,
+            hidden_size=8,
+            intermediate_size=32,
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            with patch("sparsevllm.config.AutoConfig.from_pretrained", return_value=hf_config):
+                with self.assertRaisesRegex(NotImplementedError, "Unsupported Sparse-vLLM model_type"):
+                    Config(model=tmp)
 
     def test_sparsevllm_deltakv_requires_checkpoint_path(self):
         hf_config = SimpleNamespace(

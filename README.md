@@ -269,7 +269,6 @@ Set `sparse_method` to one of:
 
 - `"deltakv"`
 - `"deltakv-triton"`, `"deltakv-triton-v2"`, `"deltakv-triton-v3"`, `"deltakv-triton-v4"`
-- `"deltakv-triton-v3-offload"` / `"deltakv-triton-v3-cuda-offload"`
 - `"deltakv-delta-quant"` for the no-checkpoint direct residual quantization ablation
 
 For compressor-backed DeltaKV inference, also pass
@@ -283,8 +282,6 @@ DeltaKV knobs you may need:
 - `deltakv_center_ratio`, `cluster_metric`: reference selection / clustering behavior.
 - `deltakv_neighbor_count`: number of selected center/reference tokens used for reconstruction.
 - `deltakv_latent_quant_bits`: `4` packs the DeltaKV-style cached state as int4 where supported.
-- `deltakv_offload_latent`: offload latent cache to CPU (enabled automatically by `*-offload` methods).
-- `deltakv_offload_cpu_threads`: CPU gather thread count for offload mode.
 
 `deltakv-delta-quant` is a Sparse-vLLM-only ablation that reuses DeltaKV center
 selection and sparse decode views, but stores the token-space residual directly:
@@ -384,15 +381,6 @@ Notes:
 
 - `deltakv_checkpoint_path` can point to either a directory (the loader scans `*.safetensors` first, then `*.bin`/`*.pt`) or a single checkpoint file.
 - Split-KV checkpoints (`k_compress_*` / `v_compress_*`) are currently not supported by the Sparse-vLLM loader.
-
-### CUDA gather extension (only for `*-cuda-offload`)
-
-The CUDA extension lives in `src/sparsevllm/cuda_kernel/` and is only required for `deltakv-triton-v3-cuda-offload`.
-
-```bash
-cd src/sparsevllm/cuda_kernel
-pip install -e .
-```
 
 ## Troubleshooting
 
