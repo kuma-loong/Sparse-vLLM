@@ -235,14 +235,15 @@ class ModelRunner:
                 ctx.sparse_controller = self.sparse_controller
                 self.sparse_controller.prepare_forward(seqs, is_prefill)
             
-            temperatures = self.prepare_sample(seqs) if self.rank == 0 else None
+            all_greedy = all(seq.temperature <= 1e-10 for seq in seqs) if self.rank == 0 else False
+            temperatures = None if (self.rank != 0 or all_greedy) else self.prepare_sample(seqs)
             
             # 3. 前向计算
             logits = self.run_model(input_ids, positions, is_prefill)
             
             # 4. Token 采样 (仅 Rank 0)
             with profiler.record("model_sampler"):
-                token_ids = self.sampler(logits, temperatures).tolist() if self.rank == 0 else None
+                token_ids = self.sampler(logits, temperatures, all_greedy=all_greedy).tolist() if self.rank == 0 else None
 
             # 5. 后置稀疏处理 (如 SnapKV 驱逐)
             with profiler.record("model_sparse_post"):

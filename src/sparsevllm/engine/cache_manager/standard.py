@@ -213,6 +213,7 @@ class StandardCacheManager(CacheManager):
 
             self.layer_batch_state.slot_mapping = slot_mapping
             self.layer_batch_state.context_lens = context_lens
+            self.layer_batch_state.max_context_len = max(context_lens_list) if context_lens_list else 0
             self.layer_batch_state.req_indices = req_indices_tensor
 
             if log_level == 'DEBUG':
@@ -244,6 +245,7 @@ class StandardCacheManager(CacheManager):
 
             self.layer_batch_state.slot_mapping = slot_mapping
             self.layer_batch_state.context_lens = context_lens
+            self.layer_batch_state.max_context_len = int(max(self.row_seq_lens[row_indices])) if row_indices else 0
             self.layer_batch_state.req_indices = req_indices
 
             logger.debug(f'{slot_mapping=}   {context_lens.tolist()=}  {slot_mapping[:10]=}  {slot_mapping[-10:]=}')

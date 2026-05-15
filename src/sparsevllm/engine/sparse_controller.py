@@ -17,6 +17,7 @@ class LayerBatchSparseState:
     active_slots: torch.Tensor | None = None   # 物理槽位 [B, K]
     req_indices: torch.Tensor | None = None
     context_lens: torch.Tensor | None = None
+    max_context_len: int | None = None
 
     # for DeltaKV
     active_compressed_indices: torch.Tensor | None = None
@@ -80,6 +81,7 @@ class SparseController:
             
             # 统一语义：context_lens 代表当前 attn 可见长度 （即使是动态稀疏方法）
             state.context_lens = batch_state.context_lens.clone()  # 虽然clone，但是感觉开销不大
+            state.max_context_len = batch_state.max_context_len
             state.req_indices = batch_state.req_indices
             state.global_req_indices = batch_state.req_indices
             state.attn_score = None
@@ -95,7 +97,7 @@ class SparseController:
             if self._needs_attn_score(i, is_prefill, seqs):
                 batch_size = len(seqs)
                 num_heads = self.config.hf_config.num_attention_heads // self.config.tensor_parallel_size
-                max_len = int(state.context_lens.max())
+                max_len = self._state_max_context_len(state)
                 # TODO 开销比较大的 attn score 初始化？
                 _val = 0.0 if is_prefill else -1e20
                 with profiler.record("sparse_prepare_attn_score"):
@@ -104,6 +106,14 @@ class SparseController:
 
     def set_modules(self, modules):
         self.layers = modules
+
+    def _state_max_context_len(self, state: LayerBatchSparseState) -> int:
+        if state.max_context_len is not None:
+            return int(state.max_context_len)
+        return int(state.context_lens.max().item())
+
+    def get_layer_max_context_len(self, layer_idx: int) -> int | None:
+        return self.layer_batch_sparse_states[layer_idx].max_context_len
 
     @torch.no_grad()
     def post_forward(self, seqs: list[Sequence], is_prefill: bool):
@@ -460,33 +470,51 @@ class SparseController:
             mask = torch.arange(search_scores.size(1), device="cuda") >= rel_hist_lens.unsqueeze(1)
             search_scores.masked_fill_(mask, -1e10)
 
-            # 3. 提取 Top-K (per-seq, padded with -1)
+            # 3. 提取 Top-K. DeltaKV keeps the original ragged per-row budget path;
+            # OmniKV below uses a fixed padded K to avoid per-decode CPU/GPU syncs.
             num_top = self.num_top_in_prefill if ctx.is_prefill else self.num_top
-            topk_list = []
-            k_list = []
-            for b in range(batch_size):
-                avail = int(rel_hist_lens[b].item())
-                k_b = min(int(num_top), int(search_scores.size(1)), max(0, avail))
-                k_list.append(k_b)
-                if k_b <= 0:
-                    topk_list.append(torch.empty((0,), device="cuda", dtype=torch.int32))
-                else:
-                    idx = search_scores[b].topk(k_b, dim=0).indices.to(torch.int32) + self.num_sink
-                    topk_list.append(idx)
-            k_max = max(k_list) if k_list else 0
-            if k_max > 0:
-                topk_indices = torch.full((batch_size, k_max), -1, device="cuda", dtype=torch.int32)
+            if self.sparse_method == 'deltakv':
+                topk_list = []
+                k_list = []
                 for b in range(batch_size):
-                    k_b = k_list[b]
-                    if k_b > 0:
-                        topk_indices[b, :k_b] = topk_list[b]
+                    avail = int(rel_hist_lens[b].item())
+                    k_b = min(int(num_top), int(search_scores.size(1)), max(0, avail))
+                    k_list.append(k_b)
+                    if k_b <= 0:
+                        topk_list.append(torch.empty((0,), device="cuda", dtype=torch.int32))
+                    else:
+                        idx = search_scores[b].topk(k_b, dim=0).indices.to(torch.int32) + self.num_sink
+                        topk_list.append(idx)
+                k_max = max(k_list) if k_list else 0
+                if k_max > 0:
+                    topk_indices = torch.full((batch_size, k_max), -1, device="cuda", dtype=torch.int32)
+                    for b in range(batch_size):
+                        k_b = k_list[b]
+                        if k_b > 0:
+                            topk_indices[b, :k_b] = topk_list[b]
+                else:
+                    topk_indices = torch.empty((batch_size, 0), device="cuda", dtype=torch.int32)
             else:
-                topk_indices = torch.empty((batch_size, 0), device="cuda", dtype=torch.int32)
+                topk_indices = None
 
             # 4. 根据方法更新目标层状态
             if self.sparse_method == 'omnikv':
                 local_req_indices = torch.arange(batch_size, dtype=torch.int32, device="cuda")
-                topk_lens = torch.tensor(k_list, dtype=torch.int32, device="cuda")
+                num_top = int(num_top)
+                k_max = min(num_top, int(search_scores.size(1)))
+                if k_max > 0:
+                    topk_lens = rel_hist_lens.clamp(min=0, max=k_max).to(torch.int32)
+                    topk_indices = search_scores.topk(k_max, dim=1, sorted=False).indices.to(torch.int32) + self.num_sink
+                else:
+                    topk_lens = torch.zeros((batch_size,), dtype=torch.int32, device="cuda")
+                    topk_indices = torch.empty((batch_size, 0), device="cuda", dtype=torch.int32)
+
+                if ctx.is_prefill:
+                    chunk_lens = ctx.cu_seqlens_q[1:] - ctx.cu_seqlens_q[:-1]
+                    max_recent_or_chunk = int(chunk_lens.max().item()) + int(self.num_recent)
+                else:
+                    max_recent_or_chunk = int(self.num_recent)
+                max_sparse_context_len = int(self.num_sink) + int(k_max) + max_recent_or_chunk
                 keep_indices, active_slots, new_context_lens = build_omnikv_keep_and_slots(
                     topk_indices,
                     topk_lens,
@@ -495,6 +523,7 @@ class SparseController:
                     self.cache_manager.get_layer_buffer_req_to_token_slots(obs_layer_idx + 1),
                     obs_sparse_state.req_indices,
                     self.num_sink,
+                    max_s=max_sparse_context_len,
                 )
 
                 for l_idx in target_layers:
@@ -502,6 +531,7 @@ class SparseController:
                     target_sparse_state.active_indices = keep_indices
                     target_sparse_state.active_slots = active_slots
                     target_sparse_state.context_lens = new_context_lens
+                    target_sparse_state.max_context_len = max_sparse_context_len
                     target_sparse_state.req_indices = local_req_indices
             
             elif self.sparse_method == 'deltakv':

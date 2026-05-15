@@ -7,6 +7,8 @@ class Context:
         self.cache_manager = None
         self.sparse_controller = None
         self.sparse_config = None
+        self.decode_mid_o = None
+        self.decode_mid_o_logexpsum = None
 
 
 _CONTEXT = Context()

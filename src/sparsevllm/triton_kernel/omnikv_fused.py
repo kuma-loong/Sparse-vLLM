@@ -84,6 +84,7 @@ def build_omnikv_keep_and_slots(
     buffer_req_to_token_slots: torch.Tensor,
     req_indices: torch.Tensor,
     num_sink: int,
+    max_s: int | None = None,
 ):
     if topk_indices.dtype != torch.int32:
         topk_indices = topk_indices.to(torch.int32)
@@ -102,7 +103,12 @@ def build_omnikv_keep_and_slots(
         assert int(topk_lens.min().item()) >= 0
         assert int(topk_lens.max().item()) <= k_max
     new_context_lens = num_sink + topk_lens + recent_chunk_lens
-    max_s = int(new_context_lens.max().item())
+    if max_s is None:
+        max_s = int(new_context_lens.max().item())
+    else:
+        max_s = int(max_s)
+        if max_s < 0:
+            raise ValueError(f"max_s must be >= 0, got {max_s}.")
 
     keep_indices = torch.empty((batch_size, max_s), dtype=torch.int32, device=topk_indices.device)
     active_slots = torch.empty((batch_size, max_s), dtype=torch.int32, device=topk_indices.device)

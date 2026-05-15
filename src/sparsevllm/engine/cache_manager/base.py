@@ -22,6 +22,7 @@ class LayerBatchStates:
 
     slot_mapping: torch.Tensor | None = None
     context_lens: torch.Tensor | None = None
+    max_context_len: int | None = None
     req_indices: torch.Tensor | None = None
 
 

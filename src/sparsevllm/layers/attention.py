@@ -48,6 +48,45 @@ def store_kvcache(key: torch.Tensor, value: torch.Tensor, k_cache: torch.Tensor,
     store_kvcache_kernel[(N,)](key, key.stride(0), value, value.stride(0), k_cache, v_cache, slot_mapping, D)
 
 
+def get_decode_workspace(
+    context,
+    batch_size: int,
+    num_heads: int,
+    num_blocks: int,
+    head_dim: int,
+    device: torch.device,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    shape_o = (batch_size, num_heads, num_blocks, head_dim)
+    shape_lse = (batch_size, num_heads, num_blocks)
+    mid_o = context.decode_mid_o
+    if (
+        mid_o is None
+        or mid_o.device != device
+        or mid_o.shape[0] < batch_size
+        or mid_o.shape[1] < num_heads
+        or mid_o.shape[2] < num_blocks
+        or mid_o.shape[3] < head_dim
+    ):
+        mid_o = torch.empty(shape_o, dtype=torch.float32, device=device)
+        context.decode_mid_o = mid_o
+
+    mid_lse = context.decode_mid_o_logexpsum
+    if (
+        mid_lse is None
+        or mid_lse.device != device
+        or mid_lse.shape[0] < batch_size
+        or mid_lse.shape[1] < num_heads
+        or mid_lse.shape[2] < num_blocks
+    ):
+        mid_lse = torch.empty(shape_lse, dtype=torch.float32, device=device)
+        context.decode_mid_o_logexpsum = mid_lse
+
+    return (
+        mid_o[:batch_size, :num_heads, :num_blocks, :head_dim],
+        mid_lse[:batch_size, :num_heads, :num_blocks],
+    )
+
+
 class Attention(nn.Module):
 
     def __init__(
@@ -67,24 +106,25 @@ class Attention(nn.Module):
         context = get_context()
         cache_manager = context.cache_manager
         sparse_controller: SparseController = context.sparse_controller
-        store_k_cache, store_v_cache, slot_mapping = cache_manager.get_layer_store_view(context.now_layer_idx)
+        layer_idx = context.now_layer_idx
+        store_k_cache, store_v_cache, slot_mapping = cache_manager.get_layer_store_view(layer_idx)
 
         # 1. 写入 KV Cache (物理行为)
         # 无论是 DeltaKV 还是全量/SnapKV，均先将当前 KV 写入物理槽位 (对于 DeltaKV，是写入 Base Pool 作为 Recent)
         store_kvcache(k, v, store_k_cache, store_v_cache, slot_mapping)
-        cache_manager.on_kv_stored(context.now_layer_idx, k, slot_mapping)
+        cache_manager.on_kv_stored(layer_idx, k, slot_mapping)
 
         # 2. 获取逻辑视图
         layer_active_slots, layer_active_indices, layer_req_indices, layer_context_lens, layer_attn_score, deltakv_temp_slots = \
-            sparse_controller.get_read_view(context.now_layer_idx)
+            sparse_controller.get_read_view(layer_idx)
 
         assert layer_active_slots is not None
         b_req_idx = layer_req_indices
 
         try:
-            k_cache, v_cache = cache_manager.get_layer_compute_tensors(context.now_layer_idx, sparse_controller)
+            k_cache, v_cache = cache_manager.get_layer_compute_tensors(layer_idx, sparse_controller)
         except NotImplementedError:
-            k_cache, v_cache = cache_manager.get_layer_kv_cache(context.now_layer_idx)
+            k_cache, v_cache = cache_manager.get_layer_kv_cache(layer_idx)
 
         # --- 通用稀疏/全量路径 (使用 Triton) ---
         try:
@@ -96,7 +136,8 @@ class Attention(nn.Module):
                 chunk_lens = context.cu_seqlens_q[1:] - context.cu_seqlens_q[:-1]
                 b_seq_len = layer_context_lens
                 b_prompt_cache_len = b_seq_len - chunk_lens
-                max_input_len = b_seq_len.max().item()
+                max_context_len = sparse_controller.get_layer_max_context_len(layer_idx)
+                max_input_len = int(max_context_len) if max_context_len is not None else b_seq_len.max().item()
 
                 # Triton 路径需要物理槽位 layer_active_slots 用于 Req_to_tokens 寻址
                 # 它内部通过 prompt_cache_len 实现因果掩码，目前不需要显式的 pos_ids
@@ -110,7 +151,7 @@ class Attention(nn.Module):
             else:    # decode
                 batch_size = q.shape[0]
                 layer_active_slots, b_req_idx, layer_context_lens = cache_manager.build_decode_view(
-                    context.now_layer_idx,
+                    layer_idx,
                     q,
                     layer_active_slots,
                     b_req_idx,
@@ -119,18 +160,23 @@ class Attention(nn.Module):
                     num_kv_heads=self.num_kv_heads,
                 )
 
-                max_len_in_batch = layer_context_lens.max().item()
+                max_context_len = sparse_controller.get_layer_max_context_len(layer_idx)
+                if max_context_len is not None:
+                    max_len_in_batch = int(max_context_len)
+                    if layer_active_slots.dim() == 2:
+                        max_len_in_batch = min(max_len_in_batch, int(layer_active_slots.shape[1]))
+                else:
+                    max_len_in_batch = layer_context_lens.max().item()
                 BLOCK_SEQ = 256
+                num_seq_blocks = (max_len_in_batch + BLOCK_SEQ - 1) // BLOCK_SEQ
 
-                mid_o = torch.empty(
-                    (batch_size, self.num_heads, (max_len_in_batch + BLOCK_SEQ - 1) // BLOCK_SEQ, self.head_dim),
-                    dtype=torch.float32,
-                    device=q.device,
-                )
-                mid_o_logexpsum = torch.empty(
-                    (batch_size, self.num_heads, (max_len_in_batch + BLOCK_SEQ - 1) // BLOCK_SEQ),
-                    dtype=torch.float32,
-                    device=q.device,
+                mid_o, mid_o_logexpsum = get_decode_workspace(
+                    context,
+                    batch_size,
+                    self.num_heads,
+                    num_seq_blocks,
+                    self.head_dim,
+                    q.device,
                 )
 
                 is_gqa = self.num_heads > self.num_kv_heads
@@ -160,7 +206,7 @@ class Attention(nn.Module):
                 o = torch.empty_like(q)
                 flash_decode_stage2(mid_o, mid_o_logexpsum, layer_context_lens, o, BLOCK_SEQ)
 
-            cache_manager.on_layer_attention_end(context.now_layer_idx)
+            cache_manager.on_layer_attention_end(layer_idx)
             return o
         finally:
             # DeltaKV reconstructs some KV into scratch slots; recycle them immediately after use.
