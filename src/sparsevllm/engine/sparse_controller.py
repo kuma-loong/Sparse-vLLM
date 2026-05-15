@@ -152,6 +152,17 @@ class SparseController:
         返回 (active_slots, active_indices, req_indices, context_lens, attn_score, temp_slots)
         """
         sparse_state = self.layer_batch_sparse_states[layer_idx]
+        ctx = get_context()
+        if ctx.is_prefill and self.cache_manager.has_prefill_staging_view(layer_idx):
+            active_slots, req_indices, context_lens, temp_slots = self.cache_manager.get_prefill_staging_view(layer_idx)
+            return (
+                active_slots,
+                None,
+                req_indices,
+                context_lens,
+                sparse_state.attn_score,
+                temp_slots,
+            )
         if (self.sparse_method in ("omnikv", "deltakv") and layer_idx in self.full_attn_layers) or \
             self.sparse_method in ('snapkv', 'pyramidkv', 'quest', 'streamingllm', 'attention-sink', 'attention_sink', ''):
 
@@ -166,7 +177,6 @@ class SparseController:
 
         assert layer_idx not in self.full_attn_layers
         if self.sparse_method == 'deltakv':
-            ctx = get_context()
             # active_compressed_indices: (B, Kmax), padded with -1; may be None (treated as K=0)
             active = sparse_state.active_compressed_indices
             # For DeltaKV we always use a batch-major Req->slots table, so kernels use local req indices.

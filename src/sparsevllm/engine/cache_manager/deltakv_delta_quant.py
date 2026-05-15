@@ -23,6 +23,14 @@ class DeltaKVDeltaQuantCacheManager(DeltaKVCacheTritonManagerV4):
         available_memory, slot_bytes_per_layer = self._get_available_slots_info()
         config = self.config
         dtype_size = torch.tensor([], dtype=self.hf_config.torch_dtype).element_size()
+        self.deltakv_prefill_staging_num_slots = self._deltakv_prefill_staging_capacity()
+        prefill_staging_bytes = int(self.deltakv_prefill_staging_num_slots) * int(slot_bytes_per_layer)
+        persistent_memory = int(available_memory) - int(prefill_staging_bytes)
+        if persistent_memory <= 0:
+            raise RuntimeError(
+                "Not enough GPU memory for DeltaKV delta-quant prefill staging KV. "
+                f"staging_slots={self.deltakv_prefill_staging_num_slots}."
+            )
 
         num_full_layers = len(self.full_layer_ids)
         num_deltakv_layers = len(self.deltakv_layer_ids)
@@ -49,7 +57,7 @@ class DeltaKVDeltaQuantCacheManager(DeltaKVCacheTritonManagerV4):
         if per_token_bytes <= 0:
             raise ValueError("Invalid DeltaKV delta-quant allocation configuration.")
 
-        max_tokens = max(1, int(available_memory / per_token_bytes))
+        max_tokens = max(1, int(persistent_memory / per_token_bytes))
         reserve_ratio = float(config.deltakv_full_pool_reserve_ratio)
         if reserve_ratio > 0:
             reserve_ratio = max(0.0, min(0.5, reserve_ratio))
@@ -59,7 +67,7 @@ class DeltaKVDeltaQuantCacheManager(DeltaKVCacheTritonManagerV4):
 
         bytes_full_layers = self.full_num_slots * num_full_layers * slot_bytes_per_layer
         bytes_latent = self.deltakv_latent_num_slots * num_deltakv_layers * latent_bytes
-        bytes_left = available_memory - bytes_full_layers - bytes_latent
+        bytes_left = persistent_memory - bytes_full_layers - bytes_latent
         if bytes_left <= 0:
             raise RuntimeError(
                 "Not enough GPU memory left for DeltaKV delta-quant full-KV pool after "
@@ -89,7 +97,8 @@ class DeltaKVDeltaQuantCacheManager(DeltaKVCacheTritonManagerV4):
         centers_capacity = min(desired_centers, max_deltakv_full_slots - overhead_slots)
         self.deltakv_full_num_slots = overhead_slots + centers_capacity
         self._deltakv_centers_capacity = int(centers_capacity)
-        self._deltakv_temp_full_reserve = min(self.deltakv_full_num_slots, int(total_top_slots))
+        self._deltakv_decode_reconstruct_full_reserve = min(self.deltakv_full_num_slots, int(total_top_slots))
+        self._deltakv_temp_full_reserve = self._deltakv_decode_reconstruct_full_reserve
 
         logger.info(
             f"DeltaKV delta-quant allocation: full_layers_slots={self.full_num_slots}; "
@@ -110,6 +119,14 @@ class DeltaKVDeltaQuantCacheManager(DeltaKVCacheTritonManagerV4):
             2,
             num_deltakv_layers,
             self.deltakv_full_num_slots,
+            self.num_kv_heads,
+            self.head_dim,
+            dtype=self.hf_config.torch_dtype,
+            device="cuda",
+        )
+        self.deltakv_prefill_staging_kv_cache = torch.empty(
+            2,
+            self.deltakv_prefill_staging_num_slots,
             self.num_kv_heads,
             self.head_dim,
             dtype=self.hf_config.torch_dtype,
@@ -181,6 +198,18 @@ class DeltaKVDeltaQuantCacheManager(DeltaKVCacheTritonManagerV4):
             self.deltakv_latent_mins[l_idx, latent_slots] = mn.to(self.deltakv_latent_mins.dtype)
         else:
             self.deltakv_latent_cache[l_idx, latent_slots] = residual.to(self.deltakv_latent_cache.dtype)
+
+    def _deltakv_store_layer_latent(
+        self,
+        *,
+        l_idx: int,
+        latent_slots: torch.Tensor,
+        kv_block: torch.Tensor,
+        base_kv: torch.Tensor,
+        to_compress_mask: torch.Tensor,
+    ):
+        residual = (kv_block - base_kv).squeeze(0)[to_compress_mask]
+        self._store_residual(l_idx, latent_slots, residual)
 
     def _load_residual(self, l_idx: int, recon_latent: torch.Tensor, kv_dim: int) -> torch.Tensor:
         residual = self.deltakv_latent_cache[l_idx, recon_latent]

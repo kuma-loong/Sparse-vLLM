@@ -41,14 +41,18 @@ class DeltaKVStandaloneCacheManager(DeltaKVCacheTritonManagerV4):
         self.full_num_slots = 0
         self.deltakv_latent_num_slots = 0
         self.deltakv_full_num_slots = 0
+        self.deltakv_prefill_staging_num_slots = 0
         self.deltakv_temp_num_slots = 0
         self.full_kv_cache = None
         self.deltakv_full_kv_cache = None
+        self.deltakv_prefill_staging_kv_cache = None
+        self.deltakv_decode_reconstruct_kv_cache = None
         self.deltakv_temp_kv_cache = None
         self.deltakv_latent_cache = None
         self.deltakv_latent_to_full_slots = None
         self.deltakv_slot_to_pos = None
         self._deltakv_temp_full_reserve = 0
+        self._deltakv_decode_reconstruct_full_reserve = 0
         self._deltakv_centers_capacity = 0
         self._deltakv_centers_reserved_total = 0
         self._deltakv_centers_reserved_by_seq: dict[int, int] = {}
@@ -82,6 +86,13 @@ class DeltaKVStandaloneCacheManager(DeltaKVCacheTritonManagerV4):
         self.deltakv_layer_batch_states = LayerBatchStates()
         self._standalone_view_cache_key: tuple[int, int] | None = None
         self._standalone_view_cache_value: dict[str, torch.Tensor | int | dict[int, torch.Tensor]] | None = None
+        self._deltakv_prefill_staging_active = False
+        self._deltakv_prefill_staging_slot_mapping = None
+        self._deltakv_prefill_staging_active_slots = None
+        self._deltakv_prefill_staging_req_indices = None
+        self._deltakv_prefill_staging_context_lens = None
+        self._deltakv_full_prefill_plans: dict[int, dict[str, torch.Tensor | int]] = {}
+        self._deltakv_full_prefill_compressed_layers: set[int] = set()
 
         from sparsevllm.utils.compressor import create_compressor
 
@@ -152,6 +163,8 @@ class DeltaKVStandaloneCacheManager(DeltaKVCacheTritonManagerV4):
         max_seqs = int(config.max_num_seqs_in_batch)
         max_total_len = int(config.max_model_len)
         max_step_chunk = int(min(int(config.max_num_batched_tokens), max_seqs * int(config.chunk_prefill_size)))
+        self.deltakv_prefill_staging_num_slots = self._deltakv_prefill_staging_capacity()
+        prefill_staging_bytes = int(self.deltakv_prefill_staging_num_slots) * int(slot_bytes_per_layer)
         overhead_slots = max_seqs * (sink + 2 * recent) + max_step_chunk
         cluster_step = max(1, int(1.0 / max(1e-6, cluster_ratio))) if cluster_ratio > 0 else 0
         centers_per_seq = self._estimate_centers_for_total_len(max_total_len)
@@ -167,7 +180,11 @@ class DeltaKVStandaloneCacheManager(DeltaKVCacheTritonManagerV4):
         centers_capacity = desired_centers
         full_slots = int(overhead_slots + centers_capacity)
         temp_slots_target = int(temp_override_i) if temp_override_i is not None else int(temp_decode_upper)
-        const_bytes = temp_slots_target * slot_bytes_per_layer + full_slots * num_layers * slot_bytes_per_layer
+        const_bytes = (
+            temp_slots_target * slot_bytes_per_layer
+            + prefill_staging_bytes
+            + full_slots * num_layers * slot_bytes_per_layer
+        )
         bytes_budget = available_memory - const_bytes
         if bytes_budget <= 0:
             raise RuntimeError(
@@ -181,6 +198,7 @@ class DeltaKVStandaloneCacheManager(DeltaKVCacheTritonManagerV4):
 
         total_bytes = (
             temp_slots_target * slot_bytes_per_layer
+            + prefill_staging_bytes
             + full_slots * num_layers * slot_bytes_per_layer
             + latent_slots * num_layers * latent_bytes
         )
@@ -195,12 +213,15 @@ class DeltaKVStandaloneCacheManager(DeltaKVCacheTritonManagerV4):
         self.deltakv_full_num_slots = int(full_slots)
         self._deltakv_centers_capacity = int(centers_capacity)
         self.deltakv_temp_num_slots = int(temp_slots_target)
+        self._deltakv_decode_reconstruct_full_reserve = 0
         self._deltakv_temp_full_reserve = 0
 
         logger.info(
             f"DeltaKV standalone allocation: persistent_slots={self.deltakv_full_num_slots} "
             f"(overhead={overhead_slots}, centers={centers_capacity}, centers_per_seq={centers_per_seq}); "
-            f"latent_slots={self.deltakv_latent_num_slots}; temp_slots={self.deltakv_temp_num_slots} "
+            f"latent_slots={self.deltakv_latent_num_slots}; "
+            f"prefill_staging_slots={self.deltakv_prefill_staging_num_slots}; "
+            f"decode_reconstruct_temp_slots={self.deltakv_temp_num_slots} "
             f"(layers={num_layers}, deltakv_full_pool_reserve_ratio={reserve_ratio:.3f})."
         )
 
@@ -213,7 +234,15 @@ class DeltaKVStandaloneCacheManager(DeltaKVCacheTritonManagerV4):
             dtype=self.hf_config.torch_dtype,
             device="cuda",
         )
-        self.deltakv_temp_kv_cache = torch.empty(
+        self.deltakv_prefill_staging_kv_cache = torch.empty(
+            2,
+            self.deltakv_prefill_staging_num_slots,
+            self.num_kv_heads,
+            self.head_dim,
+            dtype=self.hf_config.torch_dtype,
+            device="cuda",
+        )
+        self.deltakv_decode_reconstruct_kv_cache = torch.empty(
             2,
             self.deltakv_temp_num_slots,
             self.num_kv_heads,
@@ -221,6 +250,7 @@ class DeltaKVStandaloneCacheManager(DeltaKVCacheTritonManagerV4):
             dtype=self.hf_config.torch_dtype,
             device="cuda",
         )
+        self.deltakv_temp_kv_cache = self.deltakv_decode_reconstruct_kv_cache
         self.deltakv_latent_cache = torch.empty(
             num_layers,
             self.deltakv_latent_num_slots,
@@ -249,15 +279,23 @@ class DeltaKVStandaloneCacheManager(DeltaKVCacheTritonManagerV4):
         return self.deltakv_full_kv_cache[0, idx], self.deltakv_full_kv_cache[1, idx]
 
     def get_layer_store_view(self, layer_idx: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        if self.has_prefill_staging_view(layer_idx):
+            return (
+                self.deltakv_prefill_staging_kv_cache[0],
+                self.deltakv_prefill_staging_kv_cache[1],
+                self._deltakv_prefill_staging_slot_mapping,
+            )
         k_cache, v_cache = self.get_layer_kv_cache(layer_idx)
         state = self.get_layer_batch_states(layer_idx)
         return k_cache, v_cache, state.slot_mapping
 
     def get_layer_compute_tensors(self, layer_idx: int, sparse_controller):
         del sparse_controller
+        if self.has_prefill_staging_view(layer_idx):
+            return self.deltakv_prefill_staging_kv_cache[0], self.deltakv_prefill_staging_kv_cache[1]
         if self._deltakv_layer_compute_source.get(layer_idx) == "persistent":
             return self.get_layer_kv_cache(layer_idx)
-        return self.deltakv_temp_kv_cache[0], self.deltakv_temp_kv_cache[1]
+        return self.deltakv_decode_reconstruct_kv_cache[0], self.deltakv_decode_reconstruct_kv_cache[1]
 
     def get_layer_buffer_req_to_token_slots(self, layer_idx: int) -> torch.Tensor:
         raise NotImplementedError("Standalone DeltaKV always materializes a temp full-context view.")
@@ -415,8 +453,10 @@ class DeltaKVStandaloneCacheManager(DeltaKVCacheTritonManagerV4):
             "free_slots": int(self.num_free_slots),
             "deltakv_persistent_free": int(self._num_free_slots_deltakv_full),
             "deltakv_latent_free": int(self._num_free_slots_deltakv_latent),
-            "deltakv_temp_free": int(self._num_free_slots_deltakv_temp),
-            "deltakv_temp_capacity": int(self.deltakv_temp_num_slots),
+            "deltakv_prefill_staging_capacity": int(self.deltakv_prefill_staging_num_slots),
+            "deltakv_prefill_staging_active": int(bool(getattr(self, "_deltakv_prefill_staging_active", False))),
+            "deltakv_decode_reconstruct_temp_free": int(self._num_free_slots_deltakv_temp),
+            "deltakv_decode_reconstruct_temp_capacity": int(self.deltakv_temp_num_slots),
             "centers_capacity": centers_cap,
             "centers_reserved": centers_reserved,
             "centers_free": centers_free,
@@ -430,13 +470,22 @@ class DeltaKVStandaloneCacheManager(DeltaKVCacheTritonManagerV4):
         with profiler.record("cache_prepare_prefill"):
             self._reset_standalone_view_cache()
             self._deltakv_layer_compute_source.clear()
+            use_full_prefill_staging = self._should_use_full_prefill_staging(seqs)
             total_chunk_tokens = sum(seq.current_chunk_size for seq in seqs)
+            if use_full_prefill_staging and total_chunk_tokens > int(self.deltakv_prefill_staging_num_slots):
+                raise RuntimeError(
+                    "Standalone DeltaKV full-prefill staging capacity is too small for this step. "
+                    f"tokens={total_chunk_tokens} staging_slots={self.deltakv_prefill_staging_num_slots}."
+                )
 
             input_ids_np = np.empty(total_chunk_tokens, dtype=np.int64)
             positions_np = np.empty(total_chunk_tokens, dtype=np.int64)
             cu_seqlens_q = [0]
 
-            deltakv_slot_mapping = torch.empty(total_chunk_tokens, dtype=torch.int32, device="cuda")
+            if use_full_prefill_staging:
+                deltakv_slot_mapping = torch.arange(total_chunk_tokens, dtype=torch.int32, device="cuda")
+            else:
+                deltakv_slot_mapping = torch.empty(total_chunk_tokens, dtype=torch.int32, device="cuda")
             context_lens_list = []
             req_indices = []
 
@@ -455,10 +504,15 @@ class DeltaKVStandaloneCacheManager(DeltaKVCacheTritonManagerV4):
                             f"start_idx={start_idx}"
                         )
 
-                self._allocate_deltakv_full(seq.seq_id, chunk_size)
-                row_idx = self.seq_id_to_row[seq.seq_id]
-                deltakv_slot_mapping[token_offset: token_offset + chunk_size] = \
-                    self.sparse_layer_raw_slots_map[row_idx, start_idx:end_idx]
+                row_idx = self._get_free_row(seq.seq_id)
+                if use_full_prefill_staging:
+                    if start_idx != 0:
+                        raise RuntimeError("Standalone DeltaKV full-prefill staging only supports first-prefill prompts.")
+                    self._prepare_full_prefill_staging_plan(seq, row_idx, end_idx)
+                else:
+                    self._allocate_deltakv_full(seq.seq_id, chunk_size)
+                    deltakv_slot_mapping[token_offset: token_offset + chunk_size] = \
+                        self.sparse_layer_raw_slots_map[row_idx, start_idx:end_idx]
 
                 self.row_seq_lens[row_idx] += chunk_size
                 context_lens_list.append(end_idx)
@@ -480,6 +534,34 @@ class DeltaKVStandaloneCacheManager(DeltaKVCacheTritonManagerV4):
             state.slot_mapping = deltakv_slot_mapping
             state.context_lens = context_lens
             state.req_indices = req_indices_tensor
+
+            if use_full_prefill_staging:
+                self._deltakv_prefill_staging_active = True
+                self._deltakv_prefill_staging_slot_mapping = deltakv_slot_mapping
+                max_context_len = int(max(context_lens_list)) if context_lens_list else 0
+                active_slots = torch.full(
+                    (len(seqs), max_context_len),
+                    -1,
+                    dtype=torch.int32,
+                    device="cuda",
+                )
+                offset = 0
+                for b_idx, seq in enumerate(seqs):
+                    chunk_size = int(seq.current_chunk_size)
+                    active_slots[b_idx, :chunk_size] = torch.arange(
+                        offset,
+                        offset + chunk_size,
+                        dtype=torch.int32,
+                        device="cuda",
+                    )
+                    offset += chunk_size
+                self._deltakv_prefill_staging_active_slots = active_slots
+                self._deltakv_prefill_staging_req_indices = torch.arange(
+                    len(seqs),
+                    dtype=torch.int32,
+                    device="cuda",
+                )
+                self._deltakv_prefill_staging_context_lens = context_lens
 
             input_ids = torch.from_numpy(input_ids_np).to("cuda")
             positions = torch.from_numpy(positions_np).to("cuda")

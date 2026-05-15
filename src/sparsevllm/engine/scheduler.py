@@ -4,6 +4,10 @@ from collections import deque
 from sparsevllm.config import Config
 from sparsevllm.engine.sequence import Sequence, SequenceStatus
 from sparsevllm.engine.cache_manager import CacheManager
+from sparsevllm.method_registry import (
+    PREFILL_POLICY_ALL_CHUNKED,
+    PREFILL_POLICY_LONG_BS1FULL_SHORT_BATCH,
+)
 from sparsevllm.utils.log import logger
 
 
@@ -24,6 +28,7 @@ class Scheduler:
         self.max_decoding_seqs = config.max_decoding_seqs
 
         self.chunk_prefill_size = config.chunk_prefill_size
+        self.prefill_schedule_policy = config.prefill_schedule_policy
         self.eos = config.eos
 
         self.num_sink_tokens = config.num_sink_tokens
@@ -106,6 +111,56 @@ class Scheduler:
     def _reserved_prefill_tokens(self) -> int:
         return int(self.memory_oracle.reserved_prefill_slots(self.waiting, self.chunk_prefill_size))
 
+    def _can_continue_prefill_batch(
+        self,
+        *,
+        target_is_long: bool,
+        scheduled_seqs: list[Sequence],
+        step_free_count: int,
+        num_batched_tokens: int,
+        num_batched_seqs: int,
+        margin_batched_tokens: int,
+    ) -> bool:
+        if not self.waiting:
+            return False
+        if len(self.decoding) >= self.max_decoding_seqs:
+            return False
+        if self.prefill_schedule_policy == PREFILL_POLICY_LONG_BS1FULL_SHORT_BATCH and target_is_long:
+            # Long DeltaKV-family prefills are full-prefill, bs=1. They may exceed
+            # max_num_batched_tokens by design; admission budgets guard persistent KV.
+            return not scheduled_seqs and step_free_count > 0
+        return (
+            step_free_count > 0
+            and num_batched_tokens <= self.max_num_batched_tokens - margin_batched_tokens
+            and num_batched_seqs < self.max_num_seqs_in_batch
+        )
+
+    def _prefill_step_tokens(
+        self,
+        *,
+        target_is_long: bool,
+        remaining_prefill_tokens: int,
+        num_batched_tokens: int,
+        step_free_count: int,
+    ) -> int:
+        if self.prefill_schedule_policy == PREFILL_POLICY_ALL_CHUNKED:
+            return min(
+                remaining_prefill_tokens,
+                self.chunk_prefill_size,
+                self.max_num_batched_tokens - num_batched_tokens,
+                step_free_count,
+            )
+        if self.prefill_schedule_policy == PREFILL_POLICY_LONG_BS1FULL_SHORT_BATCH:
+            if target_is_long:
+                return int(remaining_prefill_tokens)
+            return min(
+                remaining_prefill_tokens,
+                self.chunk_prefill_size,
+                self.max_num_batched_tokens - num_batched_tokens,
+                step_free_count,
+            )
+        raise ValueError(f"Unknown prefill_schedule_policy={self.prefill_schedule_policy!r}")
+
     def _raise_prompt_admission_failure(
         self,
         seq: Sequence,
@@ -142,7 +197,7 @@ class Scheduler:
         physical_free_count = self.memory_oracle.num_free_slots
         reserved_prefill = self._reserved_prefill_tokens()
         logical_free_count = max(0, physical_free_count - reserved_prefill)
-        step_free_count = physical_free_count
+        step_free_count = int(self.memory_oracle.prefill_step_free_slots())
         admission_budgets = dict(
             self.memory_oracle.prompt_admission_budgets(self.waiting, self.chunk_prefill_size)
         )
@@ -162,12 +217,15 @@ class Scheduler:
                 break
             bucket_scan_budget = len(self.waiting)
             while (
-                self.waiting
-                and bucket_scan_budget > 0
-                and step_free_count > 0
-                and num_batched_tokens <= self.max_num_batched_tokens - margin_batched_tokens
-                and num_batched_seqs < self.max_num_seqs_in_batch
-                and len(self.decoding) < self.max_decoding_seqs
+                bucket_scan_budget > 0
+                and self._can_continue_prefill_batch(
+                    target_is_long=target_is_long,
+                    scheduled_seqs=scheduled_seqs,
+                    step_free_count=step_free_count,
+                    num_batched_tokens=num_batched_tokens,
+                    num_batched_seqs=num_batched_seqs,
+                    margin_batched_tokens=margin_batched_tokens,
+                )
             ):
                 seq = self._pop_next_prefill_seq(target_is_long)
                 if seq is None:
@@ -180,11 +238,11 @@ class Scheduler:
                     raise ValueError('BUG：理论上不应该在 waiting 里')
 
                 # 确定本次 Chunk 的大小
-                can_prefill_tokens = min(
-                    remaining_prefill_tokens,
-                    self.chunk_prefill_size,
-                    self.max_num_batched_tokens - num_batched_tokens,
-                    step_free_count,
+                can_prefill_tokens = self._prefill_step_tokens(
+                    target_is_long=target_is_long,
+                    remaining_prefill_tokens=remaining_prefill_tokens,
+                    num_batched_tokens=num_batched_tokens,
+                    step_free_count=step_free_count,
                 )
 
                 if can_prefill_tokens <= 0:
@@ -288,9 +346,14 @@ class Scheduler:
                 seq.current_chunk_size = can_prefill_tokens
                 num_batched_seqs += 1
                 num_batched_tokens += can_prefill_tokens
-                step_free_count -= can_prefill_tokens
+                step_free_count = max(0, step_free_count - can_prefill_tokens)
                 seq.status = SequenceStatus.RUNNING
                 scheduled_seqs.append(seq)
+                if (
+                    self.prefill_schedule_policy == PREFILL_POLICY_LONG_BS1FULL_SHORT_BATCH
+                    and target_is_long
+                ):
+                    break
 
         # 如果有 Prefill 请求被选中，直接返回，本次 step 只跑 Prefill。
         if scheduled_seqs:

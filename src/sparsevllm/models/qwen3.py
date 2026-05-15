@@ -95,6 +95,7 @@ class Qwen3MLP(nn.Module):
         hidden_size: int,
         intermediate_size: int,
         hidden_act: str,
+        mlp_chunk_size: int = 16384,
     ) -> None:
         super().__init__()
         self.gate_up_proj = MergedColumnParallelLinear(
@@ -109,12 +110,26 @@ class Qwen3MLP(nn.Module):
         )
         assert hidden_act == "silu"
         self.act_fn = SiluAndMul()
+        self.mlp_chunk_size = int(mlp_chunk_size)
+        if self.mlp_chunk_size <= 0:
+            raise ValueError(f"mlp_chunk_size must be > 0, got {mlp_chunk_size}.")
 
-    def forward(self, x):
+    def _forward_chunk(self, x):
         gate_up = self.gate_up_proj(x)
         x = self.act_fn(gate_up)
         x = self.down_proj(x)
         return x
+
+    def forward(self, x):
+        chunk_size = int(self.mlp_chunk_size)
+        if int(x.shape[0]) <= chunk_size:
+            return self._forward_chunk(x)
+
+        out = torch.empty_like(x)
+        for start in range(0, int(x.shape[0]), chunk_size):
+            end = min(start + chunk_size, int(x.shape[0]))
+            out[start:end].copy_(self._forward_chunk(x[start:end]))
+        return out
 
 
 class Qwen3DecoderLayer(nn.Module):
@@ -139,6 +154,7 @@ class Qwen3DecoderLayer(nn.Module):
             hidden_size=config.hidden_size,
             intermediate_size=config.intermediate_size,
             hidden_act=config.hidden_act,
+            mlp_chunk_size=getattr(config, "mlp_chunk_size", 16384),
         )
         self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)

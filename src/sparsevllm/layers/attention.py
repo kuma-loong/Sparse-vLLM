@@ -160,6 +160,7 @@ class Attention(nn.Module):
                 o = torch.empty_like(q)
                 flash_decode_stage2(mid_o, mid_o_logexpsum, layer_context_lens, o, BLOCK_SEQ)
 
+            cache_manager.on_layer_attention_end(context.now_layer_idx)
             return o
         finally:
             # DeltaKV reconstructs some KV into scratch slots; recycle them immediately after use.

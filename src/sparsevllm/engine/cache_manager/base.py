@@ -6,9 +6,10 @@ from abc import ABC, abstractmethod
 
 import torch
 
-from sparsevllm.config import Config, SUPPORTED_SPARSE_METHODS
+from sparsevllm.config import Config
 from sparsevllm.engine.sequence import Sequence
 from sparsevllm.constant import REDUNDANCY_BATCH_SIZE_FACTOR
+from sparsevllm.method_registry import SUPPORTED_SPARSE_METHODS
 from sparsevllm.utils.log import logger, log_level
 
 
@@ -202,6 +203,21 @@ class CacheManager(ABC):
         """Optional method-specific hook after KV has been written into cache."""
         return None
 
+    def on_layer_attention_end(self, layer_idx: int):
+        """Optional method-specific hook after a layer's attention has consumed KV."""
+        return None
+
+    def has_prefill_staging_view(self, layer_idx: int) -> bool:
+        """Whether the current prefill layer should read from a temporary staging KV view."""
+        return False
+
+    def get_prefill_staging_view(
+        self,
+        layer_idx: int,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None]:
+        """Return (active_slots, req_indices, context_lens, temp_slots) for prefill staging."""
+        raise NotImplementedError
+
     def build_decode_view(
         self,
         layer_idx: int,
@@ -240,19 +256,30 @@ class CacheManager(ABC):
         return int(seq.num_prompt_tokens - seq.num_prefilled_tokens)
 
     def reserved_prefill_slots(self, waiting_seqs: deque[Sequence], chunk_prefill_size: int) -> int:
-        """Estimate slots to reserve for already-started prefills (to reduce decode thrashing)."""
+        """Persistent slots reserved by waiting/running prefills.
+
+        This must not include temporary staging KV or decode reconstruction scratch.
+        """
         reserved = 0
         for seq in waiting_seqs:
             if 0 < seq.num_prefilled_tokens < seq.num_prompt_tokens:
                 reserved += int(seq.num_prompt_tokens - seq.num_prefilled_tokens)
         return reserved
 
+    def prefill_step_free_slots(self) -> int:
+        """Writable KV capacity for the current prefill step.
+
+        Temporary pools with a different lifetime should expose their own accounting
+        instead of being mixed into this persistent step capacity.
+        """
+        return int(self.num_free_slots)
+
     def prompt_admission_free_slots(self) -> int:
         """Slots pool used to decide whether a new prompt can be admitted."""
         return int(self.num_free_slots)
 
     def prompt_admission_cost(self, seq: Sequence) -> int:
-        """Slots needed to admit a new prompt (at prefill start)."""
+        """Persistent slots needed to admit a complete prompt to its final representation."""
         return int(seq.num_prompt_tokens)
 
     def prompt_logical_reservation_cost(self, seq: Sequence) -> int:
@@ -279,7 +306,7 @@ class CacheManager(ABC):
         return {"slots": max(0, free_slots - reserved)}
 
     def prompt_admission_costs(self, seq: Sequence) -> dict[str, int]:
-        """Return admission costs (per budget) used by Scheduler for new prompts."""
+        """Return persistent final-representation admission costs per budget."""
         return {"slots": int(self.prompt_admission_cost(seq))}
 
     def on_prompt_admitted(self, seq: Sequence, costs: dict[str, int]):

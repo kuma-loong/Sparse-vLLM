@@ -2,26 +2,13 @@ import os
 from dataclasses import dataclass
 from transformers import AutoConfig, Qwen3Config
 from typing import Union
+from sparsevllm.method_registry import (
+    PREFILL_POLICY_AUTO,
+    SUPPORTED_SPARSE_METHODS,
+    normalize_sparse_method,
+    resolve_prefill_schedule_policy,
+)
 from sparsevllm.utils.log import logger
-
-
-SUPPORTED_SPARSE_METHODS = {
-    "",
-    "streamingllm",
-    "snapkv",
-    "pyramidkv",
-    "omnikv",
-    "quest",
-    "deltakv",
-    "deltakv-triton",
-    "deltakv-triton-v2",
-    "deltakv-triton-v3",
-    "deltakv-triton-v4",
-    "deltakv-delta-quant",
-    "deltakv_delta_quant",
-    "deltakv-standalone",
-    "deltakv-snapkv",
-}
 
 
 @dataclass
@@ -33,6 +20,8 @@ class Config:
     max_decoding_seqs: int = 64
 
     chunk_prefill_size: int = 8192
+    mlp_chunk_size: int = 16384
+    prefill_schedule_policy: str = PREFILL_POLICY_AUTO
     gpu_memory_utilization: float = 0.8
     tensor_parallel_size: int = 1
     enforce_eager: bool = True
@@ -95,6 +84,7 @@ class Config:
     # Triton kernels: group multiple KV heads per program to reduce redundant loads.
     deltakv_triton_gather_heads_per_program: int = 4
     deltakv_triton_reconstruct_heads_per_program: int = 4
+    deltakv_cluster_gather_chunk_size: int = 16384
     
     enable_profiler: bool = False
     throughput_log_interval_s: float = 10.0
@@ -106,21 +96,29 @@ class Config:
         if os.getenv("PROFILER_SVLLM"):
             self.enable_profiler = True
             
-        if self.vllm_sparse_method is None:
-            self.vllm_sparse_method = ""
-        elif self.vllm_sparse_method == "vanilla":
-            self.vllm_sparse_method = ""
-        elif self.vllm_sparse_method in ("attention-sink", "attention_sink"):
-            self.vllm_sparse_method = "streamingllm"
+        self.vllm_sparse_method = normalize_sparse_method(self.vllm_sparse_method)
         if self.vllm_sparse_method not in SUPPORTED_SPARSE_METHODS:
             supported = ", ".join(repr(method) for method in sorted(SUPPORTED_SPARSE_METHODS) if method)
             raise ValueError(
                 f"Unsupported vllm_sparse_method={self.vllm_sparse_method!r}. "
                 f"Supported methods: '', {supported}."
             )
+        self.prefill_schedule_policy = resolve_prefill_schedule_policy(
+            self.vllm_sparse_method,
+            self.prefill_schedule_policy,
+        )
         
         if self.num_top_tokens_in_prefill is None:
             self.num_top_tokens_in_prefill = self.num_top_tokens
+        if int(self.mlp_chunk_size) <= 0:
+            raise ValueError(f"mlp_chunk_size must be > 0, got {self.mlp_chunk_size}.")
+        self.mlp_chunk_size = int(self.mlp_chunk_size)
+        if int(self.deltakv_cluster_gather_chunk_size) <= 0:
+            raise ValueError(
+                "deltakv_cluster_gather_chunk_size must be > 0, "
+                f"got {self.deltakv_cluster_gather_chunk_size}."
+            )
+        self.deltakv_cluster_gather_chunk_size = int(self.deltakv_cluster_gather_chunk_size)
 
         if not os.path.isdir(self.model):
             raise FileNotFoundError(f"Model directory does not exist: {self.model}")

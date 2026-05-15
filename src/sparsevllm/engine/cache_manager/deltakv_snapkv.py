@@ -57,6 +57,8 @@ class DeltaKVSnapKVCacheManager(DeltaKVStandaloneCacheManager):
         max_seqs = int(config.max_num_seqs_in_batch)
         max_total_len = int(config.max_model_len)
         max_step_chunk = int(min(int(config.max_num_batched_tokens), max_seqs * int(config.chunk_prefill_size)))
+        self.deltakv_prefill_staging_num_slots = self._deltakv_prefill_staging_capacity()
+        prefill_staging_bytes = int(self.deltakv_prefill_staging_num_slots) * int(slot_bytes_per_layer)
         # SnapKV materializes the kept latent middle into persistent raw slots at prefill end.
         # Reserve those slots up-front so bs24 benchmarks do not hit full-pool exhaustion later.
         overhead_slots = max_seqs * (sink + 2 * recent + keep_budget) + max_step_chunk
@@ -73,7 +75,11 @@ class DeltaKVSnapKVCacheManager(DeltaKVStandaloneCacheManager):
         centers_capacity = desired_centers
         full_slots = int(overhead_slots + centers_capacity)
         temp_slots_target = int(temp_override_i) if temp_override_i is not None else int(temp_decode_upper)
-        const_bytes = temp_slots_target * slot_bytes_per_layer + full_slots * num_layers * slot_bytes_per_layer
+        const_bytes = (
+            temp_slots_target * slot_bytes_per_layer
+            + prefill_staging_bytes
+            + full_slots * num_layers * slot_bytes_per_layer
+        )
         bytes_budget = available_memory - const_bytes
         if bytes_budget <= 0:
             raise RuntimeError(
@@ -87,6 +93,7 @@ class DeltaKVSnapKVCacheManager(DeltaKVStandaloneCacheManager):
 
         total_bytes = (
             temp_slots_target * slot_bytes_per_layer
+            + prefill_staging_bytes
             + full_slots * num_layers * slot_bytes_per_layer
             + latent_slots * num_layers * latent_bytes
         )
@@ -101,13 +108,15 @@ class DeltaKVSnapKVCacheManager(DeltaKVStandaloneCacheManager):
         self.deltakv_full_num_slots = int(full_slots)
         self._deltakv_centers_capacity = int(centers_capacity)
         self.deltakv_temp_num_slots = int(temp_slots_target)
+        self._deltakv_decode_reconstruct_full_reserve = 0
         self._deltakv_temp_full_reserve = 0
 
         logger.info(
             f"DeltaKV+SnapKV allocation: persistent_slots={self.deltakv_full_num_slots} "
             f"(overhead={overhead_slots}, centers={centers_capacity}, centers_per_seq={centers_per_seq}, "
             f"keep_budget={keep_budget}); latent_slots={self.deltakv_latent_num_slots}; "
-            f"temp_slots={self.deltakv_temp_num_slots} "
+            f"prefill_staging_slots={self.deltakv_prefill_staging_num_slots}; "
+            f"decode_reconstruct_temp_slots={self.deltakv_temp_num_slots} "
             f"(layers={num_layers}, deltakv_full_pool_reserve_ratio={reserve_ratio:.3f})."
         )
 
@@ -120,7 +129,15 @@ class DeltaKVSnapKVCacheManager(DeltaKVStandaloneCacheManager):
             dtype=self.hf_config.torch_dtype,
             device="cuda",
         )
-        self.deltakv_temp_kv_cache = torch.empty(
+        self.deltakv_prefill_staging_kv_cache = torch.empty(
+            2,
+            self.deltakv_prefill_staging_num_slots,
+            self.num_kv_heads,
+            self.head_dim,
+            dtype=self.hf_config.torch_dtype,
+            device="cuda",
+        )
+        self.deltakv_decode_reconstruct_kv_cache = torch.empty(
             2,
             self.deltakv_temp_num_slots,
             self.num_kv_heads,
@@ -128,6 +145,7 @@ class DeltaKVSnapKVCacheManager(DeltaKVStandaloneCacheManager):
             dtype=self.hf_config.torch_dtype,
             device="cuda",
         )
+        self.deltakv_temp_kv_cache = self.deltakv_decode_reconstruct_kv_cache
         self.deltakv_latent_cache = torch.empty(
             num_layers,
             self.deltakv_latent_num_slots,
@@ -155,6 +173,21 @@ class DeltaKVSnapKVCacheManager(DeltaKVStandaloneCacheManager):
     @property
     def _protected_recent_tokens(self) -> int:
         return int(self.config.num_recent_tokens or 0) + int(self.snapkv_window_size)
+
+    def _deltakv_full_prefill_recent_tokens(self) -> int:
+        return int(self._protected_recent_tokens)
+
+    def _after_full_prefill_plan_prepared(
+        self,
+        *,
+        row_idx: int,
+        evict_start: int,
+        evict_end: int,
+        evict_positions: torch.Tensor,
+    ):
+        del evict_start, evict_end
+        if evict_positions.numel() > 0:
+            self.row_deltakv_comp_abs_pos[row_idx, evict_positions.to(torch.long)] = evict_positions.to(torch.int32)
 
     def _standalone_persistent_slots_for_prompt(
         self,

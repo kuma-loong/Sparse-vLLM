@@ -21,6 +21,7 @@ class RuntimeParamNormalizationTest(unittest.TestCase):
                 "deltakv_latent_dim": 256,
                 "deltakv_latent_quant_bits": 0,
                 "engine_prefill_chunk_size": 512,
+                "prefill_schedule_policy": "auto",
             },
             backend="sparsevllm",
         )
@@ -43,6 +44,7 @@ class RuntimeParamNormalizationTest(unittest.TestCase):
                 "kv_compressed_size": 256,
                 "kv_quant_bits": 0,
                 "chunk_prefill_size": 512,
+                "prefill_schedule_policy": "auto",
             },
         )
 
