@@ -1,7 +1,12 @@
 # Sparse-vLLM Documentation
 
-This directory separates stable user-facing docs from development notes and
-historical experiment records.
+This directory contains stable user-facing documentation: setup guides,
+feature descriptions, architecture notes, configuration references, and
+benchmark runbooks.
+
+Developer logs, dated implementation notes, and local experiment records live
+outside this tree under [`../dev_docs/`](../dev_docs/). Keep new temporary
+records there so `docs/` stays useful as the public project guide.
 
 ## Stable Docs
 
@@ -14,8 +19,7 @@ historical experiment records.
   backend-specific semantics.
 - [Benchmarking](benchmarking/README.md): throughput, LongBench, MathBench,
   and multimodal benchmark entrypoints.
-- [Governance](governance/README.md): reliability rules, repo review, and
-  maintenance notes.
+- [Governance](governance/README.md): reliability rules for research code.
 
 ## Reference Docs
 
@@ -30,11 +34,8 @@ historical experiment records.
 - [LLaVA-OneVision vanilla batch benchmarks](benchmarking/multimodal/llava-onevision-vanilla-batch-benchmarks.md)
 - [LLaVA-OneVision ReKV-style QA-Ego4D](benchmarking/multimodal/llava-onevision-rekv-qaego4d.md)
 
-## Development Notes
+## Developer And Experiment Archive
 
-These files preserve implementation history and exact local experiment records.
-They are useful for debugging and audit trails, but they are not the primary
-entrypoint for new users.
-
-- [Experiment records](dev_notes/experiment-records.md)
-- [Code change history](dev_notes/code-change-history/)
+- [Developer documentation archive](../dev_docs/README.md): dated code-change
+  notes, local experiment records, repository review notes, and maintenance
+  TODOs that are useful for audits but not stable user documentation.

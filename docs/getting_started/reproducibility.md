@@ -1,7 +1,8 @@
 # Reproducibility
 
 Use this page as the stable checklist for reproducing Sparse-vLLM experiments.
-For exact historical runs, see [dev_notes/experiment-records.md](../dev_notes/experiment-records.md).
+For exact historical runs, see
+[dev_docs/experiment-records.md](../../dev_docs/experiment-records.md).
 
 ## Environment
 
@@ -34,9 +35,9 @@ LongBench and MathBench read data roots from environment variables:
 - `DELTAKV_DATA_DIR`: general benchmark dataset root.
 - `DELTAKV_LONGBENCH_DATA_DIR`: LongBench root containing `data/*.jsonl`.
 
-If a command uses local paths such as `/data2/haojitai/...` or
-`/root/autodl-fs/...`, rewrite them for the target machine and record the final
-paths in the run record.
+If a command uses local placeholders such as `<DATA_ROOT>`, `<MODEL_ROOT>`, or
+`<OUTPUT_ROOT>`, rewrite them for the target machine and record the final paths
+in the run record.
 
 ## Parameter Rules
 

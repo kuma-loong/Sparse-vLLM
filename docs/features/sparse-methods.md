@@ -33,7 +33,7 @@ and `LLM(...)` kwargs should use `sparse_method`.
   hooks.
 
 For new first-class methods, use the repo-local
-[`$add-sparse-method`](../../skills/add-sparse-method/SKILL.md) skill.
+[`$add-sparse-method`](../../.agents/skills/add-sparse-method/SKILL.md) skill.
 
 ## Query-Aware Knobs
 

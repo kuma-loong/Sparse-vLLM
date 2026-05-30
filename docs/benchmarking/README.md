@@ -38,8 +38,8 @@ Full-attention baseline:
 ```bash
 python benchmark/math_bench/pred.py \
   --model qwen7b-full \
-  --model_path /root/autodl-fs/models/DeepSeek-R1-Distill-Qwen-7B \
-  --tokenizer_path /root/autodl-fs/models/DeepSeek-R1-Distill-Qwen-7B \
+  --model_path <MODEL_ROOT>/DeepSeek-R1-Distill-Qwen-7B \
+  --tokenizer_path <MODEL_ROOT>/DeepSeek-R1-Distill-Qwen-7B \
   --ws 1 \
   --batch_size 30 \
   --backend sparsevllm \
@@ -53,8 +53,8 @@ OmniKV:
 ```bash
 python benchmark/math_bench/pred.py \
   --model qwen7b-omnikv \
-  --model_path /root/autodl-fs/models/DeepSeek-R1-Distill-Qwen-7B \
-  --tokenizer_path /root/autodl-fs/models/DeepSeek-R1-Distill-Qwen-7B \
+  --model_path <MODEL_ROOT>/DeepSeek-R1-Distill-Qwen-7B \
+  --tokenizer_path <MODEL_ROOT>/DeepSeek-R1-Distill-Qwen-7B \
   --ws 1 \
   --batch_size 30 \
   --backend sparsevllm \
@@ -69,14 +69,14 @@ checkpoint path below with a matching compressor for the model you run.
 ```bash
 python benchmark/math_bench/pred.py \
   --model qwen7b-deltakv \
-  --model_path /root/autodl-fs/models/DeepSeek-R1-Distill-Qwen-7B \
-  --tokenizer_path /root/autodl-fs/models/DeepSeek-R1-Distill-Qwen-7B \
+  --model_path <MODEL_ROOT>/DeepSeek-R1-Distill-Qwen-7B \
+  --tokenizer_path <MODEL_ROOT>/DeepSeek-R1-Distill-Qwen-7B \
   --ws 1 \
   --batch_size 30 \
   --backend sparsevllm \
   --task aime2024 \
   --temperature 0.6 \
-  --hyper_param '{"engine_prefill_chunk_size": 512, "prefill_keep_tokens": 16384, "max_num_batched_tokens": 8192, "max_num_seqs_in_batch": 30, "sparse_method": "deltakv-triton-v4", "chunk_prefill_accel_omnikv": true, "full_attention_layers": "0,1,2,4,7,14", "decode_keep_tokens": 1024, "deltakv_checkpoint_path": "/root/autodl-fs/checkpoints/compressor/<MATCHING_COMPRESSOR_DIR>", "deltakv_latent_dim": 256}'
+  --hyper_param '{"engine_prefill_chunk_size": 512, "prefill_keep_tokens": 16384, "max_num_batched_tokens": 8192, "max_num_seqs_in_batch": 30, "sparse_method": "deltakv-triton-v4", "chunk_prefill_accel_omnikv": true, "full_attention_layers": "0,1,2,4,7,14", "decode_keep_tokens": 1024, "deltakv_checkpoint_path": "<CHECKPOINT_ROOT>/<MATCHING_COMPRESSOR_DIR>", "deltakv_latent_dim": 256}'
 ```
 
 When `--backend sparsevllm`, method selection happens through `sparse_method`
@@ -90,8 +90,8 @@ engine rather than the HF wrapper models.
 ```bash
 python benchmark/long_bench/pred.py \
   --model qwen7b-omnikv \
-  --model_path /root/autodl-fs/models/Qwen2.5-7B-Instruct-1M \
-  --tokenizer_path /root/autodl-fs/models/Qwen2.5-7B-Instruct-1M \
+  --model_path <MODEL_ROOT>/Qwen2.5-7B-Instruct-1M \
+  --tokenizer_path <MODEL_ROOT>/Qwen2.5-7B-Instruct-1M \
   --ws 1 \
   --batch_size 1 \
   --backend sparsevllm \
@@ -113,13 +113,13 @@ PyramidKV wrapper models implemented under `src/deltakv/`.
 ```bash
 python benchmark/long_bench/pred.py \
   --model qwen7b-deltakv \
-  --model_path /root/autodl-fs/models/Qwen2.5-7B-Instruct-1M \
-  --tokenizer_path /root/autodl-fs/models/Qwen2.5-7B-Instruct-1M \
+  --model_path <MODEL_ROOT>/Qwen2.5-7B-Instruct-1M \
+  --tokenizer_path <MODEL_ROOT>/Qwen2.5-7B-Instruct-1M \
   --ws 1 \
   --batch_size 1 \
   --backend hf \
   --sparse_method deltakv \
-  --deltakv_checkpoint_path "/root/autodl-fs/checkpoints/compressor/Qwen2.5-7B-Instruct-1M-Compressor" \
+  --deltakv_checkpoint_path "<CHECKPOINT_ROOT>/Qwen2.5-7B-Instruct-1M-Compressor" \
   --hyper_param '{"hf_prefill_chunk_size": 2048000, "prefill_keep_tokens": 4096, "chunk_prefill_accel_omnikv": true, "decode_keep_tokens": 0.11, "full_attention_layers": "0,1,2,4,7,14", "recent_keep_tokens": 128, "sink_keep_tokens": 8, "use_compression": true, "use_cluster": true, "deltakv_center_ratio": 0.1}'
 ```
 

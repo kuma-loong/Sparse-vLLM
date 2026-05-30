@@ -2,7 +2,7 @@
 
 Date: 2026-05-12
 Branch: `multimodal-deltakv-adaptation`
-Review environment: `/root/autodl-tmp/conda-envs/svllm-review`
+Review environment: `<REVIEW_CONDA_ENV>`
 
 This document is the engineering review index for the current branch. It
 summarizes repository structure, runtime parameters, supported method paths,
@@ -188,10 +188,10 @@ Rules that matter for experiment reliability:
 
 ## Verification
 
-Commands run in `/root/autodl-tmp/conda-envs/svllm-review` during this review:
+Commands run in `<REVIEW_CONDA_ENV>` during this review:
 
 ```bash
-conda run --prefix /root/autodl-tmp/conda-envs/svllm-review --no-capture-output python -m pytest tests/test_visual_uniform_pruning.py tests/test_quantization_helpers.py -q
+conda run --prefix <REVIEW_CONDA_ENV> --no-capture-output python -m pytest tests/test_visual_uniform_pruning.py tests/test_quantization_helpers.py -q
 ```
 
 Result:
@@ -201,7 +201,7 @@ Result:
 ```
 
 ```bash
-conda run --prefix /root/autodl-tmp/conda-envs/svllm-review --no-capture-output python -m pytest tests -q
+conda run --prefix <REVIEW_CONDA_ENV> --no-capture-output python -m pytest tests -q
 ```
 
 Result after the tuple-index fix:
@@ -214,7 +214,7 @@ The previous PyTorch list-indexing future warning in
 `src/sparsevllm/triton_kernel/quant.py` no longer appears.
 
 ```bash
-conda run --prefix /root/autodl-tmp/conda-envs/svllm-review --no-capture-output python -m compileall -q src scripts benchmark tests
+conda run --prefix <REVIEW_CONDA_ENV> --no-capture-output python -m compileall -q src scripts benchmark tests
 ```
 
 Result:

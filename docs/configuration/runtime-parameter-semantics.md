@@ -499,7 +499,7 @@ Example Sparse-vLLM smoke command:
 ```bash
 CUDA_VISIBLE_DEVICES=7 PYTHONPATH=$PWD/src \
 python scripts/benchmarks/bench_sparse_vllm.py \
-  --model_path /data2/haojitai/models/Qwen2.5-7B-Instruct-1M \
+  --model_path <MODEL_ROOT>/Qwen2.5-7B-Instruct-1M \
   --lengths 1024 \
   --batch_sizes 2 \
   --methods deltakv-delta-quant \
@@ -898,8 +898,8 @@ python scripts/benchmarks/bench_sparse_vllm.py \
 Benchmark output/data example:
 
 ```bash
-DELTAKV_OUTPUT_DIR=/data2/haojitai/outputs \
-DELTAKV_DATA_DIR=/data2/haojitai/datasets \
+DELTAKV_OUTPUT_DIR=<OUTPUT_ROOT> \
+DELTAKV_DATA_DIR=<DATA_ROOT> \
 PYTHONPATH=$PWD/src:$PYTHONPATH \
 python benchmark/long_bench/pred.py \
   --model qwen25-deltakv \

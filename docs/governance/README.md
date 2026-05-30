@@ -1,7 +1,8 @@
 # Governance
 
-This directory holds reliability rules and internal maintenance notes.
+This directory holds stable research-code governance rules.
 
 - [Research Code Guidelines](research-code-guidelines.md)
-- [Repository Review](repo-review-2026-05-12.md)
-- [TODO](todo.md)
+
+Dated repository reviews and temporary maintenance notes live in
+[`../../dev_docs/`](../../dev_docs/).
