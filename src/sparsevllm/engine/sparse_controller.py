@@ -787,6 +787,8 @@ class SparseController:
 
     def _needs_attn_score(self, layer_idx: int, is_prefill: bool, seqs: list[Sequence]) -> bool:
         is_dynamic_deltakv = self.is_deltakv_family
+        if self.sparse_method == 'omnikv' and get_context().is_long_text is False:
+            return False
         if (self.sparse_method == 'omnikv' or is_dynamic_deltakv) and layer_idx in self.obs_layer_ids:
             if is_prefill:
                 return False
