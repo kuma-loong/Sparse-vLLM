@@ -620,6 +620,8 @@ class SparseController:
             if not is_prefill or get_context().is_long_text is False:
                 return False
             return any(seq.is_last_chunk_prefill for seq in seqs)
+        if self.sparse_method == 'omnikv' and get_context().is_long_text is False:
+            return False
         if self.sparse_method in ('omnikv', 'deltakv') and layer_idx in self.obs_layer_ids:
             if is_prefill and not self.config.chunk_prefill_accel_omnikv:
                 return False
