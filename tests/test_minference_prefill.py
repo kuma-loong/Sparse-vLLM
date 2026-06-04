@@ -1,6 +1,7 @@
 import json
 import tempfile
 import unittest
+from collections import deque
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -243,6 +244,45 @@ class MinferencePrefillConfigTest(unittest.TestCase):
 
 
 class MinferencePrefillKernelTest(unittest.TestCase):
+    @unittest.skipUnless(torch.cuda.is_available(), "CUDA is required for SnapKV cache-manager tests.")
+    def test_snapkv_decode_updates_layer_max_context_len(self):
+        manager = SnapKVCacheManager.__new__(SnapKVCacheManager)
+        manager.num_layers = 2
+        manager.max_model_len = 32
+        manager.max_buffer_rows = 4
+        manager.free_slots_stack = [
+            torch.arange(64, dtype=torch.int32, device="cuda") for _ in range(manager.num_layers)
+        ]
+        manager._num_free_slots = [64 for _ in range(manager.num_layers)]
+        manager.buffer_req_to_token_slots = [
+            torch.zeros((manager.max_buffer_rows, manager.max_model_len), dtype=torch.int32, device="cuda")
+            for _ in range(manager.num_layers)
+        ]
+        manager.seq_id_to_row = []
+        manager.free_rows = []
+        manager.row_seq_lens = []
+        manager.layer_batch_states = []
+
+        seq = Sequence([1] * 14)
+        seq.num_prefilled_tokens = 14
+        seq.current_chunk_size = 14
+        seq.append_token(2)
+
+        for _ in range(manager.num_layers):
+            manager.seq_id_to_row.append({seq.seq_id: 0})
+            manager.free_rows.append(deque(range(1, manager.max_buffer_rows)))
+            lens = torch.zeros((manager.max_buffer_rows,), dtype=torch.int32).cpu().numpy()
+            lens[0] = 14
+            manager.row_seq_lens.append(lens)
+            manager.layer_batch_states.append(SimpleNamespace(max_context_len=14))
+
+        manager._prepare_decode([seq])
+
+        for layer_id in range(manager.num_layers):
+            state = manager.layer_batch_states[layer_id]
+            self.assertEqual(state.max_context_len, 15)
+            self.assertEqual(state.context_lens.tolist(), [15])
+
     @unittest.skipUnless(torch.cuda.is_available(), "CUDA is required for MInference prefill kernel tests.")
     def test_gpu_converter_matches_row_reference(self):
         device = "cuda"

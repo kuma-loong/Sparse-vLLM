@@ -562,6 +562,7 @@ class SnapKVCacheManager(CacheManager):
                 state = self.layer_batch_states[layer_id]
                 state.slot_mapping = layers_slot_mapping_cuda[layer_id]
                 state.context_lens = layers_context_lens_cuda[layer_id]
+                state.max_context_len = int(max(layers_context_lens[layer_id])) if seqs else 0
                 req_ids = [self.seq_id_to_row[layer_id][seq.seq_id] for seq in seqs]
                 state.req_indices = torch.tensor(req_ids, dtype=torch.int32, device="cuda")
 
