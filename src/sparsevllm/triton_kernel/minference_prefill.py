@@ -9,6 +9,8 @@ import torch
 import triton
 import triton.language as tl
 
+from sparsevllm.triton_kernel.context_flashattention_nopad import context_attention_fwd
+
 
 MINFERENCE_LAST_Q = 64
 MIN_VERTICAL_SIZE = 30
@@ -16,6 +18,8 @@ MIN_SLASH_SIZE = 50
 MIN_SLASH_RECENT = 100
 MINFERENCE_BLOCK_M = 64
 MINFERENCE_BLOCK_N = 64
+MINFERENCE_DENSE_FALLBACK_RATIO = 0.50
+MINFERENCE_MIN_SPARSE_SEQ_LEN = 32768
 
 
 @lru_cache(maxsize=8)
@@ -72,38 +76,89 @@ def _get_vs_pattern_from_config(
     return vertical_size, slash_size
 
 
-def _build_head_indices(
+def _estimate_layer_pattern_density(
+    config,
+    layer_idx: int,
+    rank: int,
+    num_heads: int,
+    seq_len: int,
+) -> float:
+    pattern_config = _load_pattern_config(str(config.minference_config_path))
+    if seq_len <= 0:
+        return 1.0
+
+    total = 0
+    for head_idx in range(num_heads):
+        global_head_idx = int(rank) * num_heads + head_idx
+        vertical_size, slash_size = _get_vs_pattern_from_config(
+            pattern_config, config, layer_idx, global_head_idx
+        )
+        vertical_size = min(seq_len, max(int(vertical_size), MIN_VERTICAL_SIZE))
+        slash_size = min(seq_len, max(int(slash_size), MIN_SLASH_SIZE))
+        total += vertical_size + slash_size
+    return float(total) / float(num_heads * seq_len)
+
+
+def _get_layer_pattern_sizes(
+    pattern_config: list[dict[str, Any]],
+    config,
+    layer_idx: int,
+    rank: int,
+    num_heads: int,
+    seq_len: int,
+    device: torch.device,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    vertical_sizes = []
+    slash_sizes = []
+    for head_idx in range(num_heads):
+        global_head_idx = int(rank) * num_heads + head_idx
+        vertical_size, slash_size = _get_vs_pattern_from_config(
+            pattern_config, config, layer_idx, global_head_idx
+        )
+        vertical_sizes.append(min(seq_len, max(int(vertical_size), MIN_VERTICAL_SIZE)))
+        slash_sizes.append(min(seq_len, max(int(slash_size), MIN_SLASH_SIZE)))
+    return (
+        torch.tensor(vertical_sizes, dtype=torch.int64, device=device),
+        torch.tensor(slash_sizes, dtype=torch.int64, device=device),
+    )
+
+
+def _build_batch_head_indices(
     q_seq: torch.Tensor,
     k_seq: torch.Tensor,
-    vertical_size: int,
-    slash_size: int,
-) -> tuple[torch.Tensor, torch.Tensor]:
+    vertical_sizes: torch.Tensor,
+    slash_sizes: torch.Tensor,
+    kv_group_num: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     seq_len = int(q_seq.shape[0])
+    num_heads = int(q_seq.shape[1])
     head_dim = int(q_seq.shape[-1])
     last_q = min(MINFERENCE_LAST_Q, seq_len)
-    vertical_size = min(seq_len, max(int(vertical_size), MIN_VERTICAL_SIZE))
-    slash_size = min(seq_len, max(int(slash_size), MIN_SLASH_SIZE))
+    max_vertical = int(vertical_sizes.max().item())
+    max_slash = int(slash_sizes.max().item())
 
-    q_last = q_seq[-last_q:].to(torch.float32)
-    k_float = k_seq.to(torch.float32)
-    logits = torch.matmul(q_last, k_float.transpose(0, 1)) / math.sqrt(head_dim)
+    q_last = q_seq[-last_q:].permute(1, 0, 2).to(torch.float32)
+    kv_head_for_q = torch.arange(num_heads, device=q_seq.device) // int(kv_group_num)
+    k_by_q_head = k_seq.index_select(1, kv_head_for_q).permute(1, 2, 0).to(torch.float32)
+    logits = torch.bmm(q_last, k_by_q_head) / math.sqrt(head_dim)
+
     q_positions = torch.arange(seq_len - last_q, seq_len, device=q_seq.device)
     k_positions = torch.arange(seq_len, device=q_seq.device)
-    logits = logits.masked_fill(k_positions.unsqueeze(0) > q_positions.unsqueeze(1), -torch.inf)
+    logits = logits.masked_fill(k_positions.view(1, 1, -1) > q_positions.view(1, -1, 1), -torch.inf)
     probs = torch.softmax(logits, dim=-1, dtype=torch.float32)
 
-    vertical_scores = probs.sum(dim=0)
-    vertical_scores[: min(MIN_VERTICAL_SIZE, seq_len)] = torch.inf
-    vertical_idx = torch.topk(vertical_scores, vertical_size, dim=-1).indices.to(torch.int32)
+    vertical_scores = probs.sum(dim=1)
+    vertical_scores[:, : min(MIN_VERTICAL_SIZE, seq_len)] = torch.inf
+    vertical_idx = torch.topk(vertical_scores, max_vertical, dim=-1).indices.to(torch.int32)
 
-    slash_scores = torch.zeros((seq_len,), dtype=torch.float32, device=q_seq.device)
+    slash_scores = torch.zeros((num_heads, seq_len), dtype=torch.float32, device=q_seq.device)
     for row, pos in enumerate(range(seq_len - last_q, seq_len)):
         cols = torch.arange(pos + 1, device=q_seq.device)
         distances = (pos - cols).to(torch.long)
-        slash_scores.index_add_(0, distances, probs[row, : pos + 1])
-    slash_scores[: min(MIN_SLASH_RECENT, seq_len)] = torch.inf
-    slash_idx = torch.topk(slash_scores, slash_size, dim=-1).indices.to(torch.int32)
-    return vertical_idx, slash_idx
+        slash_scores.index_add_(1, distances, probs[:, row, : pos + 1])
+    slash_scores[:, : min(MIN_SLASH_RECENT, seq_len)] = torch.inf
+    slash_idx = torch.topk(slash_scores, max_slash, dim=-1).indices.to(torch.int32)
+    return vertical_idx, vertical_sizes.to(torch.int32), slash_idx, slash_sizes.to(torch.int32)
 
 
 def _filter_vertical_columns(vertical_list: list[int], block_starts: list[int], block_n: int) -> list[int]:
@@ -154,25 +209,37 @@ def _build_sparse_metadata(
     max_blocks = 1
     max_columns = 1
     pattern_config = _load_pattern_config(str(config.minference_config_path))
+    vertical_sizes, slash_sizes = _get_layer_pattern_sizes(
+        pattern_config,
+        config,
+        layer_idx,
+        rank,
+        num_heads,
+        max_seq_len,
+        q.device,
+    )
 
     for b_idx in range(batch):
         seq_len = int(b_seq_len[b_idx].item())
         q_start = int(b_start_loc[b_idx].item())
         req_row = int(b_req_idx[b_idx].item())
         slots = req_to_tokens[req_row, :seq_len].to(torch.long)
+        q_seq = q[q_start: q_start + seq_len]
+        k_seq = k_cache.index_select(0, slots)
+        batch_vertical_idx, batch_vertical_sizes, batch_slash_idx, batch_slash_sizes = _build_batch_head_indices(
+            q_seq,
+            k_seq,
+            vertical_sizes.clamp_max(seq_len),
+            slash_sizes.clamp_max(seq_len),
+            kv_group_num,
+        )
         batch_blocks: list[list[list[int]]] = []
         batch_columns: list[list[list[int]]] = []
         for head_idx in range(num_heads):
-            global_head_idx = int(rank) * num_heads + head_idx
-            vertical_size, slash_size = _get_vs_pattern_from_config(
-                pattern_config, config, layer_idx, global_head_idx
-            )
-            kv_head_idx = head_idx // kv_group_num
-            q_seq = q[q_start: q_start + seq_len, head_idx, :]
-            k_seq = k_cache.index_select(0, slots)[:, kv_head_idx, :]
-            vertical_idx, slash_idx = _build_head_indices(q_seq, k_seq, vertical_size, slash_size)
-            vertical_list = [int(x) for x in vertical_idx.detach().cpu().tolist()]
-            slash_list = [int(x) for x in slash_idx.detach().cpu().tolist()]
+            vertical_count = int(batch_vertical_sizes[head_idx].item())
+            slash_count = int(batch_slash_sizes[head_idx].item())
+            vertical_list = [int(x) for x in batch_vertical_idx[head_idx, :vertical_count].detach().cpu().tolist()]
+            slash_list = [int(x) for x in batch_slash_idx[head_idx, :slash_count].detach().cpu().tolist()]
 
             head_blocks: list[list[int]] = []
             head_columns: list[list[int]] = []
@@ -406,6 +473,24 @@ def minference_context_attention_fwd(
         raise ValueError("MInference prefill requires q, k_cache, and v_cache to have the same dtype.")
     if not (q.stride(-1) == 1 and k_cache.stride(-1) == 1 and v_cache.stride(-1) == 1 and o.stride(-1) == 1):
         raise ValueError("MInference prefill expects contiguous head_dim strides.")
+
+    max_seq_len = int(b_seq_len.max().item())
+    density = _estimate_layer_pattern_density(config, layer_idx, rank, int(q.shape[1]), max_seq_len)
+    if max_seq_len < MINFERENCE_MIN_SPARSE_SEQ_LEN or density >= MINFERENCE_DENSE_FALLBACK_RATIO:
+        context_attention_fwd(
+            q,
+            k_cache,
+            v_cache,
+            o,
+            b_req_idx,
+            b_start_loc,
+            b_seq_len,
+            b_prompt_cache_len,
+            max_input_len,
+            req_to_tokens,
+            attn_score=attn_score,
+        )
+        return
 
     block_count, block_offset, column_count, column_index = _build_sparse_metadata(
         q,

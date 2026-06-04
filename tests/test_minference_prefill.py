@@ -9,6 +9,7 @@ import torch
 
 from sparsevllm.config import Config
 from sparsevllm.triton_kernel.minference_prefill import (
+    _estimate_layer_pattern_density,
     _get_vs_pattern,
     minference_context_attention_fwd,
 )
@@ -75,6 +76,17 @@ class MinferencePrefillConfigTest(unittest.TestCase):
             cfg = SimpleNamespace(minference_config_path=str(pattern_path), minference_ratio=1.0)
             with self.assertRaisesRegex(NotImplementedError, "vertical_and_slash"):
                 _get_vs_pattern(cfg, 0, 0)
+
+    def test_short_context_density_triggers_dense_fallback(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            pattern_path = Path(tmp) / "pattern.json"
+            pattern_path.write_text(
+                json.dumps([{"0": ["vertical_and_slash", 4096, 4096, 1.0]}]),
+                encoding="utf-8",
+            )
+            cfg = SimpleNamespace(minference_config_path=str(pattern_path), minference_ratio=1.0)
+            density = _estimate_layer_pattern_density(cfg, layer_idx=0, rank=0, num_heads=1, seq_len=2048)
+            self.assertGreaterEqual(density, 1.0)
 
     def test_chunk_prefill_rejected_before_cuda_work(self):
         cfg = SimpleNamespace(minference_config_path="/tmp/unused.json", minference_ratio=1.0)
