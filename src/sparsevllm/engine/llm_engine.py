@@ -185,6 +185,9 @@ class LLMEngine:
         self._exited = False
         self._throughput_logger = _ThroughputIntervalLogger(config.throughput_log_interval_s)
         self.last_step_token_outputs: list[tuple[int, list[int]]] = []
+        self.last_step_logprob_outputs: list[
+            tuple[int, list[float | None], list[dict[int, float] | None]]
+        ] = []
         # 注册退出钩子，确保程序崩溃或结束时能正确释放多进程资源
         atexit.register(self.exit)
 
@@ -295,6 +298,7 @@ class LLMEngine:
         """
         with profiler.record("step"):
             self.last_step_token_outputs = []
+            self.last_step_logprob_outputs = []
             # 1. 调度：决定哪些序列进入本次 Batch
             with profiler.record("schedule"):
                 seqs, is_prefill, preempted_seqs = self.scheduler.schedule()
@@ -341,17 +345,38 @@ class LLMEngine:
             # 3. 跨进程广播并执行推理：
             # Rank 0 会驱动所有 Rank 进程同步运行本地的 ModelRunner.run
             with profiler.record("model_run_call"):
-                token_ids, attn_score = self.model_runner.call("run", seqs, is_prefill)
+                token_ids, logprob_outputs = self.model_runner.call("run", seqs, is_prefill)
+            token_logprobs, top_logprobs = (
+                logprob_outputs if logprob_outputs is not None else (None, None)
+            )
 
             token_outputs: list[tuple[int, list[int]]] = []
-            for seq, token_id in zip(seqs, token_ids):
+            logprob_step_outputs: list[
+                tuple[int, list[float | None], list[dict[int, float] | None]]
+            ] = []
+            step_token_logprobs = token_logprobs or [None] * len(seqs)
+            step_top_logprobs = top_logprobs or [None] * len(seqs)
+            for seq, token_id, token_logprob, top_logprob in zip(
+                seqs,
+                token_ids,
+                step_token_logprobs,
+                step_top_logprobs,
+            ):
                 if not is_prefill or seq.is_last_chunk_prefill:
                     token_outputs.append((seq.seq_id, [int(token_id)]))
+                    logprob_step_outputs.append((seq.seq_id, [token_logprob], [top_logprob]))
             
             # 4. 逻辑后处理：更新序列的 Token 列表和状态机
             with profiler.record("postprocess"):
-                self.scheduler.postprocess(seqs, token_ids, is_prefill)
+                self.scheduler.postprocess(
+                    seqs,
+                    token_ids,
+                    is_prefill,
+                    token_logprobs=token_logprobs,
+                    top_logprobs=top_logprobs,
+                )
             self.last_step_token_outputs = token_outputs
+            self.last_step_logprob_outputs = logprob_step_outputs
             
             # 5. 完成序列的资源回收：
             # 遍历序列，如果已达到 EOS 或最大长度，则通知所有进程释放物理槽位
@@ -360,7 +385,14 @@ class LLMEngine:
                 for seq in seqs:
                     if seq.is_finished:
                         self.model_runner.call("free_slots", seq.seq_id)
-                        finished_outputs.append((seq.seq_id, seq.completion_token_ids))
+                        finished_outputs.append(
+                            (
+                                seq.seq_id,
+                                seq.completion_token_ids,
+                                seq.completion_token_logprobs,
+                                seq.completion_top_logprobs,
+                            )
+                        )
         
         # 计算吞吐量统计数据 (正数表示 Prefill，负数表示 Decode)
         num_tokens = sum(seq.current_chunk_size for seq in seqs) if is_prefill else -len(seqs)
@@ -435,7 +467,7 @@ class LLMEngine:
                 })
             
             # 收集已完成的输出
-            for seq_id, token_ids in output:
+            for seq_id, token_ids, _token_logprobs, _top_logprobs in output:
                 outputs[seq_id] = token_ids
                 if use_tqdm:
                     pbar.update(1)
