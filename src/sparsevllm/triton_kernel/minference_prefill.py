@@ -10,6 +10,14 @@ import triton
 import triton.language as tl
 
 
+MINFERENCE_LAST_Q = 64
+MIN_VERTICAL_SIZE = 30
+MIN_SLASH_SIZE = 50
+MIN_SLASH_RECENT = 100
+MINFERENCE_BLOCK_M = 64
+MINFERENCE_BLOCK_N = 64
+
+
 @lru_cache(maxsize=8)
 def _load_pattern_config(path: str) -> list[dict[str, Any]]:
     with open(path, "r", encoding="utf-8") as f:
@@ -24,6 +32,15 @@ def _load_pattern_config(path: str) -> list[dict[str, Any]]:
 
 def _get_vs_pattern(config, layer_idx: int, global_head_idx: int) -> tuple[int, int]:
     pattern_config = _load_pattern_config(str(config.minference_config_path))
+    return _get_vs_pattern_from_config(pattern_config, config, layer_idx, global_head_idx)
+
+
+def _get_vs_pattern_from_config(
+    pattern_config: list[dict[str, Any]],
+    config,
+    layer_idx: int,
+    global_head_idx: int,
+) -> tuple[int, int]:
     if layer_idx >= len(pattern_config):
         raise ValueError(
             "MInference config has fewer layers than the model: "
@@ -63,9 +80,9 @@ def _build_head_indices(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     seq_len = int(q_seq.shape[0])
     head_dim = int(q_seq.shape[-1])
-    last_q = min(64, seq_len)
-    vertical_size = min(seq_len, max(int(vertical_size), 30))
-    slash_size = min(seq_len, max(int(slash_size), 50))
+    last_q = min(MINFERENCE_LAST_Q, seq_len)
+    vertical_size = min(seq_len, max(int(vertical_size), MIN_VERTICAL_SIZE))
+    slash_size = min(seq_len, max(int(slash_size), MIN_SLASH_SIZE))
 
     q_last = q_seq[-last_q:].to(torch.float32)
     k_float = k_seq.to(torch.float32)
@@ -76,7 +93,7 @@ def _build_head_indices(
     probs = torch.softmax(logits, dim=-1, dtype=torch.float32)
 
     vertical_scores = probs.sum(dim=0)
-    vertical_scores[: min(30, seq_len)] = torch.inf
+    vertical_scores[: min(MIN_VERTICAL_SIZE, seq_len)] = torch.inf
     vertical_idx = torch.topk(vertical_scores, vertical_size, dim=-1).indices.to(torch.int32)
 
     slash_scores = torch.zeros((seq_len,), dtype=torch.float32, device=q_seq.device)
@@ -84,9 +101,31 @@ def _build_head_indices(
         cols = torch.arange(pos + 1, device=q_seq.device)
         distances = (pos - cols).to(torch.long)
         slash_scores.index_add_(0, distances, probs[row, : pos + 1])
-    slash_scores[: min(100, seq_len)] = torch.inf
+    slash_scores[: min(MIN_SLASH_RECENT, seq_len)] = torch.inf
     slash_idx = torch.topk(slash_scores, slash_size, dim=-1).indices.to(torch.int32)
     return vertical_idx, slash_idx
+
+
+def _filter_vertical_columns(vertical_list: list[int], block_starts: list[int], block_n: int) -> list[int]:
+    return [
+        col for col in vertical_list
+        if not any(start <= col < start + block_n for start in block_starts)
+    ]
+
+
+def _copy_nested_indices(
+    count_tensor: torch.Tensor,
+    index_tensor: torch.Tensor,
+    nested_indices: list[list[list[list[int]]]],
+):
+    for b_idx, batch_indices in enumerate(nested_indices):
+        for head_idx, head_indices in enumerate(batch_indices):
+            for row_idx, values in enumerate(head_indices):
+                count_tensor[b_idx, head_idx, row_idx] = len(values)
+                if values:
+                    index_tensor[b_idx, head_idx, row_idx, : len(values)] = torch.tensor(
+                        values, dtype=torch.int32, device=index_tensor.device
+                    )
 
 
 @torch.no_grad()
@@ -114,6 +153,7 @@ def _build_sparse_metadata(
     per_row_columns: list[list[list[list[int]]]] = []
     max_blocks = 1
     max_columns = 1
+    pattern_config = _load_pattern_config(str(config.minference_config_path))
 
     for b_idx in range(batch):
         seq_len = int(b_seq_len[b_idx].item())
@@ -124,7 +164,9 @@ def _build_sparse_metadata(
         batch_columns: list[list[list[int]]] = []
         for head_idx in range(num_heads):
             global_head_idx = int(rank) * num_heads + head_idx
-            vertical_size, slash_size = _get_vs_pattern(config, layer_idx, global_head_idx)
+            vertical_size, slash_size = _get_vs_pattern_from_config(
+                pattern_config, config, layer_idx, global_head_idx
+            )
             kv_head_idx = head_idx // kv_group_num
             q_seq = q[q_start: q_start + seq_len, head_idx, :]
             k_seq = k_cache.index_select(0, slots)[:, kv_head_idx, :]
@@ -152,10 +194,7 @@ def _build_sparse_metadata(
                 if not block_starts:
                     block_starts.add(max(0, (q_block_start // block_n) * block_n))
                 sorted_blocks = sorted(block_starts)
-                filtered_columns = [
-                    col for col in vertical_list
-                    if not any(start <= col < start + block_n for start in sorted_blocks)
-                ]
+                filtered_columns = _filter_vertical_columns(vertical_list, sorted_blocks, block_n)
                 head_blocks.append(sorted_blocks)
                 head_columns.append(filtered_columns)
                 max_blocks = max(max_blocks, len(sorted_blocks))
@@ -170,22 +209,8 @@ def _build_sparse_metadata(
     column_count = torch.zeros((batch, num_heads, num_rows), dtype=torch.int32, device=q.device)
     column_index = torch.zeros((batch, num_heads, num_rows, max_columns), dtype=torch.int32, device=q.device)
 
-    for b_idx, batch_blocks in enumerate(per_row_blocks):
-        for head_idx, head_blocks in enumerate(batch_blocks):
-            for row_idx, blocks in enumerate(head_blocks):
-                block_count[b_idx, head_idx, row_idx] = len(blocks)
-                if blocks:
-                    block_offset[b_idx, head_idx, row_idx, : len(blocks)] = torch.tensor(
-                        blocks, dtype=torch.int32, device=q.device
-                    )
-    for b_idx, batch_columns in enumerate(per_row_columns):
-        for head_idx, head_columns in enumerate(batch_columns):
-            for row_idx, columns in enumerate(head_columns):
-                column_count[b_idx, head_idx, row_idx] = len(columns)
-                if columns:
-                    column_index[b_idx, head_idx, row_idx, : len(columns)] = torch.tensor(
-                        columns, dtype=torch.int32, device=q.device
-                    )
+    _copy_nested_indices(block_count, block_offset, per_row_blocks)
+    _copy_nested_indices(column_count, column_index, per_row_columns)
     return block_count, block_offset, column_count, column_index
 
 
@@ -372,8 +397,8 @@ def minference_context_attention_fwd(
     if attn_score is not None and attn_score.dim() != 3:
         raise NotImplementedError("MInference prefill currently supports only 3D attention-score collection.")
 
-    block_m = 64
-    block_n = 64
+    block_m = MINFERENCE_BLOCK_M
+    block_n = MINFERENCE_BLOCK_N
     head_dim = int(q.shape[-1])
     if head_dim not in {16, 32, 64, 128, 256}:
         raise ValueError(f"Unsupported MInference head_dim={head_dim}.")
