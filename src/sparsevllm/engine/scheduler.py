@@ -159,6 +159,24 @@ class Scheduler:
         num_batched_tokens: int,
         step_free_count: int,
     ) -> int:
+        if getattr(self.config, "prefill_attention_backend", "") == "minference":
+            available_tokens = min(
+                self.max_num_batched_tokens - num_batched_tokens,
+                step_free_count,
+            )
+            if remaining_prefill_tokens <= available_tokens:
+                return int(remaining_prefill_tokens)
+            if num_batched_tokens > 0:
+                return 0
+            raise RuntimeError(
+                "MInference prefill requires each prompt to run in one full prefill step "
+                "because chunk/prefix prefill is not supported yet. "
+                f"remaining_prefill_tokens={remaining_prefill_tokens} "
+                f"available_tokens={available_tokens} "
+                f"max_num_batched_tokens={self.max_num_batched_tokens} "
+                f"step_free_count={step_free_count}. "
+                "Increase max_num_batched_tokens/engine_prefill_chunk_size or reduce prompt length."
+            )
         if self.prefill_schedule_policy == PREFILL_POLICY_ALL_CHUNKED:
             return min(
                 remaining_prefill_tokens,

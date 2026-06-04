@@ -8,6 +8,10 @@ from unittest.mock import patch
 import torch
 
 from sparsevllm.config import Config
+from sparsevllm.engine.cache_manager.snapkv import SnapKVCacheManager
+from sparsevllm.engine.scheduler import Scheduler
+from sparsevllm.engine.sequence import Sequence
+from sparsevllm.method_registry import PREFILL_POLICY_ALL_CHUNKED
 from sparsevllm.triton_kernel.minference_prefill import (
     MINFERENCE_BLOCK_M,
     MINFERENCE_BLOCK_N,
@@ -17,6 +21,40 @@ from sparsevllm.triton_kernel.minference_prefill import (
     _get_vs_pattern,
     minference_context_attention_fwd,
 )
+
+
+class _SchedulerMemoryOracle:
+    def __init__(self, free_slots: int):
+        self.num_free_slots = int(free_slots)
+
+    def reserved_prefill_slots(self, waiting_seqs, chunk_prefill_size: int) -> int:
+        del waiting_seqs, chunk_prefill_size
+        return 0
+
+    def prefill_step_free_slots(self) -> int:
+        return self.num_free_slots
+
+    def prompt_admission_budgets(self, waiting_seqs, chunk_prefill_size: int) -> dict[str, int]:
+        del waiting_seqs, chunk_prefill_size
+        return {"slots": self.num_free_slots}
+
+    def prefill_batched_tokens_margin(self) -> int:
+        return 0
+
+    def remaining_prefill_tokens(self, seq: Sequence) -> int:
+        return int(seq.num_prompt_tokens - seq.num_prefilled_tokens)
+
+    def prompt_admission_costs(self, seq: Sequence) -> dict[str, int]:
+        return {"slots": int(seq.num_prompt_tokens)}
+
+    def prompt_admission_failure_action(self) -> str:
+        return "raise"
+
+    def prompt_logical_reservation_cost(self, seq: Sequence) -> int:
+        return int(seq.num_prompt_tokens)
+
+    def on_prompt_admitted(self, seq: Sequence, costs: dict[str, int]):
+        del seq, costs
 
 
 def _hf_config(num_layers=2, num_heads=2, num_kv_heads=2, head_dim=32):
@@ -85,6 +123,74 @@ class MinferencePrefillConfigTest(unittest.TestCase):
                     max_decoding_seqs=1,
                 )
             self.assertEqual(cfg.max_num_batched_tokens, 65560)
+
+    def test_minference_snapkv_first_prefill_schedules_full_prompt(self):
+        manager = SnapKVCacheManager.__new__(SnapKVCacheManager)
+        manager.config = SimpleNamespace(
+            vllm_sparse_method="snapkv",
+            prefill_attention_backend="minference",
+            snapkv_window_size=32,
+            chunk_prefill_size=2048,
+        )
+        seq = Sequence([1] * 4096)
+        self.assertEqual(manager.remaining_prefill_tokens(seq), 4096)
+
+    def test_plain_snapkv_still_reserves_prefill_window(self):
+        manager = SnapKVCacheManager.__new__(SnapKVCacheManager)
+        manager.config = SimpleNamespace(
+            vllm_sparse_method="snapkv",
+            prefill_attention_backend="",
+            snapkv_window_size=32,
+            chunk_prefill_size=2048,
+        )
+        seq = Sequence([1] * 4096)
+        self.assertEqual(manager.remaining_prefill_tokens(seq), 4064)
+
+    def test_scheduler_runs_minference_prefill_as_full_step(self):
+        cfg = SimpleNamespace(
+            max_num_seqs_in_batch=1,
+            max_num_batched_tokens=65536,
+            max_decoding_seqs=1,
+            chunk_prefill_size=8192,
+            prefill_schedule_policy=PREFILL_POLICY_ALL_CHUNKED,
+            eos=-1,
+            num_sink_tokens=64,
+            num_recent_tokens=512,
+            num_top_tokens=4096,
+            vllm_sparse_method="snapkv",
+            prefill_attention_backend="minference",
+        )
+        scheduler = Scheduler(cfg, _SchedulerMemoryOracle(free_slots=65536))
+        seq = Sequence([1] * 32768)
+        scheduler.add(seq)
+
+        scheduled, is_prefill, preempted = scheduler.schedule()
+
+        self.assertTrue(is_prefill)
+        self.assertEqual(preempted, [])
+        self.assertEqual(scheduled, [seq])
+        self.assertEqual(seq.current_chunk_size, 32768)
+        self.assertTrue(seq.is_last_chunk_prefill)
+
+    def test_scheduler_rejects_minference_prefill_that_cannot_fit(self):
+        cfg = SimpleNamespace(
+            max_num_seqs_in_batch=1,
+            max_num_batched_tokens=8192,
+            max_decoding_seqs=1,
+            chunk_prefill_size=8192,
+            prefill_schedule_policy=PREFILL_POLICY_ALL_CHUNKED,
+            eos=-1,
+            num_sink_tokens=64,
+            num_recent_tokens=512,
+            num_top_tokens=4096,
+            vllm_sparse_method="snapkv",
+            prefill_attention_backend="minference",
+        )
+        scheduler = Scheduler(cfg, _SchedulerMemoryOracle(free_slots=8192))
+        scheduler.add(Sequence([1] * 32768))
+
+        with self.assertRaisesRegex(RuntimeError, "MInference prefill requires each prompt"):
+            scheduler.schedule()
 
     def test_pattern_rejects_unsupported_type(self):
         with tempfile.TemporaryDirectory() as tmp:

@@ -260,6 +260,12 @@ class SnapKVCacheManager(CacheManager):
     def remaining_prefill_tokens(self, seq: Sequence) -> int:
         remaining = int(seq.num_prompt_tokens - seq.num_prefilled_tokens)
         if (
+            self.config.vllm_sparse_method == "snapkv"
+            and self.config.prefill_attention_backend == "minference"
+            and int(seq.num_prefilled_tokens) == 0
+        ):
+            return remaining
+        if (
             self._pyramidkv_can_use_full_prefill_staging()
             and int(seq.num_prefilled_tokens) == 0
             and remaining > int(self.config.chunk_prefill_size)
