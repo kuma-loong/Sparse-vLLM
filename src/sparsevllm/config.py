@@ -87,11 +87,17 @@ class Config:
 
     # Sparse Attention Config
     vllm_sparse_method: str = ""  # "", "streamingllm", "attention-sink", "attention_sink", "snapkv", "omnikv", "quest", "deltakv", "deltakv-triton", "deltakv-triton-v2", "deltakv-triton-v3", "deltakv-triton-v4", "deltakv-delta-quant", "deltakv_delta_quant", "deltakv-standalone", "deltakv-snapkv", "pyramidkv"
+    prefill_attention_backend: str = ""  # "", "minference"
 
     # General Sparse Config
     num_sink_tokens: int = 64
     num_recent_tokens: int = 512
     num_top_tokens: int = 4096
+
+    # MInference Prefill Config
+    minference_config_path: str | None = None
+    minference_starting_layer: int = 0
+    minference_ratio: float = 1.0
 
     # OmniKV Config
     obs_layer_ids: list[int] = None  # None means auto-calculate based on full_attn_layers (useful for omnikv)
@@ -157,6 +163,12 @@ class Config:
             self.enable_profiler = True
             
         self.vllm_sparse_method = normalize_sparse_method(self.vllm_sparse_method)
+        self.prefill_attention_backend = str(self.prefill_attention_backend or "").strip().lower()
+        if self.prefill_attention_backend not in {"", "minference"}:
+            raise ValueError(
+                "prefill_attention_backend must be '' or 'minference', "
+                f"got {self.prefill_attention_backend!r}."
+            )
         if self.vllm_sparse_method not in SUPPORTED_SPARSE_METHODS:
             supported = ", ".join(repr(method) for method in sorted(SUPPORTED_SPARSE_METHODS) if method)
             raise ValueError(
@@ -179,6 +191,20 @@ class Config:
                 f"got {self.deltakv_cluster_gather_chunk_size}."
             )
         self.deltakv_cluster_gather_chunk_size = int(self.deltakv_cluster_gather_chunk_size)
+        self.minference_starting_layer = int(self.minference_starting_layer)
+        if self.minference_starting_layer < 0:
+            raise ValueError(
+                "minference_starting_layer must be >= 0, "
+                f"got {self.minference_starting_layer}."
+            )
+        self.minference_ratio = float(self.minference_ratio)
+        if self.minference_ratio <= 0:
+            raise ValueError(f"minference_ratio must be > 0, got {self.minference_ratio}.")
+        if isinstance(self.minference_config_path, str):
+            minference_config_path = self.minference_config_path.strip()
+            self.minference_config_path = (
+                None if minference_config_path.lower() in {"", "none", "null"} else minference_config_path
+            )
 
         if not os.path.isdir(self.model):
             raise FileNotFoundError(f"Model directory does not exist: {self.model}")
@@ -230,6 +256,22 @@ class Config:
                 f"Unsupported Sparse-vLLM model_type={self.hf_config.model_type!r}. "
                 "Supported model types: qwen2, qwen3."
             )
+        if self.prefill_attention_backend == "minference":
+            if self.vllm_sparse_method not in {"", "snapkv"}:
+                method = self.vllm_sparse_method or "vanilla"
+                raise NotImplementedError(
+                    "MInference prefill V1 supports only vanilla/full attention and snapkv decode sparsity, "
+                    f"got vllm_sparse_method={method!r}."
+                )
+            if self.minference_config_path is None:
+                raise ValueError("minference_config_path is required when prefill_attention_backend='minference'.")
+            if not os.path.isfile(self.minference_config_path):
+                raise FileNotFoundError(f"MInference config file does not exist: {self.minference_config_path}")
+            if self.minference_starting_layer >= int(self.hf_config.num_hidden_layers):
+                raise ValueError(
+                    "minference_starting_layer must be smaller than num_hidden_layers: "
+                    f"{self.minference_starting_layer} >= {int(self.hf_config.num_hidden_layers)}."
+                )
         if self.max_model_len > self.hf_config.max_position_embeddings:
             logger.warning('max_model_len > model.max_position_embeddings 输出可能不正常')
             self.hf_config.max_position_embeddings = self.max_model_len

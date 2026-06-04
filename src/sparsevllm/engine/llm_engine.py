@@ -218,6 +218,12 @@ class LLMEngine:
         else:
             warmup_len = self.config.num_sink_tokens + self.config.num_top_tokens_in_prefill\
                          + self.config.num_recent_tokens + self.config.chunk_prefill_size + 1024
+        if self.config.prefill_attention_backend == "minference":
+            warmup_len = min(
+                warmup_len,
+                max(1, int(self.config.chunk_prefill_size)),
+                max(1, int(self.config.max_model_len) - 1),
+            )
         graph_warmup = bool(getattr(self.config, "decode_cuda_graph", False))
         num_seqs = int(self.config.max_decoding_seqs) if graph_warmup else 1
         

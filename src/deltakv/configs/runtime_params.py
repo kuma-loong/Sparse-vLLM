@@ -26,6 +26,8 @@ _COMMON_ALIASES: dict[str, str] = {
     "deltakv_center_ratio": "cluster_ratio",
     "deltakv_latent_dim": "kv_compressed_size",
     "deltakv_latent_quant_bits": "kv_quant_bits",
+    # Prefill attention backend.
+    "prefill_attention": "prefill_attention_backend",
 }
 
 _BACKEND_ALIASES: dict[str, dict[str, str]] = {

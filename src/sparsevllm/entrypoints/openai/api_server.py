@@ -32,6 +32,11 @@ SEMANTIC_ENGINE_ARGS = {
     "engine_prefill_chunk_size",
     "deltakv_neighbor_count",
     "observation_layers",
+    "prefill_attention",
+    "prefill_attention_backend",
+    "minference_config_path",
+    "minference_starting_layer",
+    "minference_ratio",
 }
 
 
