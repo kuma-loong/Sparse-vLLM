@@ -9,13 +9,17 @@ import torch
 import triton
 import triton.language as tl
 
+from sparsevllm.utils.profiler import profiler
+
 
 MINFERENCE_LAST_Q = 64
 MIN_VERTICAL_SIZE = 30
 MIN_SLASH_SIZE = 50
 MIN_SLASH_RECENT = 100
-MINFERENCE_BLOCK_M = 64
-MINFERENCE_BLOCK_N = 64
+# The reference CUDA converter is fixed at 64x64. This custom paged-KV
+# Triton path uses 128x128 on H100 to match svLLM's dense prefill tiling.
+MINFERENCE_BLOCK_M = 128
+MINFERENCE_BLOCK_N = 128
 MINFERENCE_DENSE_FALLBACK_RATIO = 0.50
 MINFERENCE_MIN_SPARSE_SEQ_LEN = 32768
 MINFERENCE_TOPK_HEAD_CHUNK = 2
@@ -122,6 +126,19 @@ def _get_layer_pattern_sizes(
     )
 
 
+def _sum_all_diagonal_matrix(mat: torch.Tensor) -> torch.Tensor:
+    # Same diagonal aggregation as MInference's sum_all_diagonal_matrix,
+    # specialized to [heads, last_q, seq_len].
+    heads, rows, cols = mat.shape
+    padded = torch.nn.functional.pad(mat, (rows, rows), "constant", 0.0)
+    padded_cols = cols + 2 * rows
+    strided = padded.as_strided(
+        (heads, rows, rows + cols),
+        (rows * padded_cols, padded_cols + 1, 1),
+    )
+    return torch.sum(strided, dim=1)[:, 1:].contiguous()
+
+
 def _build_batch_head_indices(
     q_seq: torch.Tensor,
     k_seq: torch.Tensor,
@@ -154,12 +171,8 @@ def _build_batch_head_indices(
         vertical_scores[:, : min(MIN_VERTICAL_SIZE, seq_len)] = torch.inf
         vertical_chunks.append(torch.topk(vertical_scores, max_vertical, dim=-1).indices.to(torch.int32))
 
-        slash_scores = torch.zeros((head_end - head_start, seq_len), dtype=torch.float32, device=q_seq.device)
-        for row, pos in enumerate(range(seq_len - last_q, seq_len)):
-            cols = torch.arange(pos + 1, device=q_seq.device)
-            distances = (pos - cols).to(torch.long)
-            slash_scores.index_add_(1, distances, probs[:, row, : pos + 1])
-        slash_scores[:, : min(MIN_SLASH_RECENT, seq_len)] = torch.inf
+        slash_scores = _sum_all_diagonal_matrix(probs)[:, :seq_len]
+        slash_scores[:, -min(MIN_SLASH_RECENT, seq_len):] = torch.inf
         slash_topk = torch.topk(slash_scores, max_slash, dim=-1).indices
         slash_chunks.append(((seq_len - 1) - slash_topk).to(torch.int32))
 
@@ -180,10 +193,10 @@ def _convert_vertical_slash_row(
     block_m: int,
     block_n: int,
 ) -> tuple[list[int], list[int]]:
-    # Mirrors MInference csrc/vertical_slash_index.cu. slash_list uses
-    # reference coordinates: (seq_len - 1) - diagonal_topk, sorted descending.
+    # Mirrors MInference vertical/slash range merging. The no-slash fallback
+    # follows the older torch/pycuda builder to keep only visible verticals.
     if not slash_list:
-        return [], vertical_list
+        return [], [idx for idx in vertical_list if idx < end_m]
 
     block_offsets: list[int] = []
     column_indexes: list[int] = []
@@ -193,7 +206,7 @@ def _convert_vertical_slash_row(
     while s < len(slash_list) and slash_list[s] >= end_m:
         s += 1
     if s >= len(slash_list):
-        return [], vertical_list
+        return [], [idx for idx in vertical_list if idx < end_m]
 
     range_end = max(end_m - int(slash_list[s]), block_m)
     range_start = range_end - block_m
@@ -224,19 +237,112 @@ def _convert_vertical_slash_row(
     return block_offsets, column_indexes
 
 
-def _copy_nested_indices(
-    count_tensor: torch.Tensor,
-    index_tensor: torch.Tensor,
-    nested_indices: list[list[list[list[int]]]],
+@triton.jit
+def _convert_vertical_slash_indexes_kernel(
+    B_Seqlen,
+    Vertical_Indexes,
+    Slash_Indexes,
+    Vertical_Counts,
+    Slash_Counts,
+    Block_Count,
+    Block_Offset,
+    Column_Count,
+    Column_Index,
+    stride_vi_b, stride_vi_h, stride_vi_n,
+    stride_si_b, stride_si_h, stride_si_n,
+    stride_vc_b, stride_vc_h,
+    stride_sc_b, stride_sc_h,
+    stride_bc_b, stride_bc_h, stride_bc_m,
+    stride_bo_b, stride_bo_h, stride_bo_m, stride_bo_n,
+    stride_cc_b, stride_cc_h, stride_cc_m,
+    stride_ci_b, stride_ci_h, stride_ci_m, stride_ci_n,
+    H: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
 ):
-    for b_idx, batch_indices in enumerate(nested_indices):
-        for head_idx, head_indices in enumerate(batch_indices):
-            for row_idx, values in enumerate(head_indices):
-                count_tensor[b_idx, head_idx, row_idx] = len(values)
-                if values:
-                    index_tensor[b_idx, head_idx, row_idx, : len(values)] = torch.tensor(
-                        values, dtype=torch.int32, device=index_tensor.device
-                    )
+    row_idx = tl.program_id(0)
+    cur_bh = tl.program_id(1)
+    cur_batch = cur_bh // H
+    cur_head = cur_bh % H
+    start_m = row_idx * BLOCK_M
+    seq_len = tl.load(B_Seqlen + cur_batch)
+    if start_m >= seq_len:
+        return
+
+    end_m = start_m + BLOCK_M
+    vertical_count = tl.load(Vertical_Counts + cur_batch * stride_vc_b + cur_head * stride_vc_h)
+    slash_count = tl.load(Slash_Counts + cur_batch * stride_sc_b + cur_head * stride_sc_h)
+
+    vi_base = Vertical_Indexes + cur_batch * stride_vi_b + cur_head * stride_vi_h
+    si_base = Slash_Indexes + cur_batch * stride_si_b + cur_head * stride_si_h
+    bo_base = Block_Offset + cur_batch * stride_bo_b + cur_head * stride_bo_h + row_idx * stride_bo_m
+    ci_base = Column_Index + cur_batch * stride_ci_b + cur_head * stride_ci_h + row_idx * stride_ci_m
+
+    tmp_blk_cnt = tl.full((), 0, tl.int32)
+    tmp_col_cnt = tl.full((), 0, tl.int32)
+    s = tl.full((), 0, tl.int32)
+    v = tl.full((), 0, tl.int32)
+
+    found_slash = tl.full((), 0, tl.int32)
+    while (s < slash_count) & (found_slash == 0):
+        slash_value = tl.load(si_base + s * stride_si_n)
+        if slash_value < end_m:
+            found_slash = 1
+        else:
+            s += 1
+    if s >= slash_count:
+        while v < vertical_count:
+            v_idx = tl.load(vi_base + v * stride_vi_n)
+            if v_idx < end_m:
+                tl.store(ci_base + tmp_col_cnt * stride_ci_n, v_idx)
+                tmp_col_cnt += 1
+            v += 1
+        tl.store(Column_Count + cur_batch * stride_cc_b + cur_head * stride_cc_h + row_idx * stride_cc_m, tmp_col_cnt)
+        return
+
+    slash_value = tl.load(si_base + s * stride_si_n)
+    range_end = tl.maximum(end_m - slash_value, BLOCK_M)
+    range_start = range_end - BLOCK_M
+    s += 1
+    v_idx = tl.full((), end_m + BLOCK_M, tl.int32)
+    if v < vertical_count:
+        v_idx = tl.load(vi_base + v * stride_vi_n)
+
+    active = tl.full((), 1, tl.int32)
+    while active == 1:
+        if v_idx < range_end:
+            if v_idx < range_start:
+                tl.store(ci_base + tmp_col_cnt * stride_ci_n, v_idx)
+                tmp_col_cnt += 1
+            v += 1
+            v_idx = end_m + BLOCK_M
+            if v < vertical_count:
+                v_idx = tl.load(vi_base + v * stride_vi_n)
+        else:
+            if s >= slash_count:
+                offset = range_start
+                while offset < range_end:
+                    tl.store(bo_base + tmp_blk_cnt * stride_bo_n, offset)
+                    tmp_blk_cnt += 1
+                    offset += BLOCK_N
+                active = 0
+            else:
+                slash_value = tl.load(si_base + s * stride_si_n)
+                next_range_end = tl.maximum(end_m - slash_value, BLOCK_M)
+                s += 1
+                if next_range_end > range_end + BLOCK_M:
+                    offset = range_start
+                    while offset < range_end:
+                        tl.store(bo_base + tmp_blk_cnt * stride_bo_n, offset)
+                        tmp_blk_cnt += 1
+                        offset += BLOCK_N
+                    range_start = next_range_end - BLOCK_M
+                    range_end = next_range_end
+                elif next_range_end > range_end:
+                    range_end += BLOCK_M
+
+    tl.store(Block_Count + cur_batch * stride_bc_b + cur_head * stride_bc_h + row_idx * stride_bc_m, tmp_blk_cnt)
+    tl.store(Column_Count + cur_batch * stride_cc_b + cur_head * stride_cc_h + row_idx * stride_cc_m, tmp_col_cnt)
 
 
 @torch.no_grad()
@@ -260,10 +366,6 @@ def _build_sparse_metadata(
     max_seq_len = int(b_seq_len.max().item())
     num_rows = triton.cdiv(max_seq_len, block_m)
 
-    per_row_blocks: list[list[list[list[int]]]] = []
-    per_row_columns: list[list[list[list[int]]]] = []
-    max_blocks = 1
-    max_columns = 1
     pattern_config = _load_pattern_config(str(config.minference_config_path))
     vertical_sizes, slash_sizes = _get_layer_pattern_sizes(
         pattern_config,
@@ -274,6 +376,12 @@ def _build_sparse_metadata(
         max_seq_len,
         q.device,
     )
+    max_vertical = int(vertical_sizes.max().item())
+    max_slash = int(slash_sizes.max().item())
+    vertical_indexes = torch.zeros((batch, num_heads, max_vertical), dtype=torch.int32, device=q.device)
+    slash_indexes = torch.zeros((batch, num_heads, max_slash), dtype=torch.int32, device=q.device)
+    vertical_counts = torch.zeros((batch, num_heads), dtype=torch.int32, device=q.device)
+    slash_counts = torch.zeros((batch, num_heads), dtype=torch.int32, device=q.device)
 
     for b_idx in range(batch):
         seq_len = int(b_seq_len[b_idx].item())
@@ -282,59 +390,75 @@ def _build_sparse_metadata(
         slots = req_to_tokens[req_row, :seq_len].to(torch.long)
         q_seq = q[q_start: q_start + seq_len]
         k_seq = k_cache.index_select(0, slots)
-        batch_vertical_idx, batch_vertical_sizes, batch_slash_idx, batch_slash_sizes = _build_batch_head_indices(
-            q_seq,
-            k_seq,
-            vertical_sizes.clamp_max(seq_len),
-            slash_sizes.clamp_max(seq_len),
-            kv_group_num,
-        )
-        batch_blocks: list[list[list[int]]] = []
-        batch_columns: list[list[list[int]]] = []
+        with profiler.record("minference_topk"):
+            batch_vertical_idx, batch_vertical_sizes, batch_slash_idx, batch_slash_sizes = _build_batch_head_indices(
+                q_seq,
+                k_seq,
+                vertical_sizes.clamp_max(seq_len),
+                slash_sizes.clamp_max(seq_len),
+                kv_group_num,
+            )
+        vertical_counts[b_idx] = batch_vertical_sizes
+        slash_counts[b_idx] = batch_slash_sizes
         for head_idx in range(num_heads):
             vertical_count = int(batch_vertical_sizes[head_idx].item())
             slash_count = int(batch_slash_sizes[head_idx].item())
-            vertical_list = sorted(
-                int(x) for x in batch_vertical_idx[head_idx, :vertical_count].detach().cpu().tolist()
-            )
-            slash_list = sorted(
-                (int(x) for x in batch_slash_idx[head_idx, :slash_count].detach().cpu().tolist()),
-                reverse=True,
-            )
-
-            head_blocks: list[list[int]] = []
-            head_columns: list[list[int]] = []
-            for row_idx in range(num_rows):
-                q_block_start = row_idx * block_m
-                if q_block_start >= seq_len:
-                    head_blocks.append([])
-                    head_columns.append([])
-                    continue
-                end_m = q_block_start + block_m
-                block_offsets, column_indexes = _convert_vertical_slash_row(
-                    vertical_list,
-                    slash_list,
-                    end_m=end_m,
-                    block_m=block_m,
-                    block_n=block_n,
-                )
-                head_blocks.append(block_offsets)
-                filtered_columns = column_indexes
-                head_columns.append(filtered_columns)
-                max_blocks = max(max_blocks, len(block_offsets))
-                max_columns = max(max_columns, len(filtered_columns))
-            batch_blocks.append(head_blocks)
-            batch_columns.append(head_columns)
-        per_row_blocks.append(batch_blocks)
-        per_row_columns.append(batch_columns)
+            vertical_indexes[b_idx, head_idx, :vertical_count] = torch.sort(
+                batch_vertical_idx[head_idx, :vertical_count],
+                dim=-1,
+            ).values
+            slash_indexes[b_idx, head_idx, :slash_count] = torch.sort(
+                batch_slash_idx[head_idx, :slash_count],
+                dim=-1,
+                descending=True,
+            ).values
 
     block_count = torch.zeros((batch, num_heads, num_rows), dtype=torch.int32, device=q.device)
-    block_offset = torch.zeros((batch, num_heads, num_rows, max_blocks), dtype=torch.int32, device=q.device)
+    block_offset = torch.zeros((batch, num_heads, num_rows, max_slash), dtype=torch.int32, device=q.device)
     column_count = torch.zeros((batch, num_heads, num_rows), dtype=torch.int32, device=q.device)
-    column_index = torch.zeros((batch, num_heads, num_rows, max_columns), dtype=torch.int32, device=q.device)
+    column_index = torch.zeros((batch, num_heads, num_rows, max_vertical), dtype=torch.int32, device=q.device)
 
-    _copy_nested_indices(block_count, block_offset, per_row_blocks)
-    _copy_nested_indices(column_count, column_index, per_row_columns)
+    grid = (num_rows, batch * num_heads)
+    with profiler.record("minference_metadata_convert"):
+        _convert_vertical_slash_indexes_kernel[grid](
+            b_seq_len,
+            vertical_indexes,
+            slash_indexes,
+            vertical_counts,
+            slash_counts,
+            block_count,
+            block_offset,
+            column_count,
+            column_index,
+            vertical_indexes.stride(0),
+            vertical_indexes.stride(1),
+            vertical_indexes.stride(2),
+            slash_indexes.stride(0),
+            slash_indexes.stride(1),
+            slash_indexes.stride(2),
+            vertical_counts.stride(0),
+            vertical_counts.stride(1),
+            slash_counts.stride(0),
+            slash_counts.stride(1),
+            block_count.stride(0),
+            block_count.stride(1),
+            block_count.stride(2),
+            block_offset.stride(0),
+            block_offset.stride(1),
+            block_offset.stride(2),
+            block_offset.stride(3),
+            column_count.stride(0),
+            column_count.stride(1),
+            column_count.stride(2),
+            column_index.stride(0),
+            column_index.stride(1),
+            column_index.stride(2),
+            column_index.stride(3),
+            H=num_heads,
+            BLOCK_M=block_m,
+            BLOCK_N=block_n,
+            num_warps=1,
+        )
     return block_count, block_offset, column_count, column_index
 
 
@@ -369,6 +493,8 @@ def _minference_prefill_kernel(
 
     seq_start = tl.load(B_Start_Loc + cur_batch)
     seq_len = tl.load(B_Seqlen + cur_batch)
+    if start_m * BLOCK_M >= seq_len:
+        return
     req_idx = tl.load(B_req_idx + cur_batch)
 
     offs_m = start_m * BLOCK_M + tl.arange(0, BLOCK_M)
@@ -569,60 +695,61 @@ def minference_context_attention_fwd(
     batch = int(b_seq_len.shape[0])
     num_heads = int(q.shape[1])
     kv_group_num = num_heads // int(k_cache.shape[1])
-    grid = (triton.cdiv(int(max_input_len), block_m), batch * num_heads, 1)
+    grid = (int(block_count.shape[2]), batch * num_heads, 1)
     score_arg = attn_score if attn_score is not None else o
-    _minference_prefill_kernel[grid](
-        q,
-        k_cache,
-        v_cache,
-        sm_scale,
-        o,
-        b_start_loc,
-        b_seq_len,
-        req_to_tokens,
-        b_req_idx,
-        block_count,
-        block_offset,
-        column_count,
-        column_index,
-        score_arg,
-        q.stride(0),
-        q.stride(1),
-        q.stride(2),
-        k_cache.stride(0),
-        k_cache.stride(1),
-        k_cache.stride(2),
-        v_cache.stride(0),
-        v_cache.stride(1),
-        v_cache.stride(2),
-        o.stride(0),
-        o.stride(1),
-        o.stride(2),
-        req_to_tokens.stride(0),
-        req_to_tokens.stride(1),
-        block_count.stride(0),
-        block_count.stride(1),
-        block_count.stride(2),
-        block_offset.stride(0),
-        block_offset.stride(1),
-        block_offset.stride(2),
-        block_offset.stride(3),
-        column_count.stride(0),
-        column_count.stride(1),
-        column_count.stride(2),
-        column_index.stride(0),
-        column_index.stride(1),
-        column_index.stride(2),
-        column_index.stride(3),
-        score_arg.stride(0),
-        score_arg.stride(1) if attn_score is not None else 0,
-        score_arg.stride(2) if attn_score is not None else 0,
-        kv_group_num=kv_group_num,
-        H=num_heads,
-        BLOCK_DMODEL=head_dim,
-        BLOCK_M=block_m,
-        BLOCK_N=block_n,
-        HAS_SCORE=attn_score is not None,
-        num_warps=4 if head_dim <= 64 else 8,
-        num_stages=2,
-    )
+    with profiler.record("minference_sparse_kernel"):
+        _minference_prefill_kernel[grid](
+            q,
+            k_cache,
+            v_cache,
+            sm_scale,
+            o,
+            b_start_loc,
+            b_seq_len,
+            req_to_tokens,
+            b_req_idx,
+            block_count,
+            block_offset,
+            column_count,
+            column_index,
+            score_arg,
+            q.stride(0),
+            q.stride(1),
+            q.stride(2),
+            k_cache.stride(0),
+            k_cache.stride(1),
+            k_cache.stride(2),
+            v_cache.stride(0),
+            v_cache.stride(1),
+            v_cache.stride(2),
+            o.stride(0),
+            o.stride(1),
+            o.stride(2),
+            req_to_tokens.stride(0),
+            req_to_tokens.stride(1),
+            block_count.stride(0),
+            block_count.stride(1),
+            block_count.stride(2),
+            block_offset.stride(0),
+            block_offset.stride(1),
+            block_offset.stride(2),
+            block_offset.stride(3),
+            column_count.stride(0),
+            column_count.stride(1),
+            column_count.stride(2),
+            column_index.stride(0),
+            column_index.stride(1),
+            column_index.stride(2),
+            column_index.stride(3),
+            score_arg.stride(0),
+            score_arg.stride(1) if attn_score is not None else 0,
+            score_arg.stride(2) if attn_score is not None else 0,
+            kv_group_num=kv_group_num,
+            H=num_heads,
+            BLOCK_DMODEL=head_dim,
+            BLOCK_M=block_m,
+            BLOCK_N=block_n,
+            HAS_SCORE=attn_score is not None,
+            num_warps=4 if head_dim <= 64 else 8,
+            num_stages=2,
+        )

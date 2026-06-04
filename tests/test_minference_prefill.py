@@ -9,6 +9,9 @@ import torch
 
 from sparsevllm.config import Config
 from sparsevllm.triton_kernel.minference_prefill import (
+    MINFERENCE_BLOCK_M,
+    MINFERENCE_BLOCK_N,
+    _convert_vertical_slash_indexes_kernel,
     _convert_vertical_slash_row,
     _estimate_layer_pattern_density,
     _get_vs_pattern,
@@ -121,6 +124,123 @@ class MinferencePrefillConfigTest(unittest.TestCase):
 
 
 class MinferencePrefillKernelTest(unittest.TestCase):
+    @unittest.skipUnless(torch.cuda.is_available(), "CUDA is required for MInference prefill kernel tests.")
+    def test_gpu_converter_matches_row_reference(self):
+        device = "cuda"
+        block_m = MINFERENCE_BLOCK_M
+        block_n = MINFERENCE_BLOCK_N
+        vertical = torch.tensor(
+            [
+                [[10, 70, 130, 180], [5, 65, 125, 185]],
+                [[0, 40, 90, 140], [20, 80, 120, 160]],
+            ],
+            dtype=torch.int32,
+            device=device,
+        )
+        slash = torch.tensor(
+            [
+                [[190, 130, 30], [160, 90, 10]],
+                [[240, 220, 200], [150, 120, 70]],
+            ],
+            dtype=torch.int32,
+            device=device,
+        )
+        b_seq_len = torch.tensor([192, 96], dtype=torch.int32, device=device)
+        vertical_counts = torch.full((2, 2), 4, dtype=torch.int32, device=device)
+        slash_counts = torch.full((2, 2), 3, dtype=torch.int32, device=device)
+        num_rows = 2
+        block_count = torch.zeros((2, 2, num_rows), dtype=torch.int32, device=device)
+        block_offset = torch.zeros((2, 2, num_rows, 3), dtype=torch.int32, device=device)
+        column_count = torch.zeros((2, 2, num_rows), dtype=torch.int32, device=device)
+        column_index = torch.zeros((2, 2, num_rows, 4), dtype=torch.int32, device=device)
+
+        _convert_vertical_slash_indexes_kernel[(num_rows, 4)](
+            b_seq_len,
+            vertical,
+            slash,
+            vertical_counts,
+            slash_counts,
+            block_count,
+            block_offset,
+            column_count,
+            column_index,
+            vertical.stride(0),
+            vertical.stride(1),
+            vertical.stride(2),
+            slash.stride(0),
+            slash.stride(1),
+            slash.stride(2),
+            vertical_counts.stride(0),
+            vertical_counts.stride(1),
+            slash_counts.stride(0),
+            slash_counts.stride(1),
+            block_count.stride(0),
+            block_count.stride(1),
+            block_count.stride(2),
+            block_offset.stride(0),
+            block_offset.stride(1),
+            block_offset.stride(2),
+            block_offset.stride(3),
+            column_count.stride(0),
+            column_count.stride(1),
+            column_count.stride(2),
+            column_index.stride(0),
+            column_index.stride(1),
+            column_index.stride(2),
+            column_index.stride(3),
+            H=2,
+            BLOCK_M=block_m,
+            BLOCK_N=block_n,
+            num_warps=1,
+        )
+        torch.cuda.synchronize()
+
+        block_count_cpu = block_count.cpu()
+        block_offset_cpu = block_offset.cpu()
+        column_count_cpu = column_count.cpu()
+        column_index_cpu = column_index.cpu()
+        vertical_cpu = vertical.cpu()
+        slash_cpu = slash.cpu()
+        for b_idx, seq_len in enumerate(b_seq_len.cpu().tolist()):
+            for head_idx in range(2):
+                vertical_list = vertical_cpu[b_idx, head_idx].tolist()
+                slash_list = slash_cpu[b_idx, head_idx].tolist()
+                for row_idx in range(num_rows):
+                    end_m = (row_idx + 1) * block_m
+                    if row_idx * block_m >= seq_len:
+                        self.assertEqual(int(block_count_cpu[b_idx, head_idx, row_idx]), 0)
+                        self.assertEqual(int(column_count_cpu[b_idx, head_idx, row_idx]), 0)
+                        continue
+                    expected_blocks, expected_columns = _convert_vertical_slash_row(
+                        vertical_list,
+                        slash_list,
+                        end_m=end_m,
+                        block_m=block_m,
+                        block_n=block_n,
+                    )
+                    actual_block_count = int(block_count_cpu[b_idx, head_idx, row_idx])
+                    actual_column_count = int(column_count_cpu[b_idx, head_idx, row_idx])
+                    self.assertEqual(
+                        block_offset_cpu[b_idx, head_idx, row_idx, :actual_block_count].tolist(),
+                        expected_blocks,
+                    )
+                    self.assertEqual(
+                        column_index_cpu[b_idx, head_idx, row_idx, :actual_column_count].tolist(),
+                        expected_columns,
+                    )
+                    self.assertEqual(actual_block_count, len(expected_blocks))
+                    self.assertEqual(actual_column_count, len(expected_columns))
+
+        self.assertEqual(block_offset_cpu[0, 0, 0, :1].tolist(), [0])
+        self.assertEqual(block_offset_cpu[0, 0, 1, :2].tolist(), [0, 128])
+        self.assertEqual(int(column_count_cpu[0, 0, 0]), 0)
+        self.assertEqual(int(column_count_cpu[0, 0, 1]), 0)
+        self.assertEqual(int(block_count_cpu[1, 0, 0]), 0)
+        self.assertEqual(int(column_count_cpu[1, 0, 0]), 3)
+        self.assertEqual(column_index_cpu[1, 0, 0, :3].tolist(), [0, 40, 90])
+        self.assertEqual(int(block_count_cpu[1, 0, 1]), 0)
+        self.assertEqual(int(column_count_cpu[1, 0, 1]), 0)
+
     @unittest.skipUnless(torch.cuda.is_available(), "CUDA is required for MInference prefill kernel tests.")
     def test_kernel_smoke_outputs_finite_values(self):
         with tempfile.TemporaryDirectory() as tmp:

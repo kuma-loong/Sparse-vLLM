@@ -75,6 +75,15 @@ def _wait_for_idle_gpu(args) -> tuple[bool, str]:
         time.sleep(float(args.idle_poll_s))
 
 
+def _resolve_master_port(args) -> int:
+    if args.master_port is not None:
+        return int(args.master_port)
+    try:
+        return 2333 + int(str(args.gpu).split(",")[0])
+    except ValueError:
+        return 2333
+
+
 def _build_engine_kwargs(args, method: str, prompt_len: int) -> dict[str, Any]:
     if method not in METHOD_CONFIGS:
         raise ValueError(f"Unknown method {method!r}. Valid methods: {sorted(METHOD_CONFIGS)}")
@@ -95,12 +104,13 @@ def _build_engine_kwargs(args, method: str, prompt_len: int) -> dict[str, Any]:
         "decode_keep_tokens": int(args.decode_keep_tokens),
         "prefill_keep_tokens": int(args.prefill_keep_tokens),
     }
-    kwargs.update(_load_json_arg(args.hyper_params))
+    extra_kwargs = _load_json_arg(args.hyper_params)
+    kwargs.update(extra_kwargs)
     kwargs.update(METHOD_CONFIGS[method])
     if method.startswith("minference"):
-        kwargs["minference_config_path"] = str(args.minference_config_path)
-        kwargs["minference_starting_layer"] = int(args.minference_starting_layer)
-        kwargs["minference_ratio"] = float(args.minference_ratio)
+        kwargs.setdefault("minference_config_path", str(args.minference_config_path))
+        kwargs.setdefault("minference_starting_layer", int(args.minference_starting_layer))
+        kwargs.setdefault("minference_ratio", float(args.minference_ratio))
     return kwargs
 
 
@@ -219,6 +229,7 @@ def _run_case(args, method: str, prompt_len: int) -> dict[str, Any]:
 def _run_case_worker(args, method: str, prompt_len: int, queue: mp.Queue):
     os.setsid()
     os.environ["CUDA_VISIBLE_DEVICES"] = str(args.gpu)
+    os.environ["SPARSEVLLM_MASTER_PORT"] = str(_resolve_master_port(args))
     try:
         queue.put(_run_case(args, method, prompt_len))
     except Exception as exc:
@@ -290,30 +301,40 @@ def _run_case_in_subprocess(args, method: str, prompt_len: int) -> dict[str, Any
 
 def _write_report(output_dir: Path, results: list[dict[str, Any]], args):
     report_path = output_dir / "report.md"
+    first_success_kwargs = next(
+        (row.get("engine_kwargs", {}) for row in results if row.get("status") == "success"),
+        {},
+    )
+    pattern_config = first_success_kwargs.get("minference_config_path", str(args.minference_config_path))
     lines = [
         "# Qwen2.5-7B-Instruct-1M MInference Benchmark",
         "",
         f"- Model: `{args.model_path}`",
-        f"- Pattern config: `{args.minference_config_path}`",
+        f"- Pattern config: `{pattern_config}`",
         f"- GPU: `CUDA_VISIBLE_DEVICES={args.gpu}`",
         f"- Batch size: `{args.batch_size}`",
         f"- Output length: `{args.output_len}`",
         f"- Case timeout: `{args.case_timeout_s}s`",
+        f"- SPARSEVLLM_MASTER_PORT: `{_resolve_master_port(args)}`",
         f"- Generated at: `{time.strftime('%Y-%m-%d %H:%M:%S')}`",
         f"- Command: `{' '.join(os.sys.argv)}`",
         "",
-        "| Method | Prompt tokens | Status | TTFT s | TPOT ms | Prefill tok/s | Decode tok/s | Peak GB | Total s |",
-        "| --- | ---: | --- | ---: | ---: | ---: | ---: | ---: | ---: |",
+        "| Method | Prompt tokens | Status | TTFT s | TPOT ms | Prefill tok/s | Decode tok/s | Peak GB | MInf ratio | Total s |",
+        "| --- | ---: | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
     ]
     for row in results:
         if row.get("status") != "success":
             lines.append(
-                f"| {row.get('method')} | {row.get('prompt_len')} | {row.get('status')}: {row.get('error', '')} | | | | | | |"
+                f"| {row.get('method')} | {row.get('prompt_len')} | {row.get('status')}: {row.get('error', '')} | | | | | | | |"
             )
             continue
+        engine_kwargs = row.get("engine_kwargs", {})
+        row = dict(row)
+        row["minference_ratio_effective"] = engine_kwargs.get("minference_ratio", "")
         lines.append(
             "| {method} | {prompt_len} | success | {ttft_s:.3f} | {tpot_ms:.3f} | "
-            "{prefill_tok_s:.1f} | {decode_tok_s:.1f} | {peak_mem_gb:.2f} | {total_s:.3f} |".format(**row)
+            "{prefill_tok_s:.1f} | {decode_tok_s:.1f} | {peak_mem_gb:.2f} | "
+            "{minference_ratio_effective} | {total_s:.3f} |".format(**row)
         )
     lines.extend(
         [
@@ -344,6 +365,7 @@ def main():
     parser.add_argument("--idle_wait_s", type=float, default=120.0)
     parser.add_argument("--idle_poll_s", type=float, default=5.0)
     parser.add_argument("--case_timeout_s", type=float, default=900.0)
+    parser.add_argument("--master_port", type=int, default=None)
     parser.add_argument("--allow_failures", action="store_true")
     parser.add_argument("--gpu_memory_utilization", type=float, default=0.86)
     parser.add_argument("--prompt_token_id", type=int, default=100)
