@@ -9,8 +9,6 @@ import torch
 import triton
 import triton.language as tl
 
-from sparsevllm.triton_kernel.context_flashattention_nopad import context_attention_fwd
-
 
 MINFERENCE_LAST_Q = 64
 MIN_VERTICAL_SIZE = 30
@@ -20,6 +18,7 @@ MINFERENCE_BLOCK_M = 64
 MINFERENCE_BLOCK_N = 64
 MINFERENCE_DENSE_FALLBACK_RATIO = 0.50
 MINFERENCE_MIN_SPARSE_SEQ_LEN = 32768
+MINFERENCE_TOPK_HEAD_CHUNK = 2
 
 
 @lru_cache(maxsize=8)
@@ -136,36 +135,93 @@ def _build_batch_head_indices(
     last_q = min(MINFERENCE_LAST_Q, seq_len)
     max_vertical = int(vertical_sizes.max().item())
     max_slash = int(slash_sizes.max().item())
-
-    q_last = q_seq[-last_q:].permute(1, 0, 2).to(torch.float32)
-    kv_head_for_q = torch.arange(num_heads, device=q_seq.device) // int(kv_group_num)
-    k_by_q_head = k_seq.index_select(1, kv_head_for_q).permute(1, 2, 0).to(torch.float32)
-    logits = torch.bmm(q_last, k_by_q_head) / math.sqrt(head_dim)
-
     q_positions = torch.arange(seq_len - last_q, seq_len, device=q_seq.device)
     k_positions = torch.arange(seq_len, device=q_seq.device)
-    logits = logits.masked_fill(k_positions.view(1, 1, -1) > q_positions.view(1, -1, 1), -torch.inf)
-    probs = torch.softmax(logits, dim=-1, dtype=torch.float32)
 
-    vertical_scores = probs.sum(dim=1)
-    vertical_scores[:, : min(MIN_VERTICAL_SIZE, seq_len)] = torch.inf
-    vertical_idx = torch.topk(vertical_scores, max_vertical, dim=-1).indices.to(torch.int32)
+    vertical_chunks = []
+    slash_chunks = []
+    for head_start in range(0, num_heads, MINFERENCE_TOPK_HEAD_CHUNK):
+        head_end = min(num_heads, head_start + MINFERENCE_TOPK_HEAD_CHUNK)
+        head_ids = torch.arange(head_start, head_end, device=q_seq.device)
+        kv_head_ids = head_ids // int(kv_group_num)
+        q_last = q_seq[-last_q:, head_start:head_end, :].permute(1, 0, 2).to(torch.float32)
+        k_by_q_head = k_seq.index_select(1, kv_head_ids).permute(1, 2, 0).to(torch.float32)
+        logits = torch.bmm(q_last, k_by_q_head) / math.sqrt(head_dim)
+        logits = logits.masked_fill(k_positions.view(1, 1, -1) > q_positions.view(1, -1, 1), -torch.inf)
+        probs = torch.softmax(logits, dim=-1, dtype=torch.float32)
 
-    slash_scores = torch.zeros((num_heads, seq_len), dtype=torch.float32, device=q_seq.device)
-    for row, pos in enumerate(range(seq_len - last_q, seq_len)):
-        cols = torch.arange(pos + 1, device=q_seq.device)
-        distances = (pos - cols).to(torch.long)
-        slash_scores.index_add_(1, distances, probs[:, row, : pos + 1])
-    slash_scores[:, : min(MIN_SLASH_RECENT, seq_len)] = torch.inf
-    slash_idx = torch.topk(slash_scores, max_slash, dim=-1).indices.to(torch.int32)
+        vertical_scores = probs.sum(dim=1)
+        vertical_scores[:, : min(MIN_VERTICAL_SIZE, seq_len)] = torch.inf
+        vertical_chunks.append(torch.topk(vertical_scores, max_vertical, dim=-1).indices.to(torch.int32))
+
+        slash_scores = torch.zeros((head_end - head_start, seq_len), dtype=torch.float32, device=q_seq.device)
+        for row, pos in enumerate(range(seq_len - last_q, seq_len)):
+            cols = torch.arange(pos + 1, device=q_seq.device)
+            distances = (pos - cols).to(torch.long)
+            slash_scores.index_add_(1, distances, probs[:, row, : pos + 1])
+        slash_scores[:, : min(MIN_SLASH_RECENT, seq_len)] = torch.inf
+        slash_topk = torch.topk(slash_scores, max_slash, dim=-1).indices
+        slash_chunks.append(((seq_len - 1) - slash_topk).to(torch.int32))
+
+    vertical_idx = torch.cat(vertical_chunks, dim=0)
+    slash_idx = torch.cat(slash_chunks, dim=0)
     return vertical_idx, vertical_sizes.to(torch.int32), slash_idx, slash_sizes.to(torch.int32)
 
 
-def _filter_vertical_columns(vertical_list: list[int], block_starts: list[int], block_n: int) -> list[int]:
-    return [
-        col for col in vertical_list
-        if not any(start <= col < start + block_n for start in block_starts)
-    ]
+def _save_block_offsets(range_start: int, range_end: int, block_n: int) -> list[int]:
+    return list(range(int(range_start), int(range_end), int(block_n)))
+
+
+def _convert_vertical_slash_row(
+    vertical_list: list[int],
+    slash_list: list[int],
+    *,
+    end_m: int,
+    block_m: int,
+    block_n: int,
+) -> tuple[list[int], list[int]]:
+    # Mirrors MInference csrc/vertical_slash_index.cu. slash_list uses
+    # reference coordinates: (seq_len - 1) - diagonal_topk, sorted descending.
+    if not slash_list:
+        return [], vertical_list
+
+    block_offsets: list[int] = []
+    column_indexes: list[int] = []
+    s = 0
+    v = 0
+
+    while s < len(slash_list) and slash_list[s] >= end_m:
+        s += 1
+    if s >= len(slash_list):
+        return [], vertical_list
+
+    range_end = max(end_m - int(slash_list[s]), block_m)
+    range_start = range_end - block_m
+    s += 1
+
+    v_idx = vertical_list[v] if v < len(vertical_list) else end_m + block_m
+    while True:
+        if v_idx < range_end:
+            if v_idx < range_start:
+                column_indexes.append(v_idx)
+            v += 1
+            v_idx = vertical_list[v] if v < len(vertical_list) else end_m + block_m
+            continue
+
+        if s >= len(slash_list):
+            block_offsets.extend(_save_block_offsets(range_start, range_end, block_n))
+            break
+
+        next_range_end = max(end_m - int(slash_list[s]), block_m)
+        s += 1
+        if next_range_end > range_end + block_m:
+            block_offsets.extend(_save_block_offsets(range_start, range_end, block_n))
+            range_start = next_range_end - block_m
+            range_end = next_range_end
+        elif next_range_end > range_end:
+            range_end += block_m
+
+    return block_offsets, column_indexes
 
 
 def _copy_nested_indices(
@@ -238,8 +294,13 @@ def _build_sparse_metadata(
         for head_idx in range(num_heads):
             vertical_count = int(batch_vertical_sizes[head_idx].item())
             slash_count = int(batch_slash_sizes[head_idx].item())
-            vertical_list = [int(x) for x in batch_vertical_idx[head_idx, :vertical_count].detach().cpu().tolist()]
-            slash_list = [int(x) for x in batch_slash_idx[head_idx, :slash_count].detach().cpu().tolist()]
+            vertical_list = sorted(
+                int(x) for x in batch_vertical_idx[head_idx, :vertical_count].detach().cpu().tolist()
+            )
+            slash_list = sorted(
+                (int(x) for x in batch_slash_idx[head_idx, :slash_count].detach().cpu().tolist()),
+                reverse=True,
+            )
 
             head_blocks: list[list[int]] = []
             head_columns: list[list[int]] = []
@@ -249,22 +310,18 @@ def _build_sparse_metadata(
                     head_blocks.append([])
                     head_columns.append([])
                     continue
-                q_block_end = min(seq_len - 1, q_block_start + block_m - 1)
-                block_starts = set()
-                for distance in slash_list:
-                    key_start = q_block_start - distance
-                    key_end = q_block_end - distance
-                    if key_end < 0 or key_start >= seq_len:
-                        continue
-                    aligned_start = max(0, (key_start // block_n) * block_n)
-                    block_starts.add(int(aligned_start))
-                if not block_starts:
-                    block_starts.add(max(0, (q_block_start // block_n) * block_n))
-                sorted_blocks = sorted(block_starts)
-                filtered_columns = _filter_vertical_columns(vertical_list, sorted_blocks, block_n)
-                head_blocks.append(sorted_blocks)
+                end_m = q_block_start + block_m
+                block_offsets, column_indexes = _convert_vertical_slash_row(
+                    vertical_list,
+                    slash_list,
+                    end_m=end_m,
+                    block_m=block_m,
+                    block_n=block_n,
+                )
+                head_blocks.append(block_offsets)
+                filtered_columns = column_indexes
                 head_columns.append(filtered_columns)
-                max_blocks = max(max_blocks, len(sorted_blocks))
+                max_blocks = max(max_blocks, len(block_offsets))
                 max_columns = max(max_columns, len(filtered_columns))
             batch_blocks.append(head_blocks)
             batch_columns.append(head_columns)
@@ -477,6 +534,8 @@ def minference_context_attention_fwd(
     max_seq_len = int(b_seq_len.max().item())
     density = _estimate_layer_pattern_density(config, layer_idx, rank, int(q.shape[1]), max_seq_len)
     if max_seq_len < MINFERENCE_MIN_SPARSE_SEQ_LEN or density >= MINFERENCE_DENSE_FALLBACK_RATIO:
+        from sparsevllm.triton_kernel.context_flashattention_nopad import context_attention_fwd
+
         context_attention_fwd(
             q,
             k_cache,

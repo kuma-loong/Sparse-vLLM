@@ -218,6 +218,7 @@ def _run_case(args, method: str, prompt_len: int) -> dict[str, Any]:
 
 def _run_case_worker(args, method: str, prompt_len: int, queue: mp.Queue):
     os.setsid()
+    os.environ["CUDA_VISIBLE_DEVICES"] = str(args.gpu)
     try:
         queue.put(_run_case(args, method, prompt_len))
     except Exception as exc:
@@ -251,10 +252,16 @@ def _run_case_in_subprocess(args, method: str, prompt_len: int) -> dict[str, Any
     process.start()
     process.join(timeout=float(args.case_timeout_s))
     if process.is_alive():
-        os.killpg(process.pid, signal.SIGTERM)
+        try:
+            os.killpg(process.pid, signal.SIGTERM)
+        except ProcessLookupError:
+            pass
         process.join(timeout=10.0)
         if process.is_alive():
-            os.killpg(process.pid, signal.SIGKILL)
+            try:
+                os.killpg(process.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
             process.join(timeout=10.0)
         return {
             "method": method,
@@ -337,6 +344,7 @@ def main():
     parser.add_argument("--idle_wait_s", type=float, default=120.0)
     parser.add_argument("--idle_poll_s", type=float, default=5.0)
     parser.add_argument("--case_timeout_s", type=float, default=900.0)
+    parser.add_argument("--allow_failures", action="store_true")
     parser.add_argument("--gpu_memory_utilization", type=float, default=0.86)
     parser.add_argument("--prompt_token_id", type=int, default=100)
     parser.add_argument("--sink_keep_tokens", type=int, default=64)
@@ -368,6 +376,8 @@ def main():
                 f.flush()
                 _write_report(output_dir, results, args)
     print(f"[done] report={output_dir / 'report.md'} results={results_path}", flush=True)
+    if any(row.get("status") != "success" for row in results) and not args.allow_failures:
+        raise SystemExit(1)
 
 
 if __name__ == "__main__":

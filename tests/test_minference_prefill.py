@@ -9,6 +9,7 @@ import torch
 
 from sparsevllm.config import Config
 from sparsevllm.triton_kernel.minference_prefill import (
+    _convert_vertical_slash_row,
     _estimate_layer_pattern_density,
     _get_vs_pattern,
     minference_context_attention_fwd,
@@ -88,6 +89,17 @@ class MinferencePrefillConfigTest(unittest.TestCase):
             density = _estimate_layer_pattern_density(cfg, layer_idx=0, rank=0, num_heads=1, seq_len=2048)
             self.assertGreaterEqual(density, 1.0)
 
+    def test_slash_row_conversion_matches_reference_ranges(self):
+        blocks, columns = _convert_vertical_slash_row(
+            [10, 70, 130],
+            [190],
+            end_m=192,
+            block_m=64,
+            block_n=64,
+        )
+        self.assertEqual(blocks, [0])
+        self.assertEqual(columns, [])
+
     def test_chunk_prefill_rejected_before_cuda_work(self):
         cfg = SimpleNamespace(minference_config_path="/tmp/unused.json", minference_ratio=1.0)
         with self.assertRaisesRegex(RuntimeError, "does not support chunk/prefix prefill"):
@@ -117,7 +129,7 @@ class MinferencePrefillKernelTest(unittest.TestCase):
             cfg = SimpleNamespace(minference_config_path=str(pattern_path), minference_ratio=1.0)
 
             device = "cuda"
-            seq_len = 128
+            seq_len = 256
             num_heads = 2
             num_kv_heads = 2
             head_dim = 32
@@ -133,22 +145,23 @@ class MinferencePrefillKernelTest(unittest.TestCase):
             b_prompt_cache_len = torch.zeros((1,), dtype=torch.int32, device=device)
             attn_score = torch.zeros((1, num_heads, seq_len), dtype=torch.float32, device=device)
 
-            minference_context_attention_fwd(
-                q,
-                k_cache,
-                v_cache,
-                out,
-                b_req_idx,
-                b_start_loc,
-                b_seq_len,
-                b_prompt_cache_len,
-                seq_len,
-                req_to_tokens,
-                layer_idx=0,
-                config=cfg,
-                rank=0,
-                attn_score=attn_score,
-            )
+            with patch("sparsevllm.triton_kernel.minference_prefill.MINFERENCE_MIN_SPARSE_SEQ_LEN", 1):
+                minference_context_attention_fwd(
+                    q,
+                    k_cache,
+                    v_cache,
+                    out,
+                    b_req_idx,
+                    b_start_loc,
+                    b_seq_len,
+                    b_prompt_cache_len,
+                    seq_len,
+                    req_to_tokens,
+                    layer_idx=0,
+                    config=cfg,
+                    rank=0,
+                    attn_score=attn_score,
+                )
             torch.cuda.synchronize()
             self.assertTrue(torch.isfinite(out).all().item())
             self.assertGreater(float(attn_score.abs().sum().item()), 0.0)
