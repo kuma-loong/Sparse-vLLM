@@ -5,3 +5,4 @@ behavior.
 
 - [Core Sparse Methods](sparse-methods.md)
 - [DeltaKV](deltakv.md)
+- [MInference Prefill](minference.md)

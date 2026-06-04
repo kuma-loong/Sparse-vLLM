@@ -194,6 +194,12 @@ Known Sparse-vLLM method strings:
 | `deltakv-standalone` | DeltaKV standalone manager; clears full-attention and observation-layer routing. |
 | `deltakv-snapkv` | DeltaKV plus SnapKV-style cache manager; clears full-attention and observation-layer routing. |
 
+MInference prefill is not a `sparse_method`. Enable it with the orthogonal
+`prefill_attention_backend="minference"` and pass `minference_config_path`.
+V1 supports `sparse_method="vanilla"` and `sparse_method="snapkv"` only, accepts
+only `vertical_and_slash` pattern entries, and rejects chunk prefill. Set
+`engine_prefill_chunk_size` large enough for each evaluated prompt.
+
 Sparse-vLLM currently rejects Qwen3 plus DeltaKV in `CacheManager.create(...)`
 because of qk-norm/runtime mismatch. Use HF for Qwen3 DeltaKV runs in this repo.
 
@@ -263,6 +269,10 @@ Special cases:
 | `quest_token_budget` | Sparse-vLLM Quest | Quest token budget. |
 | `chunk_size` | HF Quest adapter | Quest chunk/page size on HF. |
 | `decode_keep_tokens` | HF Quest adapter | Quest token budget on HF. |
+| `prefill_attention_backend` | Sparse-vLLM MInference | Optional prefill attention backend. Empty means dense prefill; `minference` enables MInference prefill. |
+| `minference_config_path` | Sparse-vLLM MInference | Best-pattern JSON file. Required when `prefill_attention_backend="minference"`. |
+| `minference_starting_layer` | Sparse-vLLM MInference | First layer to run MInference prefill. |
+| `minference_ratio` | Sparse-vLLM MInference | Multiplier for configured vertical/slash budgets. |
 
 Quest is a good example of "same research idea, different surface":
 

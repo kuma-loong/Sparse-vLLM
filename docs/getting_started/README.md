@@ -94,10 +94,13 @@ Sparse knobs:
 - `decode_keep_tokens`: decode-time top/important token budget.
 - `prefill_keep_tokens`: prefill/finalization top/important token budget.
 - `full_attention_layers`: comma-separated layer indices or list of layers that run full attention.
+- `prefill_attention_backend`: optional prefill attention backend; use `minference`
+  with `minference_config_path` to enable MInference prefill.
 
 ## Documentation Map
 
 - [Core sparse methods](../features/sparse-methods.md)
+- [MInference Prefill](../features/minference.md)
 - [Benchmarks](../benchmarking/README.md)
 - [DeltaKV](../features/deltakv.md)
 - [Troubleshooting](troubleshooting.md)
