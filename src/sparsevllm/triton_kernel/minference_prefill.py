@@ -1,0 +1,459 @@
+from __future__ import annotations
+
+import json
+import math
+from functools import lru_cache
+from typing import Any
+
+import torch
+import triton
+import triton.language as tl
+
+
+@lru_cache(maxsize=8)
+def _load_pattern_config(path: str) -> list[dict[str, Any]]:
+    with open(path, "r", encoding="utf-8") as f:
+        data = json.load(f)
+    if not isinstance(data, list):
+        raise ValueError(f"MInference config must be a layer list: {path}")
+    for layer_idx, layer in enumerate(data):
+        if not isinstance(layer, dict):
+            raise ValueError(f"MInference config layer {layer_idx} must be an object.")
+    return data
+
+
+def _get_vs_pattern(config, layer_idx: int, global_head_idx: int) -> tuple[int, int]:
+    pattern_config = _load_pattern_config(str(config.minference_config_path))
+    if layer_idx >= len(pattern_config):
+        raise ValueError(
+            "MInference config has fewer layers than the model: "
+            f"layer_idx={layer_idx}, config_layers={len(pattern_config)}."
+        )
+    layer_patterns = pattern_config[layer_idx]
+    key = str(int(global_head_idx))
+    if key not in layer_patterns:
+        raise ValueError(
+            "MInference config is missing a head pattern: "
+            f"layer={layer_idx}, global_head={global_head_idx}."
+        )
+    pattern = layer_patterns[key]
+    if not isinstance(pattern, (list, tuple)) or len(pattern) < 3:
+        raise ValueError(
+            "MInference head pattern must be a list like "
+            "['vertical_and_slash', vertical_size, slash_size, score]. "
+            f"layer={layer_idx}, global_head={global_head_idx}, value={pattern!r}."
+        )
+    pattern_type = str(pattern[0])
+    if pattern_type != "vertical_and_slash":
+        raise NotImplementedError(
+            "MInference prefill V1 supports only vertical_and_slash patterns, "
+            f"got {pattern_type!r} at layer={layer_idx}, global_head={global_head_idx}."
+        )
+    ratio = float(config.minference_ratio)
+    vertical_size = int(int(pattern[1]) * ratio)
+    slash_size = int(int(pattern[2]) * ratio)
+    return vertical_size, slash_size
+
+
+def _build_head_indices(
+    q_seq: torch.Tensor,
+    k_seq: torch.Tensor,
+    vertical_size: int,
+    slash_size: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    seq_len = int(q_seq.shape[0])
+    head_dim = int(q_seq.shape[-1])
+    last_q = min(64, seq_len)
+    vertical_size = min(seq_len, max(int(vertical_size), 30))
+    slash_size = min(seq_len, max(int(slash_size), 50))
+
+    q_last = q_seq[-last_q:].to(torch.float32)
+    k_float = k_seq.to(torch.float32)
+    logits = torch.matmul(q_last, k_float.transpose(0, 1)) / math.sqrt(head_dim)
+    q_positions = torch.arange(seq_len - last_q, seq_len, device=q_seq.device)
+    k_positions = torch.arange(seq_len, device=q_seq.device)
+    logits = logits.masked_fill(k_positions.unsqueeze(0) > q_positions.unsqueeze(1), -torch.inf)
+    probs = torch.softmax(logits, dim=-1, dtype=torch.float32)
+
+    vertical_scores = probs.sum(dim=0)
+    vertical_scores[: min(30, seq_len)] = torch.inf
+    vertical_idx = torch.topk(vertical_scores, vertical_size, dim=-1).indices.to(torch.int32)
+
+    slash_scores = torch.zeros((seq_len,), dtype=torch.float32, device=q_seq.device)
+    for row, pos in enumerate(range(seq_len - last_q, seq_len)):
+        cols = torch.arange(pos + 1, device=q_seq.device)
+        distances = (pos - cols).to(torch.long)
+        slash_scores.index_add_(0, distances, probs[row, : pos + 1])
+    slash_scores[: min(100, seq_len)] = torch.inf
+    slash_idx = torch.topk(slash_scores, slash_size, dim=-1).indices.to(torch.int32)
+    return vertical_idx, slash_idx
+
+
+@torch.no_grad()
+def _build_sparse_metadata(
+    q: torch.Tensor,
+    k_cache: torch.Tensor,
+    b_req_idx: torch.Tensor,
+    b_start_loc: torch.Tensor,
+    b_seq_len: torch.Tensor,
+    req_to_tokens: torch.Tensor,
+    *,
+    layer_idx: int,
+    config,
+    rank: int,
+    block_m: int,
+    block_n: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    batch = int(b_seq_len.numel())
+    num_heads = int(q.shape[1])
+    kv_group_num = num_heads // int(k_cache.shape[1])
+    max_seq_len = int(b_seq_len.max().item())
+    num_rows = triton.cdiv(max_seq_len, block_m)
+
+    per_row_blocks: list[list[list[list[int]]]] = []
+    per_row_columns: list[list[list[list[int]]]] = []
+    max_blocks = 1
+    max_columns = 1
+
+    for b_idx in range(batch):
+        seq_len = int(b_seq_len[b_idx].item())
+        q_start = int(b_start_loc[b_idx].item())
+        req_row = int(b_req_idx[b_idx].item())
+        slots = req_to_tokens[req_row, :seq_len].to(torch.long)
+        batch_blocks: list[list[list[int]]] = []
+        batch_columns: list[list[list[int]]] = []
+        for head_idx in range(num_heads):
+            global_head_idx = int(rank) * num_heads + head_idx
+            vertical_size, slash_size = _get_vs_pattern(config, layer_idx, global_head_idx)
+            kv_head_idx = head_idx // kv_group_num
+            q_seq = q[q_start: q_start + seq_len, head_idx, :]
+            k_seq = k_cache.index_select(0, slots)[:, kv_head_idx, :]
+            vertical_idx, slash_idx = _build_head_indices(q_seq, k_seq, vertical_size, slash_size)
+            vertical_list = [int(x) for x in vertical_idx.detach().cpu().tolist()]
+            slash_list = [int(x) for x in slash_idx.detach().cpu().tolist()]
+
+            head_blocks: list[list[int]] = []
+            head_columns: list[list[int]] = []
+            for row_idx in range(num_rows):
+                q_block_start = row_idx * block_m
+                if q_block_start >= seq_len:
+                    head_blocks.append([])
+                    head_columns.append([])
+                    continue
+                q_block_end = min(seq_len - 1, q_block_start + block_m - 1)
+                block_starts = set()
+                for distance in slash_list:
+                    key_start = q_block_start - distance
+                    key_end = q_block_end - distance
+                    if key_end < 0 or key_start >= seq_len:
+                        continue
+                    aligned_start = max(0, (key_start // block_n) * block_n)
+                    block_starts.add(int(aligned_start))
+                if not block_starts:
+                    block_starts.add(max(0, (q_block_start // block_n) * block_n))
+                sorted_blocks = sorted(block_starts)
+                filtered_columns = [
+                    col for col in vertical_list
+                    if not any(start <= col < start + block_n for start in sorted_blocks)
+                ]
+                head_blocks.append(sorted_blocks)
+                head_columns.append(filtered_columns)
+                max_blocks = max(max_blocks, len(sorted_blocks))
+                max_columns = max(max_columns, len(filtered_columns))
+            batch_blocks.append(head_blocks)
+            batch_columns.append(head_columns)
+        per_row_blocks.append(batch_blocks)
+        per_row_columns.append(batch_columns)
+
+    block_count = torch.zeros((batch, num_heads, num_rows), dtype=torch.int32, device=q.device)
+    block_offset = torch.zeros((batch, num_heads, num_rows, max_blocks), dtype=torch.int32, device=q.device)
+    column_count = torch.zeros((batch, num_heads, num_rows), dtype=torch.int32, device=q.device)
+    column_index = torch.zeros((batch, num_heads, num_rows, max_columns), dtype=torch.int32, device=q.device)
+
+    for b_idx, batch_blocks in enumerate(per_row_blocks):
+        for head_idx, head_blocks in enumerate(batch_blocks):
+            for row_idx, blocks in enumerate(head_blocks):
+                block_count[b_idx, head_idx, row_idx] = len(blocks)
+                if blocks:
+                    block_offset[b_idx, head_idx, row_idx, : len(blocks)] = torch.tensor(
+                        blocks, dtype=torch.int32, device=q.device
+                    )
+    for b_idx, batch_columns in enumerate(per_row_columns):
+        for head_idx, head_columns in enumerate(batch_columns):
+            for row_idx, columns in enumerate(head_columns):
+                column_count[b_idx, head_idx, row_idx] = len(columns)
+                if columns:
+                    column_index[b_idx, head_idx, row_idx, : len(columns)] = torch.tensor(
+                        columns, dtype=torch.int32, device=q.device
+                    )
+    return block_count, block_offset, column_count, column_index
+
+
+@triton.jit
+def _minference_prefill_kernel(
+    Q, K, V, sm_scale, Out,
+    B_Start_Loc, B_Seqlen, Req_to_tokens, B_req_idx,
+    Block_Count, Block_Offset, Column_Count, Column_Index,
+    Attn_Score,
+    stride_qbs, stride_qh, stride_qd,
+    stride_kbs, stride_kh, stride_kd,
+    stride_vbs, stride_vh, stride_vd,
+    stride_obs, stride_oh, stride_od,
+    stride_req_to_tokens_b, stride_req_to_tokens_s,
+    stride_bc_b, stride_bc_h, stride_bc_m,
+    stride_bo_b, stride_bo_h, stride_bo_m, stride_bo_n,
+    stride_cc_b, stride_cc_h, stride_cc_m,
+    stride_ci_b, stride_ci_h, stride_ci_m, stride_ci_n,
+    stride_asb, stride_ash, stride_asl,
+    kv_group_num,
+    H: tl.constexpr,
+    BLOCK_DMODEL: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    HAS_SCORE: tl.constexpr,
+):
+    start_m = tl.program_id(0)
+    cur_bh = tl.program_id(1)
+    cur_batch = cur_bh // H
+    cur_head = cur_bh % H
+    cur_kv_head = cur_head // kv_group_num
+
+    seq_start = tl.load(B_Start_Loc + cur_batch)
+    seq_len = tl.load(B_Seqlen + cur_batch)
+    req_idx = tl.load(B_req_idx + cur_batch)
+
+    offs_m = start_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_n = tl.arange(0, BLOCK_N)
+    offs_d = tl.arange(0, BLOCK_DMODEL)
+    m_mask = offs_m < seq_len
+
+    q_ptrs = (
+        Q + (seq_start + offs_m[:, None]) * stride_qbs
+        + cur_head * stride_qh
+        + offs_d[None, :] * stride_qd
+    )
+    q = tl.load(q_ptrs, mask=m_mask[:, None], other=0.0)
+
+    m_i = tl.zeros([BLOCK_M], dtype=tl.float32) - float("inf")
+    l_i = tl.zeros([BLOCK_M], dtype=tl.float32)
+    acc = tl.zeros([BLOCK_M, BLOCK_DMODEL], dtype=tl.float32)
+
+    block_count = tl.load(
+        Block_Count
+        + cur_batch * stride_bc_b
+        + cur_head * stride_bc_h
+        + start_m * stride_bc_m
+    )
+    block_offsets = (
+        Block_Offset
+        + cur_batch * stride_bo_b
+        + cur_head * stride_bo_h
+        + start_m * stride_bo_m
+    )
+    for block_idx in range(block_count):
+        start_n = tl.load(block_offsets + block_idx * stride_bo_n)
+        cols = start_n + offs_n
+        n_mask = cols < seq_len
+        kv_loc = tl.load(
+            Req_to_tokens + req_idx * stride_req_to_tokens_b + cols * stride_req_to_tokens_s,
+            mask=n_mask,
+            other=0,
+        )
+        k_ptrs = K + kv_loc[None, :] * stride_kbs + cur_kv_head * stride_kh + offs_d[:, None] * stride_kd
+        v_ptrs = V + kv_loc[:, None] * stride_vbs + cur_kv_head * stride_vh + offs_d[None, :] * stride_vd
+        k = tl.load(k_ptrs, mask=n_mask[None, :], other=0.0)
+        qk = tl.dot(q, k)
+        causal_mask = cols[None, :] <= offs_m[:, None]
+        score_mask = m_mask[:, None] & n_mask[None, :] & causal_mask
+        if HAS_SCORE:
+            score_to_collect = tl.where(score_mask, qk, 0.0)
+            tl.atomic_add(
+                Attn_Score
+                + cur_batch * stride_asb
+                + cur_head * stride_ash
+                + cols * stride_asl,
+                tl.sum(score_to_collect, 0),
+                mask=n_mask,
+            )
+        qk = tl.where(score_mask, qk * sm_scale, -1.0e8)
+        m_ij = tl.maximum(m_i, tl.max(qk, 1))
+        qk -= m_ij[:, None]
+        p = tl.math.exp2(qk)
+        l_ij = tl.sum(p, 1)
+        alpha = tl.math.exp2(m_i - m_ij)
+        l_i = l_i * alpha + l_ij
+        acc = acc * alpha[:, None]
+        v = tl.load(v_ptrs, mask=n_mask[:, None], other=0.0)
+        acc = tl.dot(p.to(v.dtype), v, acc)
+        m_i = m_ij
+
+    column_count = tl.load(
+        Column_Count
+        + cur_batch * stride_cc_b
+        + cur_head * stride_cc_h
+        + start_m * stride_cc_m
+    )
+    column_index = (
+        Column_Index
+        + cur_batch * stride_ci_b
+        + cur_head * stride_ci_h
+        + start_m * stride_ci_m
+    )
+    for column_start in range(0, column_count, BLOCK_N):
+        col_offsets = column_start + offs_n
+        n_mask = col_offsets < column_count
+        cols = tl.load(column_index + col_offsets * stride_ci_n, mask=n_mask, other=0)
+        n_mask = n_mask & (cols < seq_len)
+        kv_loc = tl.load(
+            Req_to_tokens + req_idx * stride_req_to_tokens_b + cols * stride_req_to_tokens_s,
+            mask=n_mask,
+            other=0,
+        )
+        k_ptrs = K + kv_loc[None, :] * stride_kbs + cur_kv_head * stride_kh + offs_d[:, None] * stride_kd
+        v_ptrs = V + kv_loc[:, None] * stride_vbs + cur_kv_head * stride_vh + offs_d[None, :] * stride_vd
+        k = tl.load(k_ptrs, mask=n_mask[None, :], other=0.0)
+        qk = tl.dot(q, k)
+        causal_mask = cols[None, :] <= offs_m[:, None]
+        score_mask = m_mask[:, None] & n_mask[None, :] & causal_mask
+        if HAS_SCORE:
+            score_to_collect = tl.where(score_mask, qk, 0.0)
+            tl.atomic_add(
+                Attn_Score
+                + cur_batch * stride_asb
+                + cur_head * stride_ash
+                + cols * stride_asl,
+                tl.sum(score_to_collect, 0),
+                mask=n_mask,
+            )
+        qk = tl.where(score_mask, qk * sm_scale, -1.0e8)
+        m_ij = tl.maximum(m_i, tl.max(qk, 1))
+        qk -= m_ij[:, None]
+        p = tl.math.exp2(qk)
+        l_ij = tl.sum(p, 1)
+        alpha = tl.math.exp2(m_i - m_ij)
+        l_i = l_i * alpha + l_ij
+        acc = acc * alpha[:, None]
+        v = tl.load(v_ptrs, mask=n_mask[:, None], other=0.0)
+        acc = tl.dot(p.to(v.dtype), v, acc)
+        m_i = m_ij
+
+    acc = acc / l_i[:, None]
+    o_ptrs = (
+        Out + (seq_start + offs_m[:, None]) * stride_obs
+        + cur_head * stride_oh
+        + offs_d[None, :] * stride_od
+    )
+    tl.store(o_ptrs, acc, mask=m_mask[:, None])
+
+
+@torch.no_grad()
+def minference_context_attention_fwd(
+    q: torch.Tensor,
+    k_cache: torch.Tensor,
+    v_cache: torch.Tensor,
+    o: torch.Tensor,
+    b_req_idx: torch.Tensor,
+    b_start_loc: torch.Tensor,
+    b_seq_len: torch.Tensor,
+    b_prompt_cache_len: torch.Tensor,
+    max_input_len: int,
+    req_to_tokens: torch.Tensor,
+    *,
+    layer_idx: int,
+    config,
+    rank: int,
+    attn_score: torch.Tensor | None = None,
+):
+    if b_prompt_cache_len.numel() and bool(torch.any(b_prompt_cache_len != 0).item()):
+        raise RuntimeError(
+            "MInference prefill does not support chunk/prefix prefill yet. "
+            "Increase engine_prefill_chunk_size so each prompt is prefetched in one step."
+        )
+    if attn_score is not None and attn_score.dim() != 3:
+        raise NotImplementedError("MInference prefill currently supports only 3D attention-score collection.")
+
+    block_m = 64
+    block_n = 64
+    head_dim = int(q.shape[-1])
+    if head_dim not in {16, 32, 64, 128, 256}:
+        raise ValueError(f"Unsupported MInference head_dim={head_dim}.")
+    if q.dtype != k_cache.dtype or k_cache.dtype != v_cache.dtype:
+        raise ValueError("MInference prefill requires q, k_cache, and v_cache to have the same dtype.")
+    if not (q.stride(-1) == 1 and k_cache.stride(-1) == 1 and v_cache.stride(-1) == 1 and o.stride(-1) == 1):
+        raise ValueError("MInference prefill expects contiguous head_dim strides.")
+
+    block_count, block_offset, column_count, column_index = _build_sparse_metadata(
+        q,
+        k_cache,
+        b_req_idx,
+        b_start_loc,
+        b_seq_len,
+        req_to_tokens,
+        layer_idx=layer_idx,
+        config=config,
+        rank=rank,
+        block_m=block_m,
+        block_n=block_n,
+    )
+
+    sm_scale = 1.0 / math.sqrt(head_dim) * 1.4426950408889634
+    batch = int(b_seq_len.shape[0])
+    num_heads = int(q.shape[1])
+    kv_group_num = num_heads // int(k_cache.shape[1])
+    grid = (triton.cdiv(int(max_input_len), block_m), batch * num_heads, 1)
+    score_arg = attn_score if attn_score is not None else o
+    _minference_prefill_kernel[grid](
+        q,
+        k_cache,
+        v_cache,
+        sm_scale,
+        o,
+        b_start_loc,
+        b_seq_len,
+        req_to_tokens,
+        b_req_idx,
+        block_count,
+        block_offset,
+        column_count,
+        column_index,
+        score_arg,
+        q.stride(0),
+        q.stride(1),
+        q.stride(2),
+        k_cache.stride(0),
+        k_cache.stride(1),
+        k_cache.stride(2),
+        v_cache.stride(0),
+        v_cache.stride(1),
+        v_cache.stride(2),
+        o.stride(0),
+        o.stride(1),
+        o.stride(2),
+        req_to_tokens.stride(0),
+        req_to_tokens.stride(1),
+        block_count.stride(0),
+        block_count.stride(1),
+        block_count.stride(2),
+        block_offset.stride(0),
+        block_offset.stride(1),
+        block_offset.stride(2),
+        block_offset.stride(3),
+        column_count.stride(0),
+        column_count.stride(1),
+        column_count.stride(2),
+        column_index.stride(0),
+        column_index.stride(1),
+        column_index.stride(2),
+        column_index.stride(3),
+        score_arg.stride(0),
+        score_arg.stride(1) if attn_score is not None else 0,
+        score_arg.stride(2) if attn_score is not None else 0,
+        kv_group_num=kv_group_num,
+        H=num_heads,
+        BLOCK_DMODEL=head_dim,
+        BLOCK_M=block_m,
+        BLOCK_N=block_n,
+        HAS_SCORE=attn_score is not None,
+        num_warps=4 if head_dim <= 64 else 8,
+        num_stages=2,
+    )
