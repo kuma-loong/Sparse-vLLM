@@ -142,8 +142,8 @@ class CacheManager(ABC):
         # Keep this heuristic conservative: large prefill batches can still peak on
         # MLP activations and allocator fragmentation after KV cache allocation.
         estimated_max_tokens = int(reserved_mem / (intermediate_size * dtype_size * 10))
-        assert 2 * config.chunk_prefill_size < estimated_max_tokens, (
-            f"{2 * config.chunk_prefill_size} >= {estimated_max_tokens}"
+        assert config.chunk_prefill_size < estimated_max_tokens, (
+            f"{config.chunk_prefill_size} >= {estimated_max_tokens}"
         )
 
         if estimated_max_tokens < config.max_num_batched_tokens:

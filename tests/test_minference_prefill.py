@@ -73,6 +73,19 @@ class MinferencePrefillConfigTest(unittest.TestCase):
             self.assertEqual(cfg.prefill_attention_backend, "minference")
             self.assertEqual(cfg.vllm_sparse_method, "snapkv")
 
+    def test_config_keeps_single_chunk_batched_token_limit(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            with patch("sparsevllm.config.AutoConfig.from_pretrained", return_value=_hf_config()):
+                cfg = Config(
+                    model=tmp,
+                    max_num_batched_tokens=65560,
+                    chunk_prefill_size=65536,
+                    max_model_len=65608,
+                    max_num_seqs_in_batch=1,
+                    max_decoding_seqs=1,
+                )
+            self.assertEqual(cfg.max_num_batched_tokens, 65560)
+
     def test_pattern_rejects_unsupported_type(self):
         with tempfile.TemporaryDirectory() as tmp:
             pattern_path = Path(tmp) / "pattern.json"

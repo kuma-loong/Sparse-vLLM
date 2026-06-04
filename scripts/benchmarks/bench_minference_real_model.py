@@ -89,12 +89,13 @@ def _build_engine_kwargs(args, method: str, prompt_len: int) -> dict[str, Any]:
         raise ValueError(f"Unknown method {method!r}. Valid methods: {sorted(METHOD_CONFIGS)}")
 
     chunk_size = int(prompt_len)
+    max_case_tokens = int(args.batch_size) * (chunk_size + int(args.output_len)) + 16
     kwargs: dict[str, Any] = {
         "enforce_eager": True,
         "gpu_memory_utilization": float(args.gpu_memory_utilization),
         "tensor_parallel_size": 1,
         "engine_prefill_chunk_size": chunk_size,
-        "max_num_batched_tokens": max(2 * chunk_size + 16, chunk_size + int(args.output_len) + 16),
+        "max_num_batched_tokens": max_case_tokens,
         "max_num_seqs_in_batch": int(args.batch_size),
         "max_decoding_seqs": int(args.batch_size),
         "max_model_len": int(prompt_len) + int(args.output_len) + 64,

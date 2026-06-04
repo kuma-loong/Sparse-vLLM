@@ -328,9 +328,10 @@ class Config:
                 if (l + 1) not in self.full_attn_layers:
                     self.obs_layer_ids.append(l)
         
-        # 确保调度吞吐量限制不小于单次分块大小
-        if self.max_num_batched_tokens < 2 * self.chunk_prefill_size:
-            self.max_num_batched_tokens = 2 * self.chunk_prefill_size
+        # 确保调度吞吐量限制不小于单次分块大小。长上下文单请求
+        # prefill 不应被强制要求预留两个 chunk 的激活预算。
+        if self.max_num_batched_tokens < self.chunk_prefill_size:
+            self.max_num_batched_tokens = self.chunk_prefill_size
 
         # PyramidKV 配置验证与智能生成
         if 'pyramidkv' == self.vllm_sparse_method:
