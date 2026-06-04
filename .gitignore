@@ -10,3 +10,4 @@ wandb/
 /scripts/tmp/
 /outputs/
 /benchmark/scbench/results/
+/reference/
