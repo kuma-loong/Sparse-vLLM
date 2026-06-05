@@ -112,6 +112,10 @@ class CacheManager(ABC):
 
             return StreamingLLMCacheManager(config, rank, world_size)
         if sparse_method in ("snapkv", "pyramidkv"):
+            if sparse_method == "snapkv" and getattr(config, "prefill_attention_backend", "") == "minference":
+                from .minference import MinferenceSnapKVCacheManager
+
+                return MinferenceSnapKVCacheManager(config, rank, world_size)
             from .snapkv import SnapKVCacheManager
 
             return SnapKVCacheManager(config, rank, world_size)
@@ -124,8 +128,12 @@ class CacheManager(ABC):
 
             return OmniKVCacheManager(config, rank, world_size)
 
-        from .standard import StandardCacheManager
+        if getattr(config, "prefill_attention_backend", "") == "minference":
+            from .minference import MinferenceStandardCacheManager
 
+            return MinferenceStandardCacheManager(config, rank, world_size)
+
+        from .standard import StandardCacheManager
         return StandardCacheManager(config, rank, world_size)
 
     def _get_available_slots_info(self) -> tuple[int, int]:
@@ -233,6 +241,40 @@ class CacheManager(ABC):
         """Optional method-specific decode-time logical view builder."""
         return active_slots, req_indices, context_lens
 
+    def run_prefill_attention(
+        self,
+        *,
+        layer_idx: int,
+        q: torch.Tensor,
+        k_cache: torch.Tensor,
+        v_cache: torch.Tensor,
+        out: torch.Tensor,
+        req_indices: torch.Tensor,
+        start_loc: torch.Tensor,
+        seq_lens: torch.Tensor,
+        prompt_cache_lens: torch.Tensor,
+        max_input_len: int,
+        active_slots: torch.Tensor,
+        attn_score: torch.Tensor | None,
+    ):
+        """Run the prefill attention backend for the current cache manager."""
+        del layer_idx
+        from sparsevllm.triton_kernel.context_flashattention_nopad import context_attention_fwd
+
+        context_attention_fwd(
+            q,
+            k_cache,
+            v_cache,
+            out,
+            req_indices,
+            start_loc,
+            seq_lens,
+            prompt_cache_lens,
+            max_input_len,
+            active_slots,
+            attn_score=attn_score,
+        )
+
     def set_decode_static_max_context_len(self, max_context_len: int):
         """Pin graph-captured decode kernels to a fixed max context length."""
         max_context_len = int(max_context_len)
@@ -266,6 +308,29 @@ class CacheManager(ABC):
     def remaining_prefill_tokens(self, seq: Sequence) -> int:
         """Effective remaining prefill tokens for scheduling decisions."""
         return int(seq.num_prompt_tokens - seq.num_prefilled_tokens)
+
+    def prefill_step_tokens(
+        self,
+        *,
+        remaining_prefill_tokens: int,
+        num_batched_tokens: int,
+        step_free_count: int,
+        max_num_batched_tokens: int,
+        target_is_long: bool,
+        chunk_prefill_size: int,
+        prefill_schedule_policy: str,
+    ) -> int | None:
+        """Return cache-manager-specific prefill step size, or None for scheduler policy."""
+        del (
+            remaining_prefill_tokens,
+            num_batched_tokens,
+            step_free_count,
+            max_num_batched_tokens,
+            target_is_long,
+            chunk_prefill_size,
+            prefill_schedule_policy,
+        )
+        return None
 
     def reserved_prefill_slots(self, waiting_seqs: deque[Sequence], chunk_prefill_size: int) -> int:
         """Persistent slots reserved by waiting/running prefills.

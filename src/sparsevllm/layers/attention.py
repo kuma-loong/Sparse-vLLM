@@ -3,8 +3,6 @@ from torch import nn
 import triton
 import triton.language as tl
 
-from sparsevllm.triton_kernel.context_flashattention_nopad import context_attention_fwd
-from sparsevllm.triton_kernel.minference_prefill import minference_context_attention_fwd
 from sparsevllm.triton_kernel.flash_decoding_stage1 import flash_decode_stage1 as mha_flash_decode_stage1
 from sparsevllm.triton_kernel.flash_decoding_stage1 import flash_decode_stage1_with_score as mha_flash_decode_stage1_with_score
 from sparsevllm.triton_kernel.gqa_flash_decoding_stage1 import flash_decode_stage1 as gqa_flash_decode_stage1
@@ -143,26 +141,20 @@ class Attention(nn.Module):
                 # Triton 路径需要物理槽位 layer_active_slots 用于 Req_to_tokens 寻址
                 # 它内部通过 prompt_cache_len 实现因果掩码，目前不需要显式的 pos_ids
                 o = torch.empty_like(q)
-                if (
-                    cache_manager.config.prefill_attention_backend == "minference"
-                    and layer_idx >= int(cache_manager.config.minference_starting_layer)
-                ):
-                    minference_context_attention_fwd(
-                        q, k_cache, v_cache, o,
-                        b_req_idx, b_start_loc, b_seq_len, b_prompt_cache_len, max_input_len,
-                        layer_active_slots,
-                        layer_idx=layer_idx,
-                        config=cache_manager.config,
-                        rank=cache_manager.rank,
-                        attn_score=layer_attn_score,
-                    )
-                else:
-                    context_attention_fwd(
-                        q, k_cache, v_cache, o,
-                        b_req_idx, b_start_loc, b_seq_len, b_prompt_cache_len, max_input_len,
-                        layer_active_slots,
-                        attn_score=layer_attn_score,
-                    )
+                cache_manager.run_prefill_attention(
+                    layer_idx=layer_idx,
+                    q=q,
+                    k_cache=k_cache,
+                    v_cache=v_cache,
+                    out=o,
+                    req_indices=b_req_idx,
+                    start_loc=b_start_loc,
+                    seq_lens=b_seq_len,
+                    prompt_cache_lens=b_prompt_cache_len,
+                    max_input_len=max_input_len,
+                    active_slots=layer_active_slots,
+                    attn_score=layer_attn_score,
+                )
             else:    # decode
                 batch_size = q.shape[0]
                 layer_active_slots, b_req_idx, layer_context_lens = cache_manager.build_decode_view(

@@ -9,6 +9,10 @@ from unittest.mock import patch
 import torch
 
 from sparsevllm.config import Config
+from sparsevllm.engine.cache_manager.minference import (
+    MinferencePrefillMixin,
+    MinferenceSnapKVCacheManager,
+)
 from sparsevllm.engine.cache_manager.snapkv import SnapKVCacheManager
 from sparsevllm.engine.scheduler import Scheduler
 from sparsevllm.engine.sequence import Sequence
@@ -56,6 +60,10 @@ class _SchedulerMemoryOracle:
 
     def on_prompt_admitted(self, seq: Sequence, costs: dict[str, int]):
         del seq, costs
+
+
+class _MinferenceSchedulerMemoryOracle(MinferencePrefillMixin, _SchedulerMemoryOracle):
+    pass
 
 
 def _hf_config(num_layers=2, num_heads=2, num_kv_heads=2, head_dim=32):
@@ -126,7 +134,7 @@ class MinferencePrefillConfigTest(unittest.TestCase):
             self.assertEqual(cfg.max_num_batched_tokens, 65560)
 
     def test_minference_snapkv_first_prefill_schedules_full_prompt(self):
-        manager = SnapKVCacheManager.__new__(SnapKVCacheManager)
+        manager = MinferenceSnapKVCacheManager.__new__(MinferenceSnapKVCacheManager)
         manager.config = SimpleNamespace(
             vllm_sparse_method="snapkv",
             prefill_attention_backend="minference",
@@ -161,7 +169,7 @@ class MinferencePrefillConfigTest(unittest.TestCase):
             vllm_sparse_method="snapkv",
             prefill_attention_backend="minference",
         )
-        scheduler = Scheduler(cfg, _SchedulerMemoryOracle(free_slots=65536))
+        scheduler = Scheduler(cfg, _MinferenceSchedulerMemoryOracle(free_slots=65536))
         seq = Sequence([1] * 32768)
         scheduler.add(seq)
 
@@ -187,7 +195,7 @@ class MinferencePrefillConfigTest(unittest.TestCase):
             vllm_sparse_method="snapkv",
             prefill_attention_backend="minference",
         )
-        scheduler = Scheduler(cfg, _SchedulerMemoryOracle(free_slots=8192))
+        scheduler = Scheduler(cfg, _MinferenceSchedulerMemoryOracle(free_slots=8192))
         scheduler.add(Sequence([1] * 32768))
 
         with self.assertRaisesRegex(RuntimeError, "MInference prefill requires each prompt"):

@@ -191,7 +191,10 @@ def _run_case(args, method: str, prompt_len: int) -> dict[str, Any]:
                 decode_s += step_s
                 if ttft_s is None:
                     ttft_s = perf_counter() - start
-            for seq_id, token_ids in finished_outputs:
+            for item in finished_outputs:
+                if not isinstance(item, tuple) or len(item) < 2:
+                    raise ValueError(f"Unexpected finished output item: {item!r}")
+                seq_id, token_ids = item[:2]
                 completion_tokens_by_seq[int(seq_id)] = len(token_ids)
 
         total_s = perf_counter() - start

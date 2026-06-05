@@ -8,6 +8,8 @@ __all__ = [
     "StandardCacheManager",
     "StreamingLLMCacheManager",
     "SnapKVCacheManager",
+    "MinferenceStandardCacheManager",
+    "MinferenceSnapKVCacheManager",
     "QuestCacheManager",
     "OmniKVCacheManager",
     "DeltaKVCacheManager",
@@ -34,6 +36,10 @@ def __getattr__(name: str):
         from .snapkv import SnapKVCacheManager
 
         return SnapKVCacheManager
+    if name in {"MinferenceStandardCacheManager", "MinferenceSnapKVCacheManager"}:
+        from . import minference as _minference
+
+        return getattr(_minference, name)
     if name == "QuestCacheManager":
         from .quest import QuestCacheManager
 

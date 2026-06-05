@@ -196,9 +196,14 @@ Known Sparse-vLLM method strings:
 
 MInference prefill is not a `sparse_method`. Enable it with the orthogonal
 `prefill_attention_backend="minference"` and pass `minference_config_path`.
-V1 supports `sparse_method="vanilla"` and `sparse_method="snapkv"` only, accepts
-only `vertical_and_slash` pattern entries, and rejects chunk prefill. Set
-`engine_prefill_chunk_size` large enough for each evaluated prompt.
+Its runtime behavior is owned by cache-manager prefill hooks, so
+`layers/attention.py` stays method-agnostic. V1 supports
+`sparse_method="vanilla"` and `sparse_method="snapkv"` only, accepts only
+`vertical_and_slash` pattern entries, and rejects chunk prefill. Set
+`max_num_batched_tokens` large enough for each evaluated prompt. Setting
+`engine_prefill_chunk_size` to the prompt length is a convenient way to make
+normalization raise `max_num_batched_tokens` for batch size 1, but MInference
+does not otherwise use the chunk size as its prefill step cap.
 
 Sparse-vLLM currently rejects Qwen3 plus DeltaKV in `CacheManager.create(...)`
 because of qk-norm/runtime mismatch. Use HF for Qwen3 DeltaKV runs in this repo.
@@ -544,7 +549,7 @@ queueing, and whether a benchmark measures the intended batch.
 | `engine_prefill_chunk_size` | Sparse-vLLM | Max prefill chunk scheduled per sequence per step; used in warmup, long-text bucket, admission, memory estimates. |
 | `hf_prefill_chunk_size` | HF | Wrapper/model chunk size for long input forwarding. Often a large value means "do not chunk". |
 | `max_model_len` | Sparse-vLLM | Hard engine capacity for prompt plus generated tokens. Affects allocation and request validation. |
-| `max_num_batched_tokens` | Sparse-vLLM | Scheduler cap for tokens in one step. Auto-raised to at least `2 * engine_prefill_chunk_size` after normalization. May also be reduced by memory heuristics. |
+| `max_num_batched_tokens` | Sparse-vLLM | Scheduler cap for tokens in one step. Auto-raised to at least `engine_prefill_chunk_size` after normalization. May also be reduced by memory heuristics. |
 | `max_num_seqs_in_batch` | Sparse-vLLM | Max active sequences in a prefill/decode step. |
 | `max_decoding_seqs` | Sparse-vLLM | Max sequences in decode queue. |
 | `prefill_schedule_policy` | Sparse-vLLM | Method-specific prefill policy resolved from `src/sparsevllm/method_registry.py`; explicit mismatches fail fast. |
