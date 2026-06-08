@@ -13,26 +13,18 @@ from typing import Any
 
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
-PYTHON = "/home/haojitai/miniconda3/envs/svllm/bin/python"
+PYTHON = os.getenv("PYTHON", str(REPO_ROOT / ".venv" / "bin" / "python"))
 
-QWEN_MODEL_PATH = "/home/haojitai/models/Qwen2.5-7B-Instruct-1M"
+QWEN_MODEL_PATH = os.getenv("QWEN_MODEL_PATH", "")
 QWEN_TOKENIZER_PATH = QWEN_MODEL_PATH
-QWEN_DELTAKV_CHECKPOINT_PATH = (
-    "/home/haojitai/checkpoints/compressor/"
-    "cluster_e2e_cs256_biasFalse_l2_ratio0.1_clusMean_before_rope_lr0.0002_"
-    "cdownmlp_swiglud3072_cuplinear_0125_222950"
-)
-LONG_BENCH_DATA_ROOT = "/home/haojitai/datasets/LongBench"
+QWEN_DELTAKV_CHECKPOINT_PATH = os.getenv("QWEN_DELTAKV_CHECKPOINT_PATH", "")
+LONG_BENCH_DATA_ROOT = os.getenv("SVLLM_LONGBENCH_DATA_DIR", os.getenv("DELTAKV_LONGBENCH_DATA_DIR", ""))
 
-LLAMA_MODEL_PATH = "/home/haojitai/models/Llama-3.1-8B-Instruct"
-LLAMA_DELTAKV_CHECKPOINT_PATH = (
-    "/home/haojitai/checkpoints/compressor/"
-    "cluster_e2e_cs512_biasFalse_l2_ratio0.1_clusMean_before_rope_lr0.0002_"
-    "cdownmlp_swiglud3072_cuplinear_0125_051527"
-)
+LLAMA_MODEL_PATH = os.getenv("LLAMA_MODEL_PATH", "")
+LLAMA_DELTAKV_CHECKPOINT_PATH = os.getenv("LLAMA_DELTAKV_CHECKPOINT_PATH", "")
 
-SCBENCH_PREPROCESSED_ROOT = "/home/haojitai/datasets/SCBench-preprocessed"
-OUTPUT_ROOT = Path("/home/haojitai/outputs")
+SCBENCH_PREPROCESSED_ROOT = os.getenv("SVLLM_SCBENCH_PREPROCESSED_ROOT", os.getenv("SCBENCH_PREPROCESSED_ROOT", ""))
+OUTPUT_ROOT = Path(os.getenv("SVLLM_BENCHMARK_OUTPUT_DIR", str(REPO_ROOT / "benchmark" / "results")))
 
 FIXED_GPU_IDS = [4, 5, 6, 7]
 FIXED_VISIBLE_GPUS = ",".join(str(gpu) for gpu in FIXED_GPU_IDS)
@@ -47,6 +39,23 @@ KVZIP_TASKS = "scbench_kv,scbench_qa_eng,scbench_summary_with_needles,scbench_ma
 QWEN_FULL_ATTN_LAYERS = "0,1,2,4,7,14"
 LLAMA_FULL_ATTN_LAYERS = "0,1,2,8,18"
 ALPHAS = [0.001, 0.02, 0.05, 0.1, 0.2]
+
+
+def require_config() -> None:
+    missing = [
+        name
+        for name, value in [
+            ("QWEN_MODEL_PATH", QWEN_MODEL_PATH),
+            ("QWEN_DELTAKV_CHECKPOINT_PATH", QWEN_DELTAKV_CHECKPOINT_PATH),
+            ("LLAMA_MODEL_PATH", LLAMA_MODEL_PATH),
+            ("LLAMA_DELTAKV_CHECKPOINT_PATH", LLAMA_DELTAKV_CHECKPOINT_PATH),
+            ("SVLLM_LONGBENCH_DATA_DIR or DELTAKV_LONGBENCH_DATA_DIR", LONG_BENCH_DATA_ROOT),
+            ("SVLLM_SCBENCH_PREPROCESSED_ROOT or SCBENCH_PREPROCESSED_ROOT", SCBENCH_PREPROCESSED_ROOT),
+        ]
+        if not value
+    ]
+    if missing:
+        raise RuntimeError("Missing required benchmark environment variables: " + ", ".join(missing))
 
 
 @dataclass
@@ -427,6 +436,7 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> int:
     args = parse_args()
+    require_config()
     queue = build_queue(args.queue_mode)
     if args.print_commands:
         return print_commands(queue)

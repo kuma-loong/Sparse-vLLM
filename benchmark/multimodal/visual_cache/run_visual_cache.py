@@ -13,11 +13,18 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 
+PROJECT_ROOT = Path(__file__).resolve().parents[3]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+if str(PROJECT_ROOT / "src") not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT / "src"))
+
 import pyarrow.parquet as pq
 import torch
 from PIL import Image
 from transformers import LlavaOnevisionConfig, LlavaOnevisionForConditionalGeneration, LlavaOnevisionProcessor
 
+from benchmark.common.paths import default_output_path
 from deltakv.modeling.llava_ov.llava_onevision_deltakv import (
     LlavaOnevisionDeltaKVForConditionalGeneration,
     load_deltakv_compressor_into_llava,
@@ -82,7 +89,7 @@ def parse_args():
             "uniform-pruning baseline."
         )
     )
-    parser.add_argument("--model_path", default="/data2/haojitai/models/llava-onevision-qwen2-7b-ov-hf")
+    parser.add_argument("--model_path", default=os.getenv("SVLLM_LLAVA_MODEL_PATH", ""))
     parser.add_argument(
         "--deltakv_checkpoint_path",
         default="none",
@@ -92,12 +99,12 @@ def parse_args():
             "method deltakv."
         ),
     )
-    parser.add_argument("--dataset_dir", default="/data2/haojitai/datasets/llava_onevision_visual_prune_bench")
-    parser.add_argument("--source_vqa_dir", default="/data2/haojitai/datasets/VQAv2")
+    parser.add_argument("--dataset_dir", default=os.getenv("SVLLM_VISUAL_CACHE_DATA_DIR", ""))
+    parser.add_argument("--source_vqa_dir", default=os.getenv("SVLLM_VQAV2_DATA_DIR", ""))
     parser.add_argument(
         "--output_dir",
-        default="",
-        help="Directory for benchmark artifacts. Defaults to --dataset_dir for backward-compatible local runs.",
+        default=default_output_path("multimodal", "visual_cache"),
+        help="Directory for benchmark artifacts.",
     )
     parser.add_argument("--num_samples", type=int, default=4)
     parser.add_argument(

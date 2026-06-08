@@ -10,7 +10,7 @@ By default, this runner loads datasets via HuggingFace Datasets:
 - AIME 2024: `load_dataset('Maxwell-Jia/AIME_2024', split='train')` (columns: `Problem`, `Answer`)
 - HMMT Nov 2025: `load_dataset('MathArena/hmmt_nov_2025', split='train')` (columns: `problem`, `answer`) (task: `hmmt_nov`)
 
-You can also place local dataset files under `--data_dir` (default: `$DELTAKV_DATA_DIR` or `/root/autodl-fs/datasets`) or pass explicit paths:
+You can also place local dataset files under `--data_dir` (default: `$SVLLM_BENCHMARK_DATA_DIR`, `$SVLLM_DATA_DIR`, or `$DELTAKV_DATA_DIR`) or pass explicit paths:
 
 - GSM8K: a `.jsonl` / `.json` file containing at least `question` and `answer` (official GSM8K uses `answer` with `#### <final>`).
 - AIME 2024: a `.jsonl` / `.json` file containing at least `Problem`/`problem` (or `question`) and `Answer`/`answer` (integer).
@@ -25,7 +25,7 @@ python benchmark/math_bench/pred.py \
   --deltakv_checkpoint_path /path/to/compressor_or_none \
   --task gsm8k,aime2024,hmmt_nov \
   --split test \
-  --data_dir /root/autodl-fs/datasets \
+  --data_dir /path/to/datasets \
   --temperature 0.6 \
   --max_new_tokens 512 \
   --batch_size 1

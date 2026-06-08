@@ -1,8 +1,14 @@
 import os
 import json
 import argparse
+import sys
+from pathlib import Path
 import numpy as np
 
+REPO_ROOT_FOR_IMPORT = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(REPO_ROOT_FOR_IMPORT))
+
+from benchmark.common.paths import benchmark_output_root
 from metrics import (
     qa_f1_score,
     rouge_zh_score,
@@ -15,7 +21,7 @@ from metrics import (
     code_sim_score,
 )
 
-BASE_PATH = os.getenv("DELTAKV_OUTPUT_DIR", "/root/autodl-fs/deltakv_outputs")
+BASE_PATH = str(benchmark_output_root())
 
 dataset2metric = {
     "narrativeqa": qa_f1_score,

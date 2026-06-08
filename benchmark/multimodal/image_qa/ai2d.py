@@ -3,16 +3,23 @@ import argparse
 import gc
 import io
 import json
+import os
 import re
 import string
+import sys
 import time
 from pathlib import Path
+
+PROJECT_ROOT = Path(__file__).resolve().parents[3]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
 
 import torch
 from datasets import load_dataset
 from PIL import Image
 from transformers import LlavaOnevisionForConditionalGeneration, LlavaOnevisionProcessor
 
+from benchmark.common.paths import default_output_path
 
 PAPER_AI2D_TARGETS = {
     "llava-onevision-qwen2-0.5b-ov-hf": 57.1,
@@ -27,11 +34,11 @@ def parse_args():
             "default prompt format used by the LLaVA-OneVision paper."
         )
     )
-    parser.add_argument("--model_path", default="/data2/haojitai/models/llava-onevision-qwen2-0.5b-ov-hf")
+    parser.add_argument("--model_path", default=os.getenv("SVLLM_LLAVA_MODEL_PATH", ""))
     parser.add_argument("--dataset_path", default="lmms-lab/ai2d")
-    parser.add_argument("--dataset_dir", default="/data2/haojitai/datasets/lmms-lab_ai2d")
-    parser.add_argument("--dataset_cache_dir", default="/data2/haojitai/datasets/hf_cache")
-    parser.add_argument("--output_dir", default="/data2/haojitai/datasets/llava_onevision_ai2d_vanilla")
+    parser.add_argument("--dataset_dir", default=os.getenv("SVLLM_AI2D_DATA_DIR", ""))
+    parser.add_argument("--dataset_cache_dir", default=os.getenv("SVLLM_HF_CACHE_DIR", ""))
+    parser.add_argument("--output_dir", default=default_output_path("multimodal", "ai2d"))
     parser.add_argument("--num_samples", type=int, default=32, help="Use -1 for the full AI2D test split.")
     parser.add_argument("--batch_size", type=int, default=4)
     parser.add_argument("--max_new_tokens", type=int, default=16)

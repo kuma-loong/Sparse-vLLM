@@ -6,6 +6,10 @@ import re
 from typing import Union
 from pathlib import Path
 
+REPO_ROOT_FOR_IMPORT = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(REPO_ROOT_FOR_IMPORT))
+sys.path.insert(0, str(REPO_ROOT_FOR_IMPORT / "src"))
+
 from tqdm import tqdm
 import numpy as np
 import random
@@ -16,21 +20,31 @@ from transformers import AutoTokenizer
 import torch.distributed as dist
 from deltakv.get_chat_api import get_generate_api
 from datetime import datetime
+from benchmark.common.paths import benchmark_output_root, longbench_data_root
 
-BASE_PATH = os.getenv("DELTAKV_OUTPUT_DIR", "/root/autodl-fs/deltakv_outputs")
-DATA_PREFIX_PATH = os.getenv(
-    "DELTAKV_LONGBENCH_DATA_DIR",
-    os.getenv("DELTAKV_DATA_DIR", "/root/autodl-fs/datasets/LongBench/"),
-)
+BASE_PATH = str(benchmark_output_root())
+DATA_PREFIX_PATH = str(longbench_data_root()) if longbench_data_root() is not None else None
 NO_CHAT_TEMPLATE_DATASETS = {"trec", "triviaqa", "samsum", "lsht", "lcc", "repobench-p"}
 
 
 def get_longbench_data_path(dataset, use_longbench_e):
+    if DATA_PREFIX_PATH is None:
+        raise FileNotFoundError(
+            "LongBench data root is not configured. Set SVLLM_LONGBENCH_DATA_DIR "
+            "or DELTAKV_LONGBENCH_DATA_DIR to a LongBench root containing data/*.jsonl. "
+            "This benchmark does not download datasets automatically."
+        )
     suffix = "_e" if use_longbench_e else ""
     return os.path.join(DATA_PREFIX_PATH, "data", f"{dataset}{suffix}.jsonl")
 
 
 def validate_longbench_data_paths(datasets, use_longbench_e):
+    if DATA_PREFIX_PATH is None:
+        raise FileNotFoundError(
+            "LongBench data root is not configured. Set SVLLM_LONGBENCH_DATA_DIR "
+            "or DELTAKV_LONGBENCH_DATA_DIR to a LongBench root containing data/*.jsonl. "
+            "This benchmark does not download datasets automatically."
+        )
     if not os.path.isdir(DATA_PREFIX_PATH):
         raise FileNotFoundError(
             "LongBench data root does not exist: "
@@ -287,7 +301,8 @@ def worker(rank, world_size, datasets, dataset2prompt, dataset2maxlen, args, out
             )
         
         data = [json.loads(line) for line in open(data_path, 'r', encoding="utf-8")]
-        if args.num_samples: data = data[:args.num_samples]
+        if args.num_samples is not None and args.num_samples > 0:
+            data = data[:args.num_samples]
         
         data_subset = data[rank::world_size]
         if not data_subset: continue

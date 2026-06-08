@@ -5,7 +5,12 @@ import random
 import subprocess
 import sys
 from datetime import datetime
+from pathlib import Path
 from typing import List
+
+REPO_ROOT_FOR_IMPORT = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(REPO_ROOT_FOR_IMPORT))
+sys.path.insert(0, str(REPO_ROOT_FOR_IMPORT / "src"))
 
 import numpy as np
 import torch
@@ -14,10 +19,11 @@ from tqdm import tqdm
 from transformers import AutoTokenizer
 
 from deltakv.get_chat_api import get_generate_api
+from benchmark.common.paths import benchmark_data_root, benchmark_output_root
 
 # Keep defaults consistent with benchmark/long_bench/pred.py, but allow env overrides.
-BASE_PATH = os.getenv("DELTAKV_OUTPUT_DIR", "/root/autodl-fs/deltakv_outputs")
-DATA_PREFIX_PATH = os.getenv("DELTAKV_DATA_DIR", "/root/autodl-fs/datasets")
+BASE_PATH = str(benchmark_output_root())
+DATA_PREFIX_PATH = str(benchmark_data_root()) if benchmark_data_root() is not None else ""
 DEFAULT_GSM8K_DATASET = ("openai/gsm8k", "main", "test")
 DEFAULT_AIME2024_DATASET = ("Maxwell-Jia/AIME_2024", None, "train")
 DEFAULT_HMMT_NOV_DATASET = ("MathArena/hmmt_nov_2025", None, "train")
@@ -342,7 +348,7 @@ def worker(rank: int, world_size: int, datasets: List[str], args, out_root: str)
                     data = _read_json_or_jsonl(data_path)
         else:
             raise ValueError(f"Unknown dataset: {dataset}")
-        if args.num_samples:
+        if args.num_samples is not None and args.num_samples > 0:
             data = data[: args.num_samples]
 
         data_subset = data[rank::world_size]
@@ -391,6 +397,7 @@ def parse_args():
     parser.add_argument("--top_k", type=int, default=0)
     parser.add_argument("--think_prefix", type=str, default="<think>\n")
     parser.add_argument("--no_force_think_prefix", action="store_false", dest="force_think_prefix")
+    parser.add_argument("--output_root", type=str, default=None)
     parser.set_defaults(force_think_prefix=True)
 
     return parser.parse_args()
@@ -412,7 +419,7 @@ if __name__ == "__main__":
             "Use another sparse_method or remove aime2024 from --task."
         )
     time_tag = datetime.now().strftime("%m%d_%H%M")
-    out_root = os.path.join(BASE_PATH, f"benchmark/math_bench/pred/{model_name}/{compressor_name}_{time_tag}")
+    out_root = args.output_root or os.path.join(BASE_PATH, f"math_bench/pred/{model_name}/{compressor_name}_{time_tag}")
     os.makedirs(out_root, exist_ok=True)
     print(f"Results will be saved in: {out_root}")
 

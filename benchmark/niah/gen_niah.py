@@ -4,6 +4,7 @@ import string
 import jsonlines
 import numpy as np
 from tqdm import tqdm
+import argparse
 
 
 def generate_text(seq_len, ratio, tokenizer):
@@ -47,15 +48,22 @@ def generate_text(seq_len, ratio, tokenizer):
 
 
 def main():
-    tokenizer = AutoTokenizer.from_pretrained("TODO")
-    seq_lens = [16000, 32000, 64000, 128000, 256000, 512000]
+    parser = argparse.ArgumentParser(description="Generate offline needle-in-a-haystack JSONL data.")
+    parser.add_argument("--tokenizer_path", required=True)
+    parser.add_argument("--output_path", default="benchmark/datasets/needle_in_haystack_tasks.jsonl")
+    parser.add_argument("--seq_lens", default="16000,32000,64000,128000,256000,512000")
+    parser.add_argument("--samples_per_setting", type=int, default=5)
+    args = parser.parse_args()
+
+    tokenizer = AutoTokenizer.from_pretrained(args.tokenizer_path, trust_remote_code=True)
+    seq_lens = [int(item) for item in args.seq_lens.split(",") if item.strip()]
     ratios = list(np.arange(0.01, 0.92, 0.1)) + [0.99]
 
     tasks = []
 
     for seq_len in seq_lens:
         for ratio in tqdm(ratios, desc=f"{seq_len}"):
-            for i in range(5):
+            for i in range(args.samples_per_setting):
                 task_text, secret_key, total_tokens, ratio = generate_text(
                     seq_len, ratio, tokenizer
                 )
@@ -68,7 +76,7 @@ def main():
                     }
                 )
 
-    with jsonlines.open("benchmark/datasets/needle_in_haystack_tasks.jsonl", mode="w") as writer:
+    with jsonlines.open(args.output_path, mode="w") as writer:
         writer.write_all(tasks)
 
 

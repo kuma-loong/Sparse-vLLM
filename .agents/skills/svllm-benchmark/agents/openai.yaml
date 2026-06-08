@@ -1,0 +1,4 @@
+interface:
+  display_name: "SVLLM Benchmark"
+  short_description: "Run Sparse-vLLM benchmarks"
+  default_prompt: "Use $svllm-benchmark to run Sparse-vLLM quick or final benchmark plans with ledgers and reliable repo-local benchmarks."

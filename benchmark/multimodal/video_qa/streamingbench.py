@@ -25,6 +25,8 @@ PROJECT_ROOT = Path(__file__).resolve().parents[3]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
+from benchmark.common.paths import default_output_path
+
 TASK_CSV_FILES = {
     "real": "Real_Time_Visual_Understanding.csv",
     "omni": "Omni_Source_Understanding.csv",
@@ -124,12 +126,12 @@ def parse_args():
             "with vanilla HF generation and no-checkpoint DeltaKV delta quantization."
         )
     )
-    parser.add_argument("--model_path", default="/data2/haojitai/models/llava-onevision-qwen2-0.5b-ov-hf")
+    parser.add_argument("--model_path", default=os.getenv("SVLLM_LLAVA_MODEL_PATH", ""))
     parser.add_argument("--deltakv_checkpoint_path", default="none")
-    parser.add_argument("--dataset_dir", default="/data2/haojitai/datasets/StreamingBench_hf")
+    parser.add_argument("--dataset_dir", default=os.getenv("SVLLM_STREAMINGBENCH_DATA_DIR", ""))
     parser.add_argument("--csv_dir", default="")
     parser.add_argument("--video_dir", default="")
-    parser.add_argument("--output_dir", default="/data2/haojitai/datasets/llava_onevision_streamingbench")
+    parser.add_argument("--output_dir", default=default_output_path("multimodal", "streamingbench"))
     parser.add_argument(
         "--tasks",
         default="real",

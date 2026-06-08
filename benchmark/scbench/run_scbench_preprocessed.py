@@ -9,13 +9,13 @@ from collections import defaultdict
 from pathlib import Path
 from typing import Any
 
-BASE_PATH = "/root/autodl-fs/deltakv_outputs"
-
 THIS_DIR = Path(__file__).resolve().parent
 REPO_ROOT = THIS_DIR.parent.parent
 
+sys.path.insert(0, str(REPO_ROOT))
 sys.path.append(str(REPO_ROOT / "src"))
 
+from benchmark.common.paths import benchmark_output_root, scbench_preprocessed_root
 from datasets import load_dataset
 from eval_utils import DATA_NAME_TO_MAX_NEW_TOKENS, dump_jsonl
 from run_scbench import load_model
@@ -32,12 +32,12 @@ def parse_args():
     parser.add_argument(
         "--data_root",
         type=str,
-        default="/root/autodl-fs/datasets/SCBench-preprocessed",
+        default=str(scbench_preprocessed_root()) if scbench_preprocessed_root() is not None else "",
     )
     parser.add_argument(
         "--output_dir",
         type=str,
-        default=f"{BASE_PATH}/benchmark/scbench_preprocessed",
+        default=str(benchmark_output_root() / "scbench_preprocessed"),
     )
     parser.add_argument("--model_name_or_path", type=str, required=True)
     parser.add_argument("--num_eval_examples", type=int, default=-1)

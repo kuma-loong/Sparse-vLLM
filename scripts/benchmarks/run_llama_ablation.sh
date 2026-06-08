@@ -1,14 +1,14 @@
 #!/bin/bash
 
-# 执行一次 git pull
-echo "Updating code..."
-git pull
-
-# 基础路径和固定参数
-MODEL_PATH="/root/autodl-fs/models/Llama-3.1-8B-Instruct"
-DATASET_PATH="/root/autodl-fs/datasets/deltakv_llama3_train_num40000_seqlen8192"
-BASE_OUTPUT_DIR="/root/autodl-fs/checkpoints/compressor"
+REPO_ROOT="${REPO_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)}"
+PYTHON="${PYTHON:-${REPO_ROOT}/.venv/bin/python}"
+MODEL_PATH="${MODEL_PATH:?Set MODEL_PATH to the base model directory}"
+DATASET_PATH="${DATASET_PATH:?Set DATASET_PATH to the compressor training dataset directory}"
+BASE_OUTPUT_DIR="${BASE_OUTPUT_DIR:?Set BASE_OUTPUT_DIR to the checkpoint output directory}"
 BASE_WANDB_GROUP="llama_hyperparams_ablation_v1"
+
+cd "${REPO_ROOT}"
+export PYTHONPATH="${REPO_ROOT}/src:${PYTHONPATH:-}"
 
 # 默认（基准）值
 DEFAULT_LATENT_DIM=512
@@ -29,7 +29,7 @@ run_train() {
     echo "Running ablation: $tag (latent_dim=$latent_dim, neighbor_count=$neighbor_count, Inter=$inter_size, Ratio=$center_ratio, GC=$gradient_checkpointing)"
     echo "----------------------------------------------------------------"
 
-    python src/deltakv/train_compressor.py \
+    "${PYTHON}" src/deltakv/train_compressor.py \
         --model_name_or_path "$MODEL_PATH" \
         --dataset_path "$DATASET_PATH" \
         --output_dir "${BASE_OUTPUT_DIR}" \

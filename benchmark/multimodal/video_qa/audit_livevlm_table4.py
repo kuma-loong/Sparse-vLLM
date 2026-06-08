@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
 import argparse
 import json
+import os
 from pathlib import Path
 
 
-DEFAULT_OUTPUT_DIR = Path("/data2/haojitai/datasets/llava_onevision_streamingbench_livevlm_table4_7b_vanilla")
-DEFAULT_EXPECTED_MODEL_PATH = Path("/data2/haojitai/models/llava-onevision-qwen2-7b-ov-hf")
+DEFAULT_OUTPUT_DIR = os.getenv("SVLLM_LIVEVLM_TABLE4_OUTPUT_DIR", "")
+DEFAULT_EXPECTED_MODEL_PATH = os.getenv("SVLLM_LLAVA_MODEL_PATH", "")
 VALID_SAMPLE_STATUSES = {
     "success",
     "invalid_input",
@@ -41,7 +42,7 @@ def parse_args():
     parser.add_argument("--metrics_path", default="", help="Path to vanilla_aggregate_metrics.json.")
     parser.add_argument(
         "--output_dir",
-        default=str(DEFAULT_OUTPUT_DIR),
+        default=DEFAULT_OUTPUT_DIR,
         help="Output directory containing vanilla_aggregate_metrics.json when --metrics_path is omitted.",
     )
     parser.add_argument("--json_out", default="", help="Optional path to write the audit summary JSON.")
@@ -53,7 +54,7 @@ def parse_args():
     )
     parser.add_argument(
         "--expected_model_path",
-        default=str(DEFAULT_EXPECTED_MODEL_PATH),
+        default=DEFAULT_EXPECTED_MODEL_PATH,
         help="Expected LLaVA-OneVision-7B model path recorded in run_info.json.",
     )
     parser.add_argument(

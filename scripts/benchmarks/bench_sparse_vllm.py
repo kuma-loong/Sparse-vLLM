@@ -1,13 +1,20 @@
-import os
 import time
 import torch
 import argparse
 import multiprocessing as mp
 import traceback
 import json
+import os
+import sys
 from pathlib import Path
 from typing import Any
 from time import perf_counter
+
+REPO_ROOT_FOR_IMPORT = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(REPO_ROOT_FOR_IMPORT))
+sys.path.insert(0, str(REPO_ROOT_FOR_IMPORT / "src"))
+
+from benchmark.common.ledger import git_metadata, selected_env_snapshot
 
 from deltakv.configs.runtime_params import normalize_runtime_params
 
@@ -250,13 +257,16 @@ def benchmark_task(method, length, bs, args, results_dict):
             "decode_scope": "full" if used_full_admission_window else "fallback",
             "staged_admission": staged_admission,
             "admission_wave_size": admission_wave_size if staged_admission else None,
-            "status": "SUCCESS"
+            "status": "success"
         }
 
     except Exception as e:
         print(f"Error at {method}/{length}/{bs}: {e}")
         traceback.print_exc()
-        results_dict[(method, length, bs)] = {"status": "FAILED"}
+        results_dict[(method, length, bs)] = {
+            "status": "model_failed",
+            "error_message": repr(e),
+        }
     finally:
         if llm is not None and hasattr(llm, "exit"):
             llm.exit()
@@ -313,6 +323,12 @@ def main():
             'Example: \'{"gpu_memory_utilization":0.9,"engine_prefill_chunk_size":4096,"tensor_parallel_size":1,"decode_keep_tokens":2048}\''
         ),
     )
+    parser.add_argument(
+        "--output_dir",
+        type=str,
+        default=None,
+        help="Optional directory for run_info.json, performance.jsonl, aggregate_metrics.json, and report.md.",
+    )
     
     args = parser.parse_args()
     try:
@@ -344,16 +360,26 @@ def main():
     for length in test_lengths:
         for bs in test_batch_sizes:
             v_res = results_dict.get(("vanilla", length, bs))
-            if v_res and v_res["status"] == "SUCCESS":
+            if v_res and v_res["status"] == "success":
                 vanilla_stats[(length, bs)] = v_res["decode_tp"]
 
+    records = []
     for method in test_methods:
         for length in test_lengths:
             for bs in test_batch_sizes:
                 res = results_dict.get((method, length, bs))
-                if not res or res["status"] in ["FAILED", "OOM"]:
-                    status_str = res["status"] if res else "UNKNOWN"
+                if not res or res["status"] not in ["success"]:
+                    status_str = res["status"] if res else "unknown"
                     print(f"{method:<12} {length:<8} {bs:<4} {status_str:<10} {'-':<12} {'-':<12} {'-':<10} {'-':<8} {'-':<10} {'-'}")
+                    records.append(
+                        {
+                            "method": method,
+                            "prompt_tokens": length,
+                            "batch_size": bs,
+                            "status": status_str,
+                            "error_message": res.get("error_message") if res else "missing result",
+                        }
+                    )
                     continue
                 
                 ttft = res["ttft"]
@@ -372,7 +398,90 @@ def main():
                 
                 speedup_str = f"{speedup:.2f}x"
                 print(f"{method:<12} {length:<8} {bs_str:<4} {ttft:<10.2f} {pre_tp:<12.1f} {dec_tp:<12.1f} {itl:<10.2f} {avg_bs:<8.1f} {mem:<10.2f} {speedup_str}")
+                records.append(
+                    {
+                        "method": method,
+                        "prompt_tokens": length,
+                        "batch_size": bs,
+                        "status": "success",
+                        "ttft_s": ttft,
+                        "prefill_tok_s": pre_tp,
+                        "decode_tok_s": dec_tp,
+                        "itl_ms": itl,
+                        "avg_active_batch_size": avg_bs,
+                        "peak_memory_gb": mem,
+                        "decode_speedup_vs_vanilla": speedup,
+                        "has_queued": has_queued,
+                        "decode_scope": res.get("decode_scope"),
+                        "staged_admission": res.get("staged_admission"),
+                    }
+                )
     print(f"{ '='*140}\n")
+
+    if args.output_dir:
+        output_dir = Path(args.output_dir).expanduser()
+        output_dir.mkdir(parents=True, exist_ok=True)
+        run_info = {
+            **git_metadata(Path(__file__).resolve().parents[2]),
+            "command": "python " + " ".join(sys.argv),
+            "model_path": args.model_path,
+            "methods": test_methods,
+            "lengths": test_lengths,
+            "batch_sizes": test_batch_sizes,
+            "output_len": args.output_len,
+            "temperature": args.temperature,
+            "top_p": args.top_p,
+            "hyper_params": args.hyper_params_dict,
+            "env": selected_env_snapshot(),
+        }
+        (output_dir / "run_info.json").write_text(json.dumps(run_info, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+        with (output_dir / "performance.jsonl").open("w", encoding="utf-8") as handle:
+            for record in records:
+                handle.write(json.dumps(record, ensure_ascii=False) + "\n")
+        with (output_dir / "per_sample_results.jsonl").open("w", encoding="utf-8") as handle:
+            for record in records:
+                handle.write(json.dumps(record, ensure_ascii=False) + "\n")
+
+        success_records = [record for record in records if record["status"] == "success"]
+        aggregate = {
+            "benchmark": "microbench",
+            "status": "success" if len(success_records) == len(records) else "model_failed",
+            "num_cases": len(records),
+            "success_cases": len(success_records),
+            "failed_cases": len(records) - len(success_records),
+            "records": records,
+        }
+        (output_dir / "aggregate_metrics.json").write_text(
+            json.dumps(aggregate, indent=2, ensure_ascii=False) + "\n",
+            encoding="utf-8",
+        )
+        report_lines = [
+            "# Sparse-vLLM Microbenchmark",
+            "",
+            f"- Model: `{args.model_path}`",
+            f"- Methods: `{','.join(test_methods)}`",
+            f"- Lengths: `{','.join(str(x) for x in test_lengths)}`",
+            f"- Batch sizes: `{','.join(str(x) for x in test_batch_sizes)}`",
+            f"- Output length: `{args.output_len}`",
+            "",
+            "| Method | Prompt tokens | Batch | Status | TTFT s | Prefill tok/s | Decode tok/s | Peak GB | Decode speedup |",
+            "| --- | ---: | ---: | --- | ---: | ---: | ---: | ---: | ---: |",
+        ]
+        for record in records:
+            report_lines.append(
+                "| {method} | {prompt_tokens} | {batch_size} | {status} | {ttft} | {prefill} | {decode} | {mem} | {speedup} |".format(
+                    method=record["method"],
+                    prompt_tokens=record["prompt_tokens"],
+                    batch_size=record["batch_size"],
+                    status=record["status"],
+                    ttft=f"{record.get('ttft_s', 0):.3f}" if record["status"] == "success" else "",
+                    prefill=f"{record.get('prefill_tok_s', 0):.1f}" if record["status"] == "success" else "",
+                    decode=f"{record.get('decode_tok_s', 0):.1f}" if record["status"] == "success" else "",
+                    mem=f"{record.get('peak_memory_gb', 0):.2f}" if record["status"] == "success" else "",
+                    speedup=f"{record.get('decode_speedup_vs_vanilla', 0):.2f}" if record["status"] == "success" else "",
+                )
+            )
+        (output_dir / "report.md").write_text("\n".join(report_lines) + "\n", encoding="utf-8")
 
 
 if __name__ == "__main__":

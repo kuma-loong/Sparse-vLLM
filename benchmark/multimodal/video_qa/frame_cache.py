@@ -14,15 +14,16 @@ PROJECT_ROOT = Path(__file__).resolve().parents[3]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
+from benchmark.common.paths import default_output_path
 from benchmark.multimodal.video_qa import streamingbench
 
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Prepare StreamingBench frame cache without loading the VLM.")
-    parser.add_argument("--dataset_dir", default="/data2/haojitai/datasets/StreamingBench_hf")
+    parser.add_argument("--dataset_dir", default=os.getenv("SVLLM_STREAMINGBENCH_DATA_DIR", ""))
     parser.add_argument("--csv_dir", default="")
     parser.add_argument("--video_dir", default="")
-    parser.add_argument("--output_dir", required=True)
+    parser.add_argument("--output_dir", default=default_output_path("multimodal", "streamingbench_frame_cache"))
     parser.add_argument("--frame_cache_dir", default="")
     parser.add_argument("--tasks", default="livevlm_table4")
     parser.add_argument(

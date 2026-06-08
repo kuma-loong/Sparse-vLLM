@@ -3,25 +3,37 @@ set -euo pipefail
 
 TAG="${1:-$(date +%m%d_%H%M%S)}"
 TASKS="scbench_kv,scbench_qa_eng,scbench_summary_with_needles"
-MODEL_PATH="/root/autodl-fs/models/Qwen2.5-7B-Instruct-1M"
-DELTAKV_CHECKPOINT_PATH="/root/autodl-fs/checkpoints/compressor/cluster_e2e_cs256_biasFalse_l2_ratio0.1_clusMean_before_rope_lr0.0002_cdownmlp_swiglud3072_cuplinear_0125_222950"
+REPO_ROOT="${REPO_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)}"
+PYTHON="${PYTHON:-${REPO_ROOT}/.venv/bin/python}"
+MODEL_PATH="${MODEL_PATH:?Set MODEL_PATH to the model directory}"
+DELTAKV_CHECKPOINT_PATH="${DELTAKV_CHECKPOINT_PATH:?Set DELTAKV_CHECKPOINT_PATH to the compressor checkpoint directory}"
+SCBENCH_PREPROCESSED_ROOT="${SVLLM_SCBENCH_PREPROCESSED_ROOT:-${SCBENCH_PREPROCESSED_ROOT:-}}"
+if [[ -z "${SCBENCH_PREPROCESSED_ROOT}" ]]; then
+  echo "Set SVLLM_SCBENCH_PREPROCESSED_ROOT or SCBENCH_PREPROCESSED_ROOT to the directory containing scbench_*.parquet" >&2
+  exit 2
+fi
 
-KVZIP_LOG="/root/autodl-fs/bench_logs/scbench_three_kvzip_${TAG}.log"
-DELTAKV_LOG="/root/autodl-fs/bench_logs/scbench_three_deltakv_${TAG}.log"
+LOG_DIR="${SVLLM_BENCHMARK_LOG_DIR:-${REPO_ROOT}/benchmark/results/logs}"
+OUTPUT_DIR="${SVLLM_BENCHMARK_OUTPUT_DIR:-${REPO_ROOT}/benchmark/results}/scbench_preprocessed"
+KVZIP_LOG="${LOG_DIR}/scbench_three_kvzip_${TAG}.log"
+DELTAKV_LOG="${LOG_DIR}/scbench_three_deltakv_${TAG}.log"
 
-mkdir -p /root/autodl-fs/bench_logs
+mkdir -p "${LOG_DIR}"
 
-export https_proxy="http://localhost:7890"
-export http_proxy="http://localhost:7890"
-export SCBENCH_PREPROCESSED_ROOT="/root/autodl-fs/datasets/SCBench-preprocessed"
+if [[ "${USE_PROXY_7890:-0}" == "1" ]]; then
+  export https_proxy="${https_proxy:-http://localhost:7890}"
+  export http_proxy="${http_proxy:-http://localhost:7890}"
+fi
+export SCBENCH_PREPROCESSED_ROOT
 
-cd /root/autodl-tmp/Sparse-vLLM
-export PYTHONPATH="/root/autodl-tmp/Sparse-vLLM/src:${PYTHONPATH:-}"
+cd "${REPO_ROOT}"
+export PYTHONPATH="${REPO_ROOT}/src:${PYTHONPATH:-}"
 
 echo "[START] kvzip $(date)"
-/root/miniconda3/bin/conda run -n kv --no-capture-output \
-  python -u benchmark/scbench/run_kvzip_preprocessed.py \
+"${PYTHON}" -u benchmark/scbench/run_kvzip_preprocessed.py \
   --task "${TASKS}" \
+  --data_root "${SCBENCH_PREPROCESSED_ROOT}" \
+  --output_dir "${OUTPUT_DIR}" \
   --model_name_or_path "${MODEL_PATH}" \
   --num_eval_examples -1 \
   --max_seq_length 131072 \
@@ -43,9 +55,10 @@ DELTAKV_HYPER_PARAM='{
 }'
 
 echo "[START] deltakv $(date)"
-/root/miniconda3/bin/conda run -n kv --no-capture-output \
-  python -u benchmark/scbench/run_scbench_preprocessed.py \
+"${PYTHON}" -u benchmark/scbench/run_scbench_preprocessed.py \
   --task "${TASKS}" \
+  --data_root "${SCBENCH_PREPROCESSED_ROOT}" \
+  --output_dir "${OUTPUT_DIR}" \
   --model_name_or_path "${MODEL_PATH}" \
   --attn_type deltakv \
   --num_eval_examples -1 \

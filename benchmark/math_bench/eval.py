@@ -2,7 +2,16 @@ import argparse
 import json
 import os
 import re
+import sys
+from pathlib import Path
 from typing import Optional
+
+REPO_ROOT_FOR_IMPORT = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(REPO_ROOT_FOR_IMPORT))
+
+from benchmark.common.paths import benchmark_output_root
+
+BASE_PATH = str(benchmark_output_root())
 
 
 def _find_last_boxed(text: str) -> Optional[str]:

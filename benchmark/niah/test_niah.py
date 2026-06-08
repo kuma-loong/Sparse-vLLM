@@ -1,8 +1,10 @@
 import json
 import os
 import time
+import sys
 from collections import defaultdict
 from datetime import datetime
+from pathlib import Path
 
 import matplotlib.pyplot as plt
 import pandas as pd
@@ -12,10 +14,15 @@ import jsonlines
 from tqdm import tqdm
 from transformers import AutoTokenizer
 
+REPO_ROOT_FOR_IMPORT = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(REPO_ROOT_FOR_IMPORT))
+sys.path.insert(0, str(REPO_ROOT_FOR_IMPORT / "src"))
+
 from deltakv.get_chat_api import get_generate_api
 from benchmark.niah.gen_niah import generate_text
+from benchmark.common.paths import benchmark_output_root
 
-BASE_PATH = os.environ.get("DELTAKV_OUTPUT_BASE", '/root/autodl-fs/deltakv_outputs')
+BASE_PATH = str(benchmark_output_root())
 
 
 def _load_or_generate_data(
@@ -158,10 +165,17 @@ def test(
         compressor_name = "None"
     
     time_tag = datetime.now().strftime("%m%d_%H%M")
-    output_dir = os.path.join(BASE_PATH, output_path, f"{compressor_name}_{time_tag}")
+    output_path_obj = Path(output_path).expanduser()
+    if output_path_obj.is_absolute():
+        output_dir = str(output_path_obj)
+    else:
+        output_dir = os.path.join(BASE_PATH, output_path, f"{compressor_name}_{time_tag}")
     os.makedirs(output_dir, exist_ok=True)
     json_save_path = os.path.join(output_dir, "accuracy_rates.json")
     heatmap_save_path = os.path.join(output_dir, "accuracy_heatmap.pdf")
+    raw_outputs_path = os.path.join(output_dir, "raw_outputs.jsonl")
+    per_sample_path = os.path.join(output_dir, "per_sample_results.jsonl")
+    aggregate_path = os.path.join(output_dir, "aggregate_metrics.json")
     print(f"Results will be saved in: {output_dir}")
 
     # 如果min_new_tokens > 1，则强制生成固定长度的token
@@ -192,6 +206,7 @@ def test(
     total_counts = defaultdict(int)
     correct_predictions = 0
     total_iterations = 0
+    records = []
 
     for item in tqdm(data, desc="Testing..."):
         # 将 total_tokens 转换为千为单位，方便分组
@@ -213,16 +228,31 @@ def test(
         print(f"Context(k)-Depth: {accuracy_key}, Response: {response}")
 
         # 检查答案是否正确
+        correct = item["answer"] in response
+        elapsed_time = round(time.time() - start_time, 3)
         if item["answer"] in response:
             correct_predictions += 1
             accuracies[accuracy_key] += 1
-            elapsed_time = round(time.time() - start_time, 3)
             overall_accuracy = round(correct_predictions / total_iterations, 3)
             print(
                 f"✅ Correct! | Key: {accuracy_key} | Time: {elapsed_time}s | Overall Acc: {overall_accuracy}"
             )
         else:
             print(f"❌ Incorrect. | Key: {accuracy_key}")
+        records.append(
+            {
+                "sample_id": total_iterations - 1,
+                "task": "niah",
+                "status": "success",
+                "context_k_tokens": context_k,
+                "depth_ratio": depth_ratio,
+                "answer": item["answer"],
+                "prediction": response,
+                "correct": correct,
+                "elapsed_s": elapsed_time,
+                "total_tokens": item["total_tokens"],
+            }
+        )
 
     accuracy_rates = {
         key: round(accuracies[key] / total_counts[key], 3)
@@ -236,6 +266,23 @@ def test(
     with open(json_save_path, "w") as f:
         json.dump(accuracy_rates, f, indent=4)
     print(f"\nResults saved to {json_save_path}")
+    with open(raw_outputs_path, "w", encoding="utf-8") as f:
+        for record in records:
+            f.write(json.dumps(record, ensure_ascii=False) + "\n")
+    with open(per_sample_path, "w", encoding="utf-8") as f:
+        for record in records:
+            f.write(json.dumps(record, ensure_ascii=False) + "\n")
+    aggregate = {
+        "benchmark": "niah",
+        "status": "success",
+        "num_samples": len(records),
+        "correct": correct_predictions,
+        "accuracy": round(correct_predictions / max(total_iterations, 1), 4),
+        "accuracy_rates": accuracy_rates,
+    }
+    with open(aggregate_path, "w", encoding="utf-8") as f:
+        json.dump(aggregate, f, ensure_ascii=False, indent=2)
+        f.write("\n")
 
     # --- Generate and Save Heatmap ---
     if not accuracy_rates:

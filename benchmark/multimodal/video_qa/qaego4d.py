@@ -4,6 +4,7 @@ import csv
 import gc
 import hashlib
 import json
+import os
 import re
 import shutil
 import sys
@@ -18,6 +19,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[3]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
+from benchmark.common.paths import default_output_path
 from benchmark.multimodal.model_adapters.llava_onevision import (
     batch_to_device,
     ensure_left_padding,
@@ -37,12 +39,12 @@ def parse_args():
             "ReKV-style prompt, and accuracy."
         )
     )
-    parser.add_argument("--model_path", default="/data2/haojitai/models/llava-onevision-qwen2-7b-ov-hf")
+    parser.add_argument("--model_path", default=os.getenv("SVLLM_LLAVA_MODEL_PATH", ""))
     parser.add_argument("--deltakv_checkpoint_path", default="none")
-    parser.add_argument("--dataset_dir", default="/data2/haojitai/datasets/rekv_qaego4d")
+    parser.add_argument("--dataset_dir", default=os.getenv("SVLLM_QAEGO4D_DATA_DIR", ""))
     parser.add_argument("--anno_path", default="")
     parser.add_argument("--video_dir", default="")
-    parser.add_argument("--output_dir", default="/data2/haojitai/datasets/llava_onevision_rekv_qaego4d")
+    parser.add_argument("--output_dir", default=default_output_path("multimodal", "qaego4d"))
     parser.add_argument("--methods", default="vanilla,deltakv_delta_quant")
     parser.add_argument("--num_samples", type=int, default=32, help="Number of QA pairs to evaluate. Use -1 for all 500.")
     parser.add_argument("--sample_start", type=int, default=0)
