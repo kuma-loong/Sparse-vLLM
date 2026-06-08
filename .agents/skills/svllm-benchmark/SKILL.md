@@ -24,7 +24,7 @@ Default to pure-text benchmarks. The normal quick/final path is sanity, microben
 
 Use this priority order.
 
-1. **Performance/microbench**: `scripts/benchmarks/bench_sparse_vllm.py` for TTFT, TPOT, prefill tok/s, decode tok/s, and peak memory. Standard microbench runs should include 256k context unless the user explicitly asks for a shorter smoke test.
+1. **Performance/microbench**: `scripts/benchmarks/bench_sparse_vllm.py` for TTFT, TPOT, prefill tok/s, decode tok/s, and peak memory. Standard microbench runs should include 256k context unless the user explicitly asks for a shorter smoke test. Use fixed decode lengths: 512 output tokens for 1k/4k/16k contexts and 1024 output tokens for 32k and longer contexts.
 2. **Quick correctness**: `benchmark/niah/test_niah.py` for controllable long-context retrieval.
 3. **Real quality**: `benchmark/long_bench/pred.py` and `benchmark/long_bench/eval.py`.
 4. **KV cache lifecycle**: `benchmark/scbench/run_scbench_preprocessed.py`.

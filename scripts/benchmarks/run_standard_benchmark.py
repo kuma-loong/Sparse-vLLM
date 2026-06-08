@@ -134,37 +134,57 @@ def build_jobs(args: argparse.Namespace, run_root: Path) -> list[BenchmarkJob]:
         )
 
     if wanted("microbench"):
-        out = _job_output(run_root, "microbench")
-        cmd = _python_cmd(
-            "scripts/benchmarks/bench_sparse_vllm.py",
-            "--model_path",
-            args.model_path,
-            "--methods",
-            methods,
-            "--lengths",
-            args.lengths,
-            "--batch_sizes",
-            args.batch_sizes,
-            "--output_len",
-            str(args.microbench_output_len),
-            "--output_dir",
-            str(out),
-        )
-        if method_config:
-            cmd.extend(["--hyper_params", _json_cli(method_config)])
-        jobs.append(
-            BenchmarkJob(
-                name="microbench",
-                tier="Tier 0",
-                source="repo_existing",
-                command=cmd,
-                output_dir=out,
-                dataset="synthetic",
-                sample_policy=args.sample_policy,
-                lengths=_split_ints(args.lengths),
-                max_new_tokens=args.microbench_output_len,
+        if args.microbench_output_len is None:
+            selected_lengths = _split_ints(args.lengths)
+            unsupported_lengths = [
+                length for length in selected_lengths if 16000 < length < 32000
+            ]
+            if unsupported_lengths:
+                raise ValueError(
+                    "Default microbench output length is only fixed for <=16k and >=32k contexts. "
+                    f"Unsupported lengths: {unsupported_lengths}. Pass --microbench_output_len explicitly."
+                )
+            microbench_specs = [
+                ("microbench_decode512", [length for length in selected_lengths if length <= 16000], 512),
+                ("microbench_decode1024", [length for length in selected_lengths if length >= 32000], 1024),
+            ]
+        else:
+            microbench_specs = [("microbench", _split_ints(args.lengths), args.microbench_output_len)]
+
+        for job_name, job_lengths, output_len in microbench_specs:
+            if not job_lengths:
+                continue
+            out = _job_output(run_root, job_name)
+            cmd = _python_cmd(
+                "scripts/benchmarks/bench_sparse_vllm.py",
+                "--model_path",
+                args.model_path,
+                "--methods",
+                methods,
+                "--lengths",
+                ",".join(str(length) for length in job_lengths),
+                "--batch_sizes",
+                args.batch_sizes,
+                "--output_len",
+                str(output_len),
+                "--output_dir",
+                str(out),
             )
-        )
+            if method_config:
+                cmd.extend(["--hyper_params", _json_cli(method_config)])
+            jobs.append(
+                BenchmarkJob(
+                    name=job_name,
+                    tier="Tier 0",
+                    source="repo_existing",
+                    command=cmd,
+                    output_dir=out,
+                    dataset="synthetic",
+                    sample_policy=args.sample_policy,
+                    lengths=job_lengths,
+                    max_new_tokens=output_len,
+                )
+            )
 
     if wanted("niah"):
         out = _job_output(run_root, "niah")
@@ -423,7 +443,7 @@ def run_job(args: argparse.Namespace, job: BenchmarkJob, ledger_jsonl: Path, led
         "lengths": job.lengths,
         "max_new_tokens": job.max_new_tokens,
         "decode_config": {
-            "microbench_output_len": args.microbench_output_len,
+            "microbench_output_len": job.max_new_tokens if job.name.startswith("microbench") else args.microbench_output_len,
             "math_temperature": args.math_temperature,
         },
         "gpu": os.getenv("CUDA_VISIBLE_DEVICES", f"cuda_device={args.cuda_device}"),
@@ -502,8 +522,6 @@ def apply_mode_defaults(args: argparse.Namespace) -> None:
         args.sample_policy = "smoke" if args.mode == "quick" else "full"
     if args.lengths is None:
         args.lengths = "1024,4096,16000,32000,64000,128000,256000"
-    if args.microbench_output_len is None:
-        args.microbench_output_len = 8 if args.mode == "quick" else 32
     if args.niah_context_lengths is None:
         args.niah_context_lengths = "16,32" if args.mode == "quick" else "16,32,64,128"
     if args.longbench_tasks is None:
