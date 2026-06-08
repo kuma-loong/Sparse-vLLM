@@ -31,6 +31,7 @@ dependencies = [
     "fuzzywuzzy",
     "loguru",
     "jieba",
+    "jsonlines",
     "rich",
     "rouge",
     "fastapi",
