@@ -501,7 +501,7 @@ def apply_mode_defaults(args: argparse.Namespace) -> None:
     if args.sample_policy is None:
         args.sample_policy = "smoke" if args.mode == "quick" else "full"
     if args.lengths is None:
-        args.lengths = "1024,4096,16000,32000" if args.mode == "quick" else "1024,4096,16000,32000,64000,128000"
+        args.lengths = "1024,4096,16000,32000,64000,128000,256000"
     if args.microbench_output_len is None:
         args.microbench_output_len = 8 if args.mode == "quick" else 32
     if args.niah_context_lengths is None:

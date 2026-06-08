@@ -104,7 +104,7 @@ KV 压缩 / sparse decode：
 
 - 5 到 10 条短 prompt sanity check。
 - 固定长度 synthetic prompt 性能测试。
-- 长度：1k、4k、16k、32k；最终报告扩展到 64k、128k、256k、512k。
+- 长度：1k、4k、16k、32k、64k、128k、256k；最终报告可按需要扩展到 512k。
 - 输出长度：建议 1、8、32 三档；1 用于 TTFT/prefill，8/32 用于 decode。
 
 判定：
