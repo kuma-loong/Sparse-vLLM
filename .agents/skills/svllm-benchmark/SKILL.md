@@ -7,6 +7,8 @@ description: Run Sparse-vLLM benchmarks according to the standard benchmark desi
 
 Use this skill when running or interpreting Sparse-vLLM benchmark work. Follow the plan in `dev_docs/plan/benchmark/standard_benchmark_design.md`.
 
+Default to pure-text benchmarks. The normal quick/final path is sanity, microbench, NIAH, LongBench, SCBench, and MathBench. Multimodal benchmarks are optional and should only be selected when the user explicitly asks for visual KV, LLaVA-OneVision, Video-MME, StreamingBench, AI2D, or visual-cache evaluation.
+
 ## Core Rules
 
 1. Prefer repo-local reliable benchmarks before external benchmarks.
@@ -27,9 +29,9 @@ Use this priority order.
 3. **Real quality**: `benchmark/long_bench/pred.py` and `benchmark/long_bench/eval.py`.
 4. **KV cache lifecycle**: `benchmark/scbench/run_scbench_preprocessed.py`.
 5. **Reasoning regression**: `benchmark/math_bench/pred.py`.
-6. **Visual cache**: `benchmark/multimodal/visual_cache/run_visual_cache.py`, Video-MME, StreamingBench, or AI2D only for multimodal changes.
+6. **Optional visual cache**: `benchmark/multimodal/visual_cache/run_visual_cache.py`, Video-MME, StreamingBench, or AI2D only for explicit multimodal changes.
 
-External benchmarks such as RULER, MRCR, NoLiMa, HELMET, InfiniteBench, LV-Eval, and LongBench v2 are final-report additions or capability-gap fillers. Do not introduce them before the repo-local path is working.
+External text benchmarks such as RULER, MRCR, NoLiMa, HELMET, InfiniteBench, LV-Eval, and LongBench v2 are final-report additions or capability-gap fillers. Do not introduce them before the repo-local text path is working.
 
 ## Standard Runner
 
@@ -70,7 +72,7 @@ Set only the variables needed by the chosen benchmarks.
 - LongBench: `SVLLM_LONGBENCH_DATA_DIR` or `DELTAKV_LONGBENCH_DATA_DIR`, pointing to a root with `data/*.jsonl`.
 - SCBench preprocessed: `SVLLM_SCBENCH_PREPROCESSED_ROOT` or `SCBENCH_PREPROCESSED_ROOT`, pointing to a directory with `scbench_*.parquet`.
 - General local data: `SVLLM_BENCHMARK_DATA_DIR`, `SVLLM_DATA_DIR`, or `DELTAKV_DATA_DIR`.
-- Multimodal: `SVLLM_LLAVA_MODEL_PATH` plus dataset-specific variables such as `SVLLM_STREAMINGBENCH_DATA_DIR`, `SVLLM_VIDEOMME_DATA_DIR`, `SVLLM_AI2D_DATA_DIR`, `SVLLM_VISUAL_CACHE_DATA_DIR`, and `SVLLM_VQAV2_DATA_DIR`.
+- Optional multimodal: `SVLLM_LLAVA_MODEL_PATH` plus dataset-specific variables such as `SVLLM_STREAMINGBENCH_DATA_DIR`, `SVLLM_VIDEOMME_DATA_DIR`, `SVLLM_AI2D_DATA_DIR`, `SVLLM_VISUAL_CACHE_DATA_DIR`, and `SVLLM_VQAV2_DATA_DIR`.
 
 Use `--use_proxy_7890` on the standard runner only when the user confirms mainland network constraints and proxy availability.
 
