@@ -210,8 +210,8 @@ def load_scbench_preprocessed_dataset(data_root: str | Path, data_name: str):
         if hf_snapshot_path.is_dir():
             hint = (
                 " The path looks like a raw Hugging Face SCBench snapshot. "
-                "Run benchmark/scbench/prepare_preprocessed.py first and point "
-                "SVLLM_SCBENCH_PREPROCESSED_ROOT to its output directory."
+                "Point SVLLM_SCBENCH_PREPROCESSED_ROOT or benchmark/data/SCBench-preprocessed "
+                "to the already prepared flat parquet directory."
             )
         raise FileNotFoundError(f"Missing SCBench preprocessed parquet: {path}.{hint}")
 

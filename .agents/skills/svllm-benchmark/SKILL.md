@@ -76,15 +76,6 @@ Set only the variables needed by the chosen benchmarks.
 
 If no environment variable is set, benchmark scripts also look for repo-local ignored data links at `benchmark/data/LongBench` and `benchmark/data/SCBench-preprocessed`.
 
-If the user provides the raw `microsoft/SCBench` Hugging Face snapshot, prepare it explicitly before running benchmarks:
-
-```bash
-.venv/bin/python benchmark/scbench/prepare_preprocessed.py \
-  --source_root <SCBench-raw-root> \
-  --output_root <SCBench-preprocessed-root> \
-  --tasks all
-```
-
 Use `--use_proxy_7890` on the standard runner only when the user confirms mainland network constraints and proxy availability.
 
 ## Interpreting Results
