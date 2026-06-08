@@ -74,6 +74,17 @@ Set only the variables needed by the chosen benchmarks.
 - General local data: `SVLLM_BENCHMARK_DATA_DIR`, `SVLLM_DATA_DIR`, or `DELTAKV_DATA_DIR`.
 - Optional multimodal: `SVLLM_LLAVA_MODEL_PATH` plus dataset-specific variables such as `SVLLM_STREAMINGBENCH_DATA_DIR`, `SVLLM_VIDEOMME_DATA_DIR`, `SVLLM_AI2D_DATA_DIR`, `SVLLM_VISUAL_CACHE_DATA_DIR`, and `SVLLM_VQAV2_DATA_DIR`.
 
+If no environment variable is set, benchmark scripts also look for repo-local ignored data links at `benchmark/data/LongBench` and `benchmark/data/SCBench-preprocessed`.
+
+If the user provides the raw `microsoft/SCBench` Hugging Face snapshot, prepare it explicitly before running benchmarks:
+
+```bash
+.venv/bin/python benchmark/scbench/prepare_preprocessed.py \
+  --source_root <SCBench-raw-root> \
+  --output_root <SCBench-preprocessed-root> \
+  --tasks all
+```
+
 Use `--use_proxy_7890` on the standard runner only when the user confirms mainland network constraints and proxy availability.
 
 ## Interpreting Results

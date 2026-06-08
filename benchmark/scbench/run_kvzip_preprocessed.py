@@ -17,8 +17,7 @@ sys.path.append(str(REPO_ROOT / "src"))
 sys.path.insert(0, str(REPO_ROOT / "baselines" / "kvzip"))
 
 from benchmark.common.paths import benchmark_output_root, scbench_preprocessed_root
-from datasets import load_dataset
-from eval_utils import DATA_NAME_TO_MAX_NEW_TOKENS, dump_jsonl
+from eval_utils import DATA_NAME_TO_MAX_NEW_TOKENS, dump_jsonl, load_scbench_preprocessed_dataset
 from tqdm import tqdm
 
 from data.wrapper import get_query
@@ -159,11 +158,7 @@ def prediction_path(result_dir: Path, data_name: str, rank: int | None = None) -
 
 
 def load_preprocessed_dataset(args, data_name: str):
-    dataset = load_dataset(
-        "parquet",
-        data_files=str(Path(args.data_root) / f"{data_name}.parquet"),
-        split="train",
-    )
+    dataset = load_scbench_preprocessed_dataset(args.data_root, data_name)
     if args.num_eval_examples != -1:
         dataset = dataset.select(range(min(args.num_eval_examples, len(dataset))))
     return dataset

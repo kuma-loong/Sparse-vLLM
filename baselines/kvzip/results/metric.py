@@ -5,8 +5,6 @@
 import re
 import string
 from collections import Counter, defaultdict
-from rouge import Rouge
-from results.repo_qa_utils import compute_score as compute_repoqa_score
 
 
 def normalize_answer(s):
@@ -47,6 +45,8 @@ def normalize_answer(s):
 
 
 def rouge_score(prediction, ground_truth, **kwargs):
+    from rouge import Rouge
+
     rouge = Rouge()
     try:
         scores = rouge.get_scores([prediction], [ground_truth], avg=True)
@@ -124,6 +124,8 @@ def exact_match_score(pred, ref, normalize=True):
 
 
 def repoqa_score(preds, refs, subtask=None):
+    from results.repo_qa_utils import compute_score as compute_repoqa_score
+
     needle_by_repo = defaultdict(list)
     for name, gt in zip(refs["func_name"], refs["ground_truth"]):
         needle_by_repo[refs["repo"]].append({"needle": gt, "name": name})

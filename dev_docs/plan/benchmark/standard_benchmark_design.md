@@ -238,6 +238,31 @@ python benchmark/scbench/run_scbench_preprocessed.py \
   --hyper_param '<json>'
 ```
 
+如果本地只有 `microsoft/SCBench` 的 HuggingFace snapshot（例如每个任务目录下是 `test-*.parquet`，或 `data/scbench_*.jsonl`），先显式转换成当前 runner 消费的 flat preprocessed parquet：
+
+```bash
+.venv/bin/python benchmark/scbench/prepare_preprocessed.py \
+  --source_root <SCBench-raw-root> \
+  --output_root <SCBench-preprocessed-root> \
+  --tasks all
+```
+
+转换后设置：
+
+```bash
+export SVLLM_SCBENCH_PREPROCESSED_ROOT=<SCBench-preprocessed-root>
+```
+
+也可以把本地数据链接到仓库忽略目录，让 benchmark 脚本在没有环境变量时直接发现：
+
+```bash
+mkdir -p benchmark/data
+ln -sfn <LongBench-root> benchmark/data/LongBench
+ln -sfn <SCBench-preprocessed-root> benchmark/data/SCBench-preprocessed
+```
+
+`run_scbench_preprocessed.py` 只接受带有 `prompts` 和 `ground_truth` 列的 preprocessed parquet。传入 raw snapshot 时应在数据校验阶段快速失败，不应先加载模型。
+
 需要额外记录：
 
 - mode：multi-turn 或 multi-request/SCDQ。

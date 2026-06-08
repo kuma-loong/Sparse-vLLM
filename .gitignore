@@ -8,6 +8,7 @@ __pycache__/
 wandb/
 /tmp/
 /outputs/
+/benchmark/data/
 /benchmark/scbench/results/
 /benchmark/results/
 /reference/
@@ -15,5 +16,4 @@ wandb/
 # Temp
 RoadMap.md
 NOTE.md
-
 

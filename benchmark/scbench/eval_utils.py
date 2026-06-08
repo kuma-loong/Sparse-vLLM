@@ -13,10 +13,9 @@ from collections import Counter
 from pathlib import Path
 
 import copy
-import jieba
 import torch
 import torch.profiler
-from rouge import Rouge
+from datasets import load_dataset
 from tqdm import tqdm
 from transformers import GenerationConfig, SinkCache
 
@@ -198,6 +197,33 @@ def dump_jsonl(data, fname):
 def dump_json(data, fname):
     with open(fname, "w", encoding="utf8") as fout:
         json.dump(data, fout, indent=2, ensure_ascii=False)
+
+
+def load_scbench_preprocessed_dataset(data_root: str | Path, data_name: str):
+    root = Path(data_root).expanduser()
+    path = root / f"{data_name}.parquet"
+    if not root.is_dir():
+        raise FileNotFoundError(f"SCBench preprocessed data root does not exist: {root}")
+    if not path.is_file():
+        hf_snapshot_path = root / data_name
+        hint = ""
+        if hf_snapshot_path.is_dir():
+            hint = (
+                " The path looks like a raw Hugging Face SCBench snapshot. "
+                "Run benchmark/scbench/prepare_preprocessed.py first and point "
+                "SVLLM_SCBENCH_PREPROCESSED_ROOT to its output directory."
+            )
+        raise FileNotFoundError(f"Missing SCBench preprocessed parquet: {path}.{hint}")
+
+    dataset = load_dataset("parquet", data_files=str(path), split="train")
+    required_columns = {"prompts", "ground_truth"}
+    missing = sorted(required_columns.difference(dataset.column_names))
+    if missing:
+        raise ValueError(
+            f"SCBench preprocessed parquet has wrong schema: {path}. "
+            f"Missing columns: {missing}. Expected at least {sorted(required_columns)}."
+        )
+    return dataset
 
 
 def load_data(
@@ -953,6 +979,8 @@ def in_match(prediction, ground_truth):
 
 
 def rouge_score(prediction, ground_truth, **kwargs) -> float:
+    from rouge import Rouge
+
     rouge = Rouge()
     try:
         scores = rouge.get_scores([prediction], [ground_truth], avg=True)
@@ -962,6 +990,8 @@ def rouge_score(prediction, ground_truth, **kwargs) -> float:
 
 
 def rouge_zh_score(prediction, ground_truth, **kwargs):
+    import jieba
+
     prediction = " ".join(list(jieba.cut(prediction, cut_all=False)))
     ground_truth = " ".join(list(jieba.cut(ground_truth, cut_all=False)))
     score = rouge_score(prediction, ground_truth)
@@ -1000,6 +1030,8 @@ def qa_f1_score(line):
 
 
 def qa_f1_zh_score(prediction, ground_truth, **kwargs):
+    import jieba
+
     prediction_tokens = list(jieba.cut(prediction, cut_all=False))
     ground_truth_tokens = list(jieba.cut(ground_truth, cut_all=False))
     prediction_tokens = [normalize_zh_answer(token) for token in prediction_tokens]

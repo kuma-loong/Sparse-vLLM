@@ -10,12 +10,29 @@ import string
 from collections import Counter
 from pathlib import Path
 
-import evaluate
 from args import parse_args
-from repo_qa_utils import compute_score as compute_repoqa_score
 from tqdm import tqdm
 
-ROUGE_SCORER = evaluate.load("rouge")
+ROUGE_SCORER = None
+COMPUTE_REPOQA_SCORE = None
+
+
+def get_rouge_scorer():
+    global ROUGE_SCORER
+    if ROUGE_SCORER is None:
+        import evaluate
+
+        ROUGE_SCORER = evaluate.load("rouge")
+    return ROUGE_SCORER
+
+
+def get_compute_repoqa_score():
+    global COMPUTE_REPOQA_SCORE
+    if COMPUTE_REPOQA_SCORE is None:
+        from repo_qa_utils import compute_score
+
+        COMPUTE_REPOQA_SCORE = compute_score
+    return COMPUTE_REPOQA_SCORE
 
 
 def normalize_answer(s: str) -> str:
@@ -297,7 +314,7 @@ def get_score_one_longbook_qa_eng(pred, label, model_name: str) -> float:
 
 
 def get_score_one_longbook_sum_eng(pred: str, label: str, model_name: str) -> float:
-    score = ROUGE_SCORER.compute(
+    score = get_rouge_scorer().compute(
         predictions=[pred], references=[label], use_aggregator=False
     )
     return score["rougeLsum"][0]  # type: ignore
@@ -455,7 +472,7 @@ def compute_scores(
     if scdq_mode:
         if task_name == "scbench_repoqa":
             labels = get_labels(preds)
-            acc = compute_repoqa_score(model_name, preds, labels, needle_by_repo)
+            acc = get_compute_repoqa_score()(model_name, preds, labels, needle_by_repo)
         elif task_name == "scbench_summary_with_needles":
             subtasks = ["scbench_summary", "scbench_passkey"]
             acc = {}
@@ -486,7 +503,7 @@ def compute_scores(
                     continue
 
                 if subtask == "scbench_repoqa":
-                    acc_ = compute_repoqa_score(
+                    acc_ = get_compute_repoqa_score()(
                         model_name, preds_, labels, needle_by_repo
                     )
                     acc_ = acc_[model_name]["scores"]["all"][0.8]["pass@1"]
@@ -555,7 +572,7 @@ def compute_scores(
     for turn_idx, preds in preds_by_turns.items():
         if task_name == "scbench_repoqa":
             labels = get_labels(preds)
-            acc = compute_repoqa_score(model_name, preds, labels, needle_by_repo)
+            acc = get_compute_repoqa_score()(model_name, preds, labels, needle_by_repo)
         elif task_name == "scbench_summary_with_needles":
             # compute acc for each task
             subtasks = ["scbench_summary", "scbench_passkey"]
@@ -587,7 +604,7 @@ def compute_scores(
 
                 if subtask == "scbench_repoqa":
                     preds_ = [pred for pred in preds if pred["task"] == subtask]
-                    acc_ = compute_repoqa_score(
+                    acc_ = get_compute_repoqa_score()(
                         model_name, preds_, labels, needle_by_repo
                     )
                     acc_ = acc_[model_name]["scores"]["all"][0.8]["pass@1"]

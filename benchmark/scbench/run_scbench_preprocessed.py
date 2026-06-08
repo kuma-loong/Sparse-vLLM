@@ -16,8 +16,7 @@ sys.path.insert(0, str(REPO_ROOT))
 sys.path.append(str(REPO_ROOT / "src"))
 
 from benchmark.common.paths import benchmark_output_root, scbench_preprocessed_root
-from datasets import load_dataset
-from eval_utils import DATA_NAME_TO_MAX_NEW_TOKENS, dump_jsonl
+from eval_utils import DATA_NAME_TO_MAX_NEW_TOKENS, dump_jsonl, load_scbench_preprocessed_dataset
 from run_scbench import load_model
 from tqdm import tqdm
 
@@ -262,7 +261,20 @@ def _worker_has_samples(dataset_len: int, start_example_id: int, rank: int, worl
     return False
 
 
+def _load_datasets(args, data_names: list[str]):
+    datasets_by_name = {}
+    for data_name in data_names:
+        dataset = load_scbench_preprocessed_dataset(args.data_root, data_name)
+        if args.num_eval_examples != -1:
+            dataset = dataset.select(range(min(args.num_eval_examples, len(dataset))))
+        if len(dataset) == 0:
+            raise ValueError(f"SCBench task {data_name} has no selected examples.")
+        datasets_by_name[data_name] = dataset
+    return datasets_by_name
+
+
 def _run_worker(args, data_names: list[str]):
+    datasets_by_name = _load_datasets(args, data_names)
     rank = args.worker_rank if args.worker_rank >= 0 else 0
     world_size = args.worker_world_size if args.worker_rank >= 0 else 1
 
@@ -303,14 +315,7 @@ def _run_worker(args, data_names: list[str]):
 
     results = {}
     for data_name in data_names:
-        dataset = load_dataset(
-            "parquet",
-            data_files=str(Path(args.data_root) / f"{data_name}.parquet"),
-            split="train",
-        )
-
-        if args.num_eval_examples != -1:
-            dataset = dataset.select(range(min(args.num_eval_examples, len(dataset))))
+        dataset = datasets_by_name[data_name]
 
         if world_size > 1 and not _worker_has_samples(len(dataset), args.start_example_id, rank, world_size):
             dump_jsonl([], prediction_path(result_dir, data_name, rank))

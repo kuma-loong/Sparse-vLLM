@@ -15,6 +15,13 @@ def _first_env_path(*names: str) -> Path | None:
     return None
 
 
+def _first_existing_path(*paths: Path) -> Path | None:
+    for path in paths:
+        if path.is_dir():
+            return path
+    return None
+
+
 def benchmark_output_root() -> Path:
     return (
         _first_env_path("SVLLM_BENCHMARK_OUTPUT_DIR", "DELTAKV_OUTPUT_DIR", "DELTAKV_OUTPUT_BASE")
@@ -27,22 +34,34 @@ def benchmark_data_root() -> Path | None:
 
 
 def longbench_data_root() -> Path | None:
-    return _first_env_path(
+    env_path = _first_env_path(
         "SVLLM_LONGBENCH_DATA_DIR",
         "DELTAKV_LONGBENCH_DATA_DIR",
         "SVLLM_BENCHMARK_DATA_DIR",
         "SVLLM_DATA_DIR",
         "DELTAKV_DATA_DIR",
     )
+    if env_path is not None:
+        return env_path
+    return _first_existing_path(
+        REPO_ROOT / "benchmark" / "data" / "LongBench",
+        REPO_ROOT / "benchmark" / "data" / "longbench",
+    )
 
 
 def scbench_preprocessed_root() -> Path | None:
-    return _first_env_path(
+    env_path = _first_env_path(
         "SVLLM_SCBENCH_PREPROCESSED_ROOT",
         "SCBENCH_PREPROCESSED_ROOT",
         "SVLLM_BENCHMARK_DATA_DIR",
         "SVLLM_DATA_DIR",
         "DELTAKV_DATA_DIR",
+    )
+    if env_path is not None:
+        return env_path
+    return _first_existing_path(
+        REPO_ROOT / "benchmark" / "data" / "SCBench-preprocessed",
+        REPO_ROOT / "benchmark" / "data" / "scbench-preprocessed",
     )
 
 
