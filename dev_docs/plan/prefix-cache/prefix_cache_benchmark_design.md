@@ -62,8 +62,9 @@ Each run writes:
 
 - `run_info.json`: command, git metadata, environment, model, seed, and config.
 - `benchmark_plan.json`: expanded case matrix and engine kwargs.
-- `per_turn_results.jsonl`: per-request status, prompt tokens, generated tokens, TTFT, latency, cached tokens, planned eligible tokens, observed eligible tokens, and turn/session ids.
-- `raw_outputs.jsonl`: full prompt token ids and generated token ids/text.
+- `<case>/per_turn_results.jsonl`: per-request status, prompt tokens, generated tokens, TTFT, latency, cached tokens, planned eligible tokens, observed eligible tokens, and turn/session ids.
+- `<case>/raw_outputs.jsonl`: full prompt token ids and generated token ids/text.
+- `<case>/aggregate_metrics.json`: one summary object for the case.
 - `performance.jsonl`: one summary row per case.
 - `aggregate_metrics.json`: all case summaries.
 - `report.md`: compact table.
