@@ -574,9 +574,25 @@ class CacheManager(ABC):
         """Whether the current prepared prefill step is backed by a full-prefill staging view."""
         return False
 
+    def prefill_step_free_slots_for(self, seq: Sequence) -> int:
+        """Writable KV capacity for a specific prefill candidate."""
+        return int(self.prefill_step_free_slots())
+
+    def prefill_step_reservation_cost(self, seq: Sequence, scheduled_tokens: int) -> int:
+        """Scheduler-side capacity consumed by scheduling a prefill chunk."""
+        return int(scheduled_tokens)
+
     def decode_step_free_slots(self) -> int:
         """Writable KV capacity for one decode step."""
         return int(self.num_free_slots)
+
+    def decode_step_free_slots_for(self, seq: Sequence) -> int:
+        """Writable KV capacity for a specific decode candidate."""
+        return int(self.decode_step_free_slots())
+
+    def decode_step_reservation_cost(self, seq: Sequence) -> int:
+        """Scheduler-side capacity consumed by scheduling one decode token."""
+        return 1
 
     def prompt_admission_free_slots(self) -> int:
         """Slots pool used to decide whether a new prompt can be admitted."""

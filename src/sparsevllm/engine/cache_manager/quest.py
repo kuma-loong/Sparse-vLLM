@@ -1,16 +1,41 @@
 from __future__ import annotations
 
 from collections import deque
+from dataclasses import dataclass
 
 import numpy as np
 import torch
 
 from sparsevllm.config import Config
 from sparsevllm.engine.sequence import Sequence
+from sparsevllm.engine.prefix_cache import (
+    PrefixCacheBlock,
+    PrefixCacheIndex,
+    build_prefix_cache_fingerprint,
+    usable_prefix_cache_tokens,
+)
 from sparsevllm.utils.context import get_context
 from sparsevllm.utils.profiler import profiler
 
 from .base import CacheManager, LayerBatchStates, SparseSelection
+
+
+@dataclass
+class QuestPrefixRuntimeState:
+    parent_key: bytes | None
+    next_logical_block_idx: int
+    pending_tokens: list[int]
+    pending_slots: list[torch.Tensor]
+
+
+@dataclass
+class PendingQuestPrefixBlock:
+    key: bytes
+    parent_key: bytes | None
+    logical_block_idx: int
+    page_slot: int
+    slots: torch.Tensor
+    token_ids: list[int]
 
 
 class QuestCacheManager(CacheManager):
@@ -39,6 +64,25 @@ class QuestCacheManager(CacheManager):
         self.free_rows = deque(range(self.max_buffer_rows))
         self.row_seq_lens = np.zeros((self.max_buffer_rows,), dtype=np.int32)
         self.layer_batch_state = LayerBatchStates()
+        self.enable_prefix_caching = bool(config.enable_prefix_caching and config.vllm_sparse_method == "quest")
+        self.prefix_cache_block_size = int(config.prefix_cache_block_size)
+        if self.enable_prefix_caching and self.prefix_cache_block_size != self.page_size:
+            raise ValueError(
+                "Quest prefix cache requires prefix_cache_block_size == quest_chunk_size: "
+                f"prefix_cache_block_size={self.prefix_cache_block_size}, quest_chunk_size={self.page_size}."
+            )
+        self.prefix_cache: PrefixCacheIndex | None = None
+        if self.enable_prefix_caching:
+            self.prefix_cache = PrefixCacheIndex(
+                block_size=self.prefix_cache_block_size,
+                fingerprint=build_prefix_cache_fingerprint(config, self.prefix_cache_block_size),
+                max_blocks=config.prefix_cache_max_blocks,
+            )
+        self.seq_id_to_prefix_blocks: dict[int, list[PrefixCacheBlock]] = {}
+        self.seq_id_to_materialized_blocks: dict[int, list[PrefixCacheBlock]] = {}
+        self.seq_id_to_cached_pages: dict[int, set[int]] = {}
+        self.prefix_runtime_states: dict[int, QuestPrefixRuntimeState] = {}
+        self.pending_prefix_blocks: dict[int, list[PendingQuestPrefixBlock]] = {}
 
         # [2, L, P, H_kv, D] -> 0:max, 1:min
         self.metadata_cache = torch.empty(
@@ -93,6 +137,305 @@ class QuestCacheManager(CacheManager):
     def num_free_slots(self) -> int:
         return int(self._num_free_pages * self.page_size)
 
+    def _prefix_evictable_slots(self) -> int:
+        if self.prefix_cache is None:
+            return 0
+        return int(self.prefix_cache.evictable_blocks() * self.page_size)
+
+    def _prefix_evictable_pages(self) -> int:
+        if self.prefix_cache is None:
+            return 0
+        return int(self.prefix_cache.evictable_blocks())
+
+    def _partial_page_free_slots(self) -> int:
+        total = 0
+        for row_idx in self.seq_id_to_row.values():
+            row_len = int(self.row_seq_lens[row_idx])
+            page_offset = row_len % self.page_size
+            if page_offset:
+                total += self.page_size - page_offset
+        return total
+
+    def prefill_step_free_slots(self) -> int:
+        return int(self.num_free_slots + self._prefix_evictable_slots() + self._partial_page_free_slots())
+
+    def prefill_step_free_slots_for(self, seq: Sequence) -> int:
+        row_idx = self.seq_id_to_row.get(seq.seq_id)
+        partial = 0
+        if row_idx is not None:
+            page_offset = int(self.row_seq_lens[row_idx]) % self.page_size
+            if page_offset:
+                partial = self.page_size - page_offset
+        return int(self.num_free_slots + self._prefix_evictable_slots() + partial)
+
+    def prefill_step_reservation_cost(self, seq: Sequence, scheduled_tokens: int) -> int:
+        row_idx = self.seq_id_to_row.get(seq.seq_id)
+        cur_len = 0 if row_idx is None else int(self.row_seq_lens[row_idx])
+        remaining = int(scheduled_tokens)
+        cost = 0
+        page_offset = cur_len % self.page_size
+        if page_offset:
+            take = min(remaining, self.page_size - page_offset)
+            cost += take
+            remaining -= take
+        if remaining > 0:
+            cost += self._ceil_to_page_slots(remaining)
+        return int(cost)
+
+    def decode_step_free_slots(self) -> int:
+        partial_decode_slots = 0
+        for row_idx in self.seq_id_to_row.values():
+            if int(self.row_seq_lens[row_idx]) % self.page_size:
+                partial_decode_slots += 1
+        page_slots = (self._num_free_pages + self._prefix_evictable_pages()) * self.page_size
+        return int(page_slots + partial_decode_slots)
+
+    def decode_step_free_slots_for(self, seq: Sequence) -> int:
+        if self._required_new_pages(seq.seq_id, 1) == 0:
+            return 1
+        return self.page_size if (self._num_free_pages + self._prefix_evictable_pages()) > 0 else 0
+
+    def decode_step_reservation_cost(self, seq: Sequence) -> int:
+        if self._required_new_pages(seq.seq_id, 1) == 0:
+            return 1
+        return self.page_size
+
+    def prompt_admission_free_slots(self) -> int:
+        return int(self.num_free_slots + self._prefix_evictable_slots())
+
+    def _prefix_hit_evictable_slots(self, seq: Sequence) -> int:
+        if self.prefix_cache is None or int(getattr(seq, "prefix_cache_hit_len", 0) or 0) <= 0:
+            return 0
+        if seq.prefix_cache_hit_last_key is None:
+            raise RuntimeError(f"seq_id={seq.seq_id} has prefix hit length but no last key.")
+        chain = self.prefix_cache.get_chain(seq.prefix_cache_hit_last_key, int(seq.prefix_cache_hit_blocks))
+        return sum(self.page_size for block in chain if PrefixCacheIndex.can_evict(block))
+
+    def _ceil_to_page_slots(self, n_tokens: int) -> int:
+        n_tokens = int(n_tokens)
+        if n_tokens <= 0:
+            return 0
+        return ((n_tokens + self.page_size - 1) // self.page_size) * self.page_size
+
+    def prompt_admission_cost(self, seq: Sequence) -> int:
+        hit_len = int(getattr(seq, "prefix_cache_hit_len", 0) or 0)
+        suffix_len = int(seq.num_prompt_tokens - hit_len)
+        return self._ceil_to_page_slots(suffix_len) + self._prefix_hit_evictable_slots(seq)
+
+    def prompt_logical_reservation_cost(self, seq: Sequence) -> int:
+        return int(self.prompt_admission_cost(seq))
+
+    def reserved_prefill_slots(self, waiting_seqs: deque[Sequence], chunk_prefill_size: int) -> int:
+        reserved = 0
+        for seq in waiting_seqs:
+            if 0 < seq.num_prefilled_tokens < seq.num_prompt_tokens:
+                remaining = int(seq.num_prompt_tokens - seq.num_prefilled_tokens)
+                reserved += self._ceil_to_page_slots(remaining)
+        return reserved
+
+    def free_slot_stats(self) -> dict[str, int]:
+        stats = {
+            "free_slots": int(self.num_free_slots),
+            "quest_free_pages": int(self._num_free_pages),
+        }
+        if self.prefix_cache is not None:
+            stats.update(self.prefix_cache.stats())
+            stats["prefix_cache_evictable_slots"] = int(self._prefix_evictable_slots())
+        return stats
+
+    def refresh_prefix_cache_hit(self, seq: Sequence) -> None:
+        self.clear_prefix_cache_hit(seq)
+        if not self.enable_prefix_caching or self.prefix_cache is None:
+            return
+        if seq.num_prefilled_tokens != 0 or seq.num_completion_tokens != 0:
+            return
+        usable_tokens = usable_prefix_cache_tokens(seq.num_prompt_tokens, self.page_size)
+        if usable_tokens <= 0:
+            return
+        hit_len, last_key, hit_blocks = self.prefix_cache.lookup_longest_prefix(
+            seq.prompt_token_ids,
+            max_usable_tokens=usable_tokens,
+        )
+        if hit_len <= 0:
+            return
+        if last_key is None or hit_blocks <= 0:
+            raise RuntimeError("Quest prefix cache lookup returned an invalid hit.")
+        if hit_len >= seq.num_prompt_tokens or hit_len % self.page_size != 0:
+            raise RuntimeError(
+                "Quest prefix cache lookup returned an unusable hit length: "
+                f"seq_id={seq.seq_id} hit_len={hit_len} prompt_len={seq.num_prompt_tokens} "
+                f"page_size={self.page_size}."
+            )
+        seq.prefix_cache_enabled = True
+        seq.prefix_cache_hit_len = int(hit_len)
+        seq.prefix_cache_hit_blocks = int(hit_blocks)
+        seq.prefix_cache_hit_last_key = last_key
+        seq.prefix_cache_block_size = self.page_size
+        seq.prefix_cache_method = "quest"
+
+    def _release_prefix_blocks(self, blocks: list[PrefixCacheBlock]) -> None:
+        for block in blocks:
+            block.ref_count -= 1
+            if block.ref_count < 0:
+                raise RuntimeError("Quest prefix cache block ref_count became negative.")
+
+    def _free_prefix_cache_blocks(self, blocks: list[PrefixCacheBlock]) -> None:
+        for block in blocks:
+            if block.page_slot is None:
+                raise RuntimeError("Quest prefix cache block is missing page_slot.")
+            ptr = self._num_free_pages
+            self.free_pages_stack[ptr] = int(block.page_slot)
+            self._num_free_pages += 1
+
+    def _validate_page_slots(self, slots: torch.Tensor, page_slot: int | None = None) -> int:
+        if int(slots.numel()) != self.page_size:
+            raise RuntimeError(
+                f"Quest prefix block must contain exactly one full page: "
+                f"num_slots={int(slots.numel())} page_size={self.page_size}."
+            )
+        slots_i32 = slots.to(dtype=torch.int32)
+        page_slots = torch.div(slots_i32, self.page_size, rounding_mode="floor")
+        page_offsets = torch.remainder(slots_i32, self.page_size)
+        first_page_slot = int(page_slots[0].item())
+        if page_slot is not None and int(page_slot) != first_page_slot:
+            raise RuntimeError(
+                f"Quest prefix block page_slot does not match token slots: "
+                f"page_slot={page_slot} slots_page={first_page_slot}."
+            )
+        if hasattr(self, "num_pages") and not (0 <= first_page_slot < int(self.num_pages)):
+            raise RuntimeError(
+                f"Quest prefix block page_slot out of range: page_slot={first_page_slot} "
+                f"num_pages={int(self.num_pages)}."
+            )
+        if not torch.all(page_slots == first_page_slot).item():
+            raise RuntimeError("Quest prefix block token slots span multiple pages.")
+        expected_offsets = self.page_offsets_i32.to(device=slots_i32.device)
+        if not torch.equal(page_offsets, expected_offsets):
+            raise RuntimeError("Quest prefix block token slots are not a contiguous full page.")
+        return first_page_slot
+
+    def _evict_prefix_cache_until_free(self, needed_slots: int) -> None:
+        if not self.enable_prefix_caching or self.prefix_cache is None:
+            return
+        needed_slots = int(needed_slots)
+        if self.num_free_slots >= needed_slots:
+            return
+        missing_slots = needed_slots - int(self.num_free_slots)
+        needed_pages = (missing_slots + self.page_size - 1) // self.page_size
+        evicted = self.prefix_cache.evict_until_freeable(needed_pages)
+        self._free_prefix_cache_blocks(evicted)
+
+    def _evict_prefix_cache_for_insert(self, needed_blocks: int = 1) -> None:
+        if not self.enable_prefix_caching or self.prefix_cache is None:
+            return
+        evicted = self.prefix_cache.ensure_insert_capacity(needed_blocks)
+        self._free_prefix_cache_blocks(evicted)
+
+    def _attach_prefix_cache_if_needed(self, seq: Sequence) -> None:
+        if not self.enable_prefix_caching or self.prefix_cache is None:
+            return
+        hit_len = int(getattr(seq, "prefix_cache_hit_len", 0) or 0)
+        if hit_len <= 0:
+            return
+        if seq.seq_id in self.seq_id_to_prefix_blocks:
+            return
+        if seq.prefix_cache_hit_last_key is None:
+            raise RuntimeError(f"seq_id={seq.seq_id} has Quest prefix hit length but no last key.")
+        if hit_len % self.page_size != 0:
+            raise RuntimeError(
+                f"seq_id={seq.seq_id} Quest prefix hit length is not page aligned: "
+                f"hit_len={hit_len} page_size={self.page_size}."
+            )
+        chain = self.prefix_cache.get_chain(seq.prefix_cache_hit_last_key, int(seq.prefix_cache_hit_blocks))
+        if len(chain) * self.page_size != hit_len:
+            raise RuntimeError(
+                "Quest prefix cache chain length does not match scheduler metadata: "
+                f"seq_id={seq.seq_id} hit_len={hit_len} blocks={len(chain)} page_size={self.page_size}."
+            )
+        row_idx = self._get_free_row(seq.seq_id)
+        if int(self.row_seq_lens[row_idx]) != 0:
+            raise RuntimeError(
+                f"Cannot attach Quest prefix cache to non-empty row: seq_id={seq.seq_id} "
+                f"row_idx={row_idx} row_len={int(self.row_seq_lens[row_idx])}."
+            )
+
+        cached_pages = self.seq_id_to_cached_pages.setdefault(seq.seq_id, set())
+        for block in chain:
+            if block.page_slot is None:
+                raise RuntimeError(
+                    f"Invalid Quest prefix cache block page for seq_id={seq.seq_id}: "
+                    f"logical_block_idx={block.logical_block_idx}."
+                )
+            page_idx = int(block.logical_block_idx)
+            start = page_idx * self.page_size
+            end = start + self.page_size
+            page_slot = int(block.page_slot)
+            self.buffer_req_to_page_slots[row_idx, page_idx] = page_slot
+            if block.slots is not None:
+                self._validate_page_slots(block.slots, page_slot)
+                slots = block.slots
+            else:
+                slots = page_slot * self.page_size + self.page_offsets_i32
+            self.buffer_req_to_token_slots[row_idx, start:end] = slots
+            block.ref_count += 1
+            cached_pages.add(page_idx)
+
+        self.row_seq_lens[row_idx] = hit_len
+        self.seq_id_to_prefix_blocks[seq.seq_id] = chain
+        self.prefix_cache.touch_chain(chain)
+
+    def _record_prefix_materialization(
+        self,
+        seq: Sequence,
+        token_ids: list[int],
+        slots: torch.Tensor,
+    ) -> None:
+        if not self.enable_prefix_caching or self.prefix_cache is None:
+            return
+        if seq.num_completion_tokens != 0:
+            return
+        if len(token_ids) != int(slots.numel()):
+            raise RuntimeError(
+                f"Quest prefix materialization token/slot mismatch: seq_id={seq.seq_id} "
+                f"tokens={len(token_ids)} slots={int(slots.numel())}."
+            )
+        state = self.prefix_runtime_states.get(seq.seq_id)
+        if state is None:
+            hit_blocks = int(getattr(seq, "prefix_cache_hit_blocks", 0) or 0)
+            parent_key = getattr(seq, "prefix_cache_hit_last_key", None)
+            state = QuestPrefixRuntimeState(
+                parent_key=parent_key,
+                next_logical_block_idx=hit_blocks,
+                pending_tokens=[],
+                pending_slots=[],
+            )
+            self.prefix_runtime_states[seq.seq_id] = state
+
+        pending_blocks = self.pending_prefix_blocks.setdefault(seq.seq_id, [])
+        for token_id, slot in zip(token_ids, slots):
+            state.pending_tokens.append(int(token_id))
+            state.pending_slots.append(slot.detach().clone().reshape(()))
+            if len(state.pending_tokens) != self.page_size:
+                continue
+            block_tokens = list(state.pending_tokens)
+            block_slots = torch.stack(state.pending_slots).to(dtype=torch.int32)
+            key = self.prefix_cache.hash_block(block_tokens, state.parent_key)
+            page_slot = self._validate_page_slots(block_slots)
+            pending_blocks.append(
+                PendingQuestPrefixBlock(
+                    key=key,
+                    parent_key=state.parent_key,
+                    logical_block_idx=state.next_logical_block_idx,
+                    page_slot=page_slot,
+                    slots=block_slots,
+                    token_ids=block_tokens,
+                )
+            )
+            state.parent_key = key
+            state.next_logical_block_idx += 1
+            state.pending_tokens = []
+            state.pending_slots = []
+
     def _get_free_row(self, seq_id: int) -> int:
         if seq_id in self.seq_id_to_row:
             return self.seq_id_to_row[seq_id]
@@ -111,11 +454,23 @@ class QuestCacheManager(CacheManager):
         self.buffer_req_to_page_slots[row_idx, page_idx] = page_slot
         return page_slot
 
+    def _required_new_pages(self, seq_id: int, size: int) -> int:
+        row_idx = self.seq_id_to_row.get(seq_id)
+        cur_len = 0 if row_idx is None else int(self.row_seq_lens[row_idx])
+        before_pages = (cur_len + self.page_size - 1) // self.page_size
+        after_len = cur_len + int(size)
+        after_pages = (after_len + self.page_size - 1) // self.page_size
+        return max(0, after_pages - before_pages)
+
     @torch.no_grad()
     def _allocate(self, seq_id: int, size: int) -> torch.Tensor:
         with profiler.record("cache_allocate"):
-            assert self.num_free_slots >= size, (
-                f"Out of QuEST KV slots: need {size}, free {self.num_free_slots}"
+            needed_pages = self._required_new_pages(seq_id, size)
+            if needed_pages > 0:
+                self._evict_prefix_cache_until_free(needed_pages * self.page_size)
+            assert self._num_free_pages >= needed_pages, (
+                f"Out of QuEST KV pages: need_pages={needed_pages}, free_pages={self._num_free_pages}, "
+                f"size={size}, free_slots={self.num_free_slots}"
             )
 
             row_idx = self._get_free_row(seq_id)
@@ -158,11 +513,22 @@ class QuestCacheManager(CacheManager):
 
             cur_len = int(self.row_seq_lens[row_idx])
             num_pages = (cur_len + self.page_size - 1) // self.page_size
+            cached_pages = self.seq_id_to_cached_pages.pop(seq_id, set())
             if num_pages > 0:
-                page_slots = self.buffer_req_to_page_slots[row_idx, :num_pages]
-                ptr = self._num_free_pages
-                self.free_pages_stack[ptr: ptr + num_pages] = page_slots
-                self._num_free_pages += num_pages
+                free_page_slots = [
+                    int(self.buffer_req_to_page_slots[row_idx, page_idx].item())
+                    for page_idx in range(num_pages)
+                    if page_idx not in cached_pages
+                ]
+                if free_page_slots:
+                    page_slots = torch.tensor(free_page_slots, dtype=torch.int32, device=self.free_pages_stack.device)
+                    ptr = self._num_free_pages
+                    self.free_pages_stack[ptr: ptr + len(free_page_slots)] = page_slots
+                    self._num_free_pages += len(free_page_slots)
+            self._release_prefix_blocks(self.seq_id_to_prefix_blocks.pop(seq_id, []))
+            self._release_prefix_blocks(self.seq_id_to_materialized_blocks.pop(seq_id, []))
+            self.prefix_runtime_states.pop(seq_id, None)
+            self.pending_prefix_blocks.pop(seq_id, None)
 
             self.buffer_req_to_token_slots[row_idx, :] = 0
             self.buffer_req_to_page_slots[row_idx, :] = -1
@@ -175,6 +541,9 @@ class QuestCacheManager(CacheManager):
     @torch.no_grad()
     def _prepare_prefill(self, seqs: list[Sequence]):
         with profiler.record("cache_prepare_prefill"):
+            for seq in seqs:
+                self._attach_prefix_cache_if_needed(seq)
+
             total_chunk_tokens = sum(seq.current_chunk_size for seq in seqs)
 
             input_ids_np = np.empty(total_chunk_tokens, dtype=np.int64)
@@ -200,7 +569,7 @@ class QuestCacheManager(CacheManager):
                             f"start_idx={start_idx}"
                         )
 
-                self._allocate(seq.seq_id, chunk_size)
+                allocated_slots = self._allocate(seq.seq_id, chunk_size)
                 row_idx = self.seq_id_to_row[seq.seq_id]
                 slot_mapping[token_offset: token_offset + chunk_size] = self.buffer_req_to_token_slots[row_idx, start_idx:end_idx]
                 context_lens_list.append(end_idx)
@@ -209,9 +578,11 @@ class QuestCacheManager(CacheManager):
                 chunk_tokens = seq.token_ids
                 if len(chunk_tokens) > chunk_size:
                     chunk_tokens = chunk_tokens[start_idx:end_idx]
+                chunk_tokens = list(chunk_tokens)
 
                 input_ids_np[token_offset: token_offset + chunk_size] = chunk_tokens
                 positions_np[token_offset: token_offset + chunk_size] = np.arange(start_idx, end_idx)
+                self._record_prefix_materialization(seq, chunk_tokens, allocated_slots)
 
                 cu_seqlens_q.append(cu_seqlens_q[-1] + chunk_size)
                 token_offset += chunk_size
@@ -227,6 +598,51 @@ class QuestCacheManager(CacheManager):
             positions = torch.from_numpy(positions_np).to("cuda")
             cu_seqlens_q = torch.tensor(cu_seqlens_q, dtype=torch.int32, device="cuda")
             return input_ids, positions, cu_seqlens_q
+
+    def on_forward_end(self, seqs: list[Sequence], is_prefill: bool):
+        if not is_prefill or not self.enable_prefix_caching or self.prefix_cache is None:
+            return
+        with profiler.record("quest_prefix_cache_materialize"):
+            for seq in seqs:
+                pending_blocks = self.pending_prefix_blocks.pop(seq.seq_id, [])
+                if not pending_blocks:
+                    continue
+                cached_pages = self.seq_id_to_cached_pages.setdefault(seq.seq_id, set())
+                materialized = self.seq_id_to_materialized_blocks.setdefault(seq.seq_id, [])
+                protected: list[PrefixCacheBlock] = []
+                protected_keys = {
+                    key
+                    for pending in pending_blocks
+                    for key in (pending.parent_key, pending.key)
+                    if key is not None and self.prefix_cache.has_block(key)
+                }
+                for key in protected_keys:
+                    block = self.prefix_cache.get_block(key)
+                    if block is None:
+                        continue
+                    block.ref_count += 1
+                    protected.append(block)
+                try:
+                    for pending in pending_blocks:
+                        if not self.prefix_cache.has_block(pending.key):
+                            self._evict_prefix_cache_for_insert(1)
+                        block = PrefixCacheBlock(
+                            key=pending.key,
+                            parent_key=pending.parent_key,
+                            block_size=self.page_size,
+                            logical_block_idx=pending.logical_block_idx,
+                            slots=pending.slots,
+                            page_slot=pending.page_slot,
+                            token_ids=tuple(pending.token_ids),
+                        )
+                        inserted = self.prefix_cache.insert_block(block)
+                        if inserted is not block:
+                            continue
+                        inserted.ref_count = 1
+                        materialized.append(inserted)
+                        cached_pages.add(int(inserted.logical_block_idx))
+                finally:
+                    self._release_prefix_blocks(protected)
 
     @torch.no_grad()
     def _prepare_decode(self, seqs: list[Sequence]):
