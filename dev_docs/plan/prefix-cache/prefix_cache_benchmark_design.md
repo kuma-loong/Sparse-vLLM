@@ -62,7 +62,7 @@ Each run writes:
 
 - `run_info.json`: command, git metadata, environment, model, seed, and config.
 - `benchmark_plan.json`: expanded case matrix and engine kwargs.
-- `per_turn_results.jsonl`: per-request status, prompt tokens, generated tokens, TTFT, latency, cached tokens, eligible tokens, and turn/session ids.
+- `per_turn_results.jsonl`: per-request status, prompt tokens, generated tokens, TTFT, latency, cached tokens, planned eligible tokens, observed eligible tokens, and turn/session ids.
 - `raw_outputs.jsonl`: full prompt token ids and generated token ids/text.
 - `performance.jsonl`: one summary row per case.
 - `aggregate_metrics.json`: all case summaries.
@@ -82,7 +82,7 @@ Every request is recorded with an explicit status. Failed attempts remain in the
 - prefix cache runtime counters: lookups, hit requests, hit tokens, materialized blocks, duplicate blocks, evictions, live/evictable/pinned blocks
 - peak GPU memory
 
-Use `eligible_cache_hit_rate` to validate correctness of the cache matching logic, and use TTFT/latency to evaluate performance.
+Use `eligible_cache_hit_rate` to validate correctness of the cache matching logic, and use TTFT/latency to evaluate performance. The aggregate uses observed eligible tokens so same-round shared-prefix hits, such as later sessions reusing an earlier session's shared system prompt, are counted instead of producing hit rates above 1.0.
 
 ## Functional Smoke Command
 

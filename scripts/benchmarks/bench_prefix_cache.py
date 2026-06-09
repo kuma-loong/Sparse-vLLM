@@ -429,6 +429,9 @@ def _run_request_batch(
             first_token_s = state.first_token_s or state.finish_s or time.perf_counter()
             finish_s = state.finish_s or first_token_s
             generated = state.generated_token_ids[: int(spec.output_len)]
+            cached_tokens = int(state.prefix_cache_hit_len)
+            planned_eligible_tokens = int(spec.eligible_cache_tokens)
+            observed_eligible_tokens = max(planned_eligible_tokens, cached_tokens)
             record = {
                 "request_key": spec.request_key,
                 "seq_id": seq_id,
@@ -440,9 +443,10 @@ def _run_request_batch(
                 "prompt_tokens": len(spec.prompt_token_ids),
                 "max_new_tokens": int(spec.output_len),
                 "generated_tokens": len(generated),
-                "eligible_cache_tokens": int(spec.eligible_cache_tokens),
+                "planned_eligible_cache_tokens": planned_eligible_tokens,
+                "eligible_cache_tokens": observed_eligible_tokens,
                 "expected_reuse_tokens": int(spec.expected_reuse_tokens),
-                "cached_tokens": int(state.prefix_cache_hit_len),
+                "cached_tokens": cached_tokens,
                 "cached_blocks": int(state.prefix_cache_hit_blocks),
                 "ttft_s": float(first_token_s - state.add_s),
                 "latency_s": float(finish_s - state.add_s),
