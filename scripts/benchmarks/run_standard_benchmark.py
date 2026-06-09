@@ -88,6 +88,25 @@ def _missing_data_marker(name: str) -> Path:
     return Path(f"/__missing_svllm_{name}_data_root__")
 
 
+def _prefix_cache_token_count_plan(args: argparse.Namespace) -> list[int]:
+    multiturn_first_prompt = (
+        int(args.prefix_cache_system_prompt_len)
+        + int(args.prefix_cache_session_prefix_len)
+        + int(args.prefix_cache_user_len)
+    )
+    multiturn_max_prompt = (
+        int(args.prefix_cache_system_prompt_len)
+        + int(args.prefix_cache_session_prefix_len)
+        + int(args.prefix_cache_turns)
+        * (int(args.prefix_cache_user_len) + int(args.prefix_cache_output_len))
+    )
+    shared_prefix_max_prompt = (
+        int(args.prefix_cache_shared_prefix_len)
+        + int(args.prefix_cache_shared_suffix_len)
+    )
+    return [multiturn_first_prompt, multiturn_max_prompt, shared_prefix_max_prompt]
+
+
 def build_jobs(args: argparse.Namespace, run_root: Path) -> list[BenchmarkJob]:
     jobs: list[BenchmarkJob] = []
     selected = set(_split_csv(args.benchmarks))
@@ -306,6 +325,75 @@ def build_jobs(args: argparse.Namespace, run_root: Path) -> list[BenchmarkJob]:
             )
         )
 
+    if wanted("prefix_cache"):
+        out = _job_output(run_root, "prefix_cache")
+        cmd = _python_cmd(
+            "scripts/benchmarks/bench_prefix_cache.py",
+            "--model_path",
+            args.model_path,
+            "--cuda_device",
+            str(args.cuda_device),
+            "--output_dir",
+            str(out),
+            "--feature",
+            args.feature,
+            "--objective",
+            args.objective,
+            "--cases",
+            args.prefix_cache_cases,
+            "--workloads",
+            args.prefix_cache_workloads,
+            "--history_update",
+            args.prefix_cache_history_update,
+            "--sessions",
+            str(args.prefix_cache_sessions),
+            "--turns",
+            str(args.prefix_cache_turns),
+            "--system_prompt_len",
+            str(args.prefix_cache_system_prompt_len),
+            "--session_prefix_len",
+            str(args.prefix_cache_session_prefix_len),
+            "--user_len",
+            str(args.prefix_cache_user_len),
+            "--output_len",
+            str(args.prefix_cache_output_len),
+            "--shared_prompts",
+            str(args.prefix_cache_shared_prompts),
+            "--shared_prefix_len",
+            str(args.prefix_cache_shared_prefix_len),
+            "--shared_suffix_len",
+            str(args.prefix_cache_shared_suffix_len),
+            "--min_performance_prompt_len",
+            str(args.prefix_cache_min_performance_prompt_len),
+            "--min_cacheable_prefix_len",
+            str(args.prefix_cache_min_cacheable_prefix_len),
+            "--case_timeout_s",
+            str(args.prefix_cache_case_timeout_s),
+            "--master_port_base",
+            str(args.prefix_cache_master_port_base),
+            "--skip_ledger",
+        )
+        if args.prefix_cache_allow_short_trace:
+            cmd.append("--allow_short_trace")
+        if args.continue_on_failure:
+            cmd.append("--continue_on_failure")
+        prefix_hyper_params = _json_arg(args.hyper_param)
+        if prefix_hyper_params:
+            cmd.extend(["--hyper_params", _json_cli(prefix_hyper_params)])
+        jobs.append(
+            BenchmarkJob(
+                name="prefix_cache",
+                tier="Tier 3",
+                source="repo_custom",
+                command=cmd,
+                output_dir=out,
+                dataset="synthetic_token_trace",
+                sample_policy="seeded_dynamic_multiturn",
+                lengths=_prefix_cache_token_count_plan(args),
+                max_new_tokens=args.prefix_cache_output_len,
+            )
+        )
+
     if wanted("mathbench"):
         out = _job_output(run_root, "mathbench")
         cmd = _python_cmd(
@@ -507,6 +595,23 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--scbench_kv_type", default="dense")
     parser.add_argument("--scbench_num_examples", type=int, default=None)
     parser.add_argument("--scbench_max_seq_length", type=int, default=131072)
+    parser.add_argument("--prefix_cache_cases", default="baseline_full,prefix_full,prefix_omnikv,prefix_quest")
+    parser.add_argument("--prefix_cache_workloads", default="shared_prefix,multiturn")
+    parser.add_argument("--prefix_cache_history_update", choices=["synthetic", "generated"], default="synthetic")
+    parser.add_argument("--prefix_cache_sessions", type=int, default=4)
+    parser.add_argument("--prefix_cache_turns", type=int, default=4)
+    parser.add_argument("--prefix_cache_system_prompt_len", type=int, default=16384)
+    parser.add_argument("--prefix_cache_session_prefix_len", type=int, default=2048)
+    parser.add_argument("--prefix_cache_user_len", type=int, default=256)
+    parser.add_argument("--prefix_cache_output_len", type=int, default=128)
+    parser.add_argument("--prefix_cache_shared_prompts", type=int, default=4)
+    parser.add_argument("--prefix_cache_shared_prefix_len", type=int, default=16384)
+    parser.add_argument("--prefix_cache_shared_suffix_len", type=int, default=2048)
+    parser.add_argument("--prefix_cache_min_performance_prompt_len", type=int, default=8192)
+    parser.add_argument("--prefix_cache_min_cacheable_prefix_len", type=int, default=8192)
+    parser.add_argument("--prefix_cache_allow_short_trace", action="store_true")
+    parser.add_argument("--prefix_cache_case_timeout_s", type=float, default=0.0)
+    parser.add_argument("--prefix_cache_master_port_base", type=int, default=24000)
     parser.add_argument("--math_tasks", default="gsm8k")
     parser.add_argument("--math_num_samples", type=int, default=None)
     parser.add_argument("--math_max_new_tokens", type=int, default=None)

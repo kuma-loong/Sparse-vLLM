@@ -302,6 +302,19 @@ python benchmark/math_bench/pred.py \
 
 运行前可加 `--dry_run` 查看命令计划。缺少 LongBench 或 SCBench 数据时，总控脚本应记录 `invalid_run`，不自动下载数据集。
 
+Prefix cache trace 是专项 workload，不在 quick/final 默认列表里；需要显式选择：
+
+```bash
+.venv/bin/python scripts/benchmarks/run_standard_benchmark.py \
+  --mode quick \
+  --feature prefix_cache \
+  --objective "evaluate prefix cache on shared-prefix and multi-turn traces" \
+  --model_path <MODEL_PATH> \
+  --cuda_device <GPU_ID> \
+  --benchmarks prefix_cache \
+  --prefix_cache_cases baseline_full,prefix_full,prefix_omnikv,prefix_quest
+```
+
 建议一个功能对应一个 ledger：
 
 ```text

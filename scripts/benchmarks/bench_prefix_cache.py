@@ -921,6 +921,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--objective", default="evaluate Sparse-vLLM prefix cache on realistic multi-turn traces")
     parser.add_argument("--dry_run", action="store_true")
     parser.add_argument("--continue_on_failure", action="store_true")
+    parser.add_argument("--skip_ledger", action="store_true", help="Do not append per-case ledger rows. Use this when called by the standard benchmark runner.")
     parser.add_argument("--allow_short_trace", action="store_true", help="Allow cache-lifecycle smoke traces that do not enter sparse paths.")
     parser.add_argument("--min_performance_prompt_len", type=int, default=8192)
     parser.add_argument("--min_cacheable_prefix_len", type=int, default=8192)
@@ -1070,7 +1071,8 @@ def main() -> None:
         for summary in summaries:
             handle.write(json.dumps(summary, ensure_ascii=False) + "\n")
     _write_report(output_dir, summaries, args)
-    _append_ledger(output_dir, summaries, args)
+    if not args.skip_ledger:
+        _append_ledger(output_dir, summaries, args)
 
     print(json.dumps(aggregate, indent=2, ensure_ascii=False))
     if aggregate["status"] != "success":

@@ -118,6 +118,21 @@ CUDA_VISIBLE_DEVICES=6 .venv/bin/python scripts/benchmarks/bench_prefix_cache.py
   --continue_on_failure
 ```
 
+## Standard Runner Command
+
+Prefix cache trace is available through the standard runner, but it is not part of the default quick/final benchmark lists. Select it explicitly when the experiment needs prefix-cache lifecycle and TTFT measurements:
+
+```bash
+.venv/bin/python scripts/benchmarks/run_standard_benchmark.py \
+  --mode quick \
+  --feature prefix_cache \
+  --objective "evaluate prefix cache on shared-prefix and multi-turn traces" \
+  --model_path /data2/guquansheng/models/Qwen2.5-7B-Instruct-1M \
+  --cuda_device 5 \
+  --benchmarks prefix_cache \
+  --prefix_cache_cases baseline_full,prefix_full,prefix_omnikv,prefix_quest
+```
+
 ## Quick Realistic Command
 
 Run only when an idle GPU is available. This 16K-prefix trace is the minimum useful performance tier; it is long enough for prefix reuse to dominate normal scheduling and Python/CUDA synchronization noise while keeping runtime manageable.
