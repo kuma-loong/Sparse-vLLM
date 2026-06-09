@@ -246,12 +246,17 @@ def _trace_sparse_path_summary(args: argparse.Namespace) -> dict[str, int | bool
     plan = _token_count_plan(args)
     prefill_threshold = _long_text_threshold(args, is_prefill=True)
     decode_threshold = _long_text_threshold(args, is_prefill=False)
+    multiturn_base_prefix = int(args.system_prompt_len) + int(args.session_prefix_len)
     return {
         "history_update": str(args.history_update),
         "chunk_prefill_accel_omnikv": bool(args.chunk_prefill_accel_omnikv),
         "omnikv_prefill_long_text_threshold": prefill_threshold,
         "omnikv_decode_long_text_threshold": decode_threshold,
         "quest_sparse_decode_threshold": int(args.quest_token_budget),
+        "min_performance_prompt_len": int(args.min_performance_prompt_len),
+        "min_cacheable_prefix_len": int(args.min_cacheable_prefix_len),
+        "multiturn_base_prefix": int(multiturn_base_prefix),
+        "shared_prefix_len": int(args.shared_prefix_len),
         "max_prompt_len": int(plan["max_prompt_len"]),
         "multiturn_first_prompt": int(plan["multiturn_first_prompt"]),
         "multiturn_max_prompt": int(plan["multiturn_max_prompt"]),
@@ -270,6 +275,37 @@ def _validate_sparse_path_requirements(args: argparse.Namespace, cases: list[str
     shared_prompt = int(summary["shared_prefix_max_prompt"])
     multiturn_first = int(summary["multiturn_first_prompt"])
     multiturn_max = int(summary["multiturn_max_prompt"])
+    min_prompt = int(args.min_performance_prompt_len)
+    min_cacheable_prefix = int(args.min_cacheable_prefix_len)
+
+    if min_prompt > 0:
+        if "shared_prefix" in workloads and shared_prompt < min_prompt:
+            errors.append(
+                "shared_prefix prompt is too short for a stable performance benchmark: "
+                f"shared_prefix_len + shared_suffix_len = {shared_prompt}, "
+                f"min_performance_prompt_len = {min_prompt}."
+            )
+        if "multiturn" in workloads and multiturn_first < min_prompt:
+            errors.append(
+                "multiturn first prompt is too short for a stable performance benchmark: "
+                f"system + session + user = {multiturn_first}, "
+                f"min_performance_prompt_len = {min_prompt}."
+            )
+
+    if min_cacheable_prefix > 0 and any(case.startswith("prefix_") for case in cases):
+        multiturn_base_prefix = int(args.system_prompt_len) + int(args.session_prefix_len)
+        if "shared_prefix" in workloads and int(args.shared_prefix_len) < min_cacheable_prefix:
+            errors.append(
+                "shared_prefix cacheable prefix is too short to dominate noise: "
+                f"shared_prefix_len = {args.shared_prefix_len}, "
+                f"min_cacheable_prefix_len = {min_cacheable_prefix}."
+            )
+        if "multiturn" in workloads and multiturn_base_prefix < min_cacheable_prefix:
+            errors.append(
+                "multiturn reusable base prefix is too short to dominate noise: "
+                f"system_prompt_len + session_prefix_len = {multiturn_base_prefix}, "
+                f"min_cacheable_prefix_len = {min_cacheable_prefix}."
+            )
 
     if "prefix_omnikv" in cases:
         if not args.chunk_prefill_accel_omnikv:
@@ -304,9 +340,9 @@ def _validate_sparse_path_requirements(args: argparse.Namespace, cases: list[str
 
     if errors:
         raise ValueError(
-            "Prefix-cache performance benchmark trace does not enter the requested sparse path. "
-            "Increase prompt lengths or lower sparse budgets; pass --allow_short_trace only for "
-            "cache-lifecycle smoke tests.\n- " + "\n- ".join(errors)
+            "Prefix-cache performance benchmark trace is not valid for stable sparse/cache measurement. "
+            "Increase prompt lengths and reusable prefix lengths, or lower sparse budgets; pass "
+            "--allow_short_trace only for cache-lifecycle smoke tests.\n- " + "\n- ".join(errors)
         )
 
 
@@ -882,27 +918,29 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--dry_run", action="store_true")
     parser.add_argument("--continue_on_failure", action="store_true")
     parser.add_argument("--allow_short_trace", action="store_true", help="Allow cache-lifecycle smoke traces that do not enter sparse paths.")
+    parser.add_argument("--min_performance_prompt_len", type=int, default=8192)
+    parser.add_argument("--min_cacheable_prefix_len", type=int, default=8192)
     parser.add_argument("--cuda_device", default=None, help="Physical GPU id to expose through CUDA_VISIBLE_DEVICES.")
     parser.add_argument("--case_timeout_s", type=float, default=0.0)
     parser.add_argument("--master_port_base", type=int, default=24000)
 
     parser.add_argument("--seed", type=int, default=20260609)
     parser.add_argument("--history_update", choices=("synthetic", "generated"), default="synthetic")
-    parser.add_argument("--sessions", type=int, default=8)
+    parser.add_argument("--sessions", type=int, default=4)
     parser.add_argument("--turns", type=int, default=4)
-    parser.add_argument("--system_prompt_len", type=int, default=2048)
-    parser.add_argument("--session_prefix_len", type=int, default=256)
-    parser.add_argument("--user_len", type=int, default=64)
-    parser.add_argument("--output_len", type=int, default=32)
-    parser.add_argument("--shared_prompts", type=int, default=16)
-    parser.add_argument("--shared_prefix_len", type=int, default=2048)
-    parser.add_argument("--shared_suffix_len", type=int, default=256)
+    parser.add_argument("--system_prompt_len", type=int, default=16384)
+    parser.add_argument("--session_prefix_len", type=int, default=2048)
+    parser.add_argument("--user_len", type=int, default=256)
+    parser.add_argument("--output_len", type=int, default=128)
+    parser.add_argument("--shared_prompts", type=int, default=4)
+    parser.add_argument("--shared_prefix_len", type=int, default=16384)
+    parser.add_argument("--shared_suffix_len", type=int, default=2048)
 
-    parser.add_argument("--gpu_memory_utilization", type=float, default=0.70)
+    parser.add_argument("--gpu_memory_utilization", type=float, default=0.65)
     parser.add_argument("--tensor_parallel_size", type=int, default=1)
-    parser.add_argument("--max_active_requests", type=int, default=8)
-    parser.add_argument("--max_num_batched_tokens", type=int, default=4096)
-    parser.add_argument("--chunk_prefill_size", type=int, default=1024)
+    parser.add_argument("--max_active_requests", type=int, default=4)
+    parser.add_argument("--max_num_batched_tokens", type=int, default=8192)
+    parser.add_argument("--chunk_prefill_size", type=int, default=4096)
     parser.add_argument("--max_model_len_margin", type=int, default=64)
     parser.add_argument("--hyper_params", default="{}")
 
@@ -910,12 +948,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--prefix_cache_max_blocks", type=int, default=None)
     parser.add_argument("--prefix_cache_salt", default="prefix-cache-bench-v1")
     parser.add_argument("--quest_chunk_size", type=int, default=16)
-    parser.add_argument("--quest_token_budget", type=int, default=1024)
+    parser.add_argument("--quest_token_budget", type=int, default=4096)
 
     parser.add_argument("--num_sink_tokens", type=int, default=8)
-    parser.add_argument("--num_recent_tokens", type=int, default=128)
-    parser.add_argument("--num_top_tokens", type=int, default=512)
-    parser.add_argument("--num_top_tokens_in_prefill", type=int, default=512)
+    parser.add_argument("--num_recent_tokens", type=int, default=256)
+    parser.add_argument("--num_top_tokens", type=int, default=2048)
+    parser.add_argument("--num_top_tokens_in_prefill", type=int, default=2048)
     parser.add_argument("--chunk_prefill_accel_omnikv", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--full_attn_layers", default="0,1,2,4,7,14")
     parser.add_argument("--max_steps_per_round", type=int, default=20000)
