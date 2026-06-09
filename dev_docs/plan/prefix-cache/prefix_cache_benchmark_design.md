@@ -44,6 +44,17 @@ This is the vLLM-style controlled reuse test.
 
 This simulates real chat/agent requests where each new request repeats the previous prompt plus dynamic assistant output and a new user message. Because `prefix_cache_cache_decode_blocks=False`, generated decode tokens are intentionally recomputed on the next turn; only prompt-prefill blocks can be reused.
 
+For comparable performance runs, the benchmark uses deterministic synthetic assistant-history tokens by default (`--history_update synthetic`). Real model outputs are still generated and saved, but they do not feed the next prompt. This keeps all cases on the same request trace while preserving dynamic growing histories. Use `--history_update generated` only for an exploratory traffic simulation where case-to-case prompt traces may diverge after the first turn.
+
+## Sparse-Path Guardrails
+
+Prefix-cache performance runs must enter the sparse method path. The driver fails fast unless `--allow_short_trace` is explicitly passed.
+
+- OmniKV prefill/TTFT sparse path requires `prompt_len > sink_keep_tokens + decode_keep_tokens + recent_keep_tokens + engine_prefill_chunk_size`, and `chunk_prefill_accel_omnikv=True`.
+- OmniKV decode sparse path requires `context_len > sink_keep_tokens + decode_keep_tokens + recent_keep_tokens`.
+- QuEST sparse decode path requires `context_len > quest_token_budget`; QuEST does not sparsify prefill, so TTFT mostly measures prefix-cache prefill reuse plus fixed overhead, while latency/TPOT reflect QuEST decode sparsity.
+- The report records `long_prefill_requests` and `quest_sparse_decode_eligible_requests`; a sparse performance run with zeros there is invalid.
+
 ## Required Outputs
 
 Each run writes:
@@ -72,7 +83,9 @@ Every request is recorded with an explicit status. Failed attempts remain in the
 
 Use `eligible_cache_hit_rate` to validate correctness of the cache matching logic, and use TTFT/latency to evaluate performance.
 
-## Smoke Command
+## Functional Smoke Command
+
+This only validates cache lifecycle, output saving, and failure handling. It is not a sparse performance benchmark, because the prompts are intentionally short and require `--allow_short_trace`.
 
 ```bash
 CUDA_VISIBLE_DEVICES=6 .venv/bin/python scripts/benchmarks/bench_prefix_cache.py \
@@ -95,38 +108,44 @@ CUDA_VISIBLE_DEVICES=6 .venv/bin/python scripts/benchmarks/bench_prefix_cache.py
   --num_top_tokens 128 \
   --num_top_tokens_in_prefill 128 \
   --num_recent_tokens 64 \
+  --full_attn_layers 0,1,2,4,7,14 \
+  --quest_token_budget 128 \
   --master_port_base 25000 \
   --case_timeout_s 900 \
+  --allow_short_trace \
   --continue_on_failure
 ```
 
 ## Quick Realistic Command
 
-Run only when an idle GPU is available:
+Run only when an idle GPU is available. This trace enters OmniKV prefill sparse path and QuEST sparse decode path while keeping runtime manageable.
 
 ```bash
 CUDA_VISIBLE_DEVICES=<idle_gpu> .venv/bin/python scripts/benchmarks/bench_prefix_cache.py \
   --model_path /data2/guquansheng/models/Qwen2.5-7B-Instruct-1M \
   --cases baseline_full,prefix_full,prefix_omnikv,prefix_quest \
   --workloads shared_prefix,multiturn \
-  --sessions 8 \
-  --turns 4 \
-  --system_prompt_len 2048 \
-  --session_prefix_len 256 \
-  --user_len 64 \
-  --shared_prompts 8 \
-  --shared_prefix_len 2048 \
-  --shared_suffix_len 256 \
-  --output_len 32 \
+  --sessions 4 \
+  --turns 3 \
+  --system_prompt_len 4096 \
+  --session_prefix_len 512 \
+  --user_len 128 \
+  --shared_prompts 4 \
+  --shared_prefix_len 4096 \
+  --shared_suffix_len 512 \
+  --output_len 64 \
+  --history_update synthetic \
   --gpu_memory_utilization 0.60 \
-  --max_active_requests 8 \
-  --max_num_batched_tokens 4096 \
+  --max_active_requests 4 \
+  --max_num_batched_tokens 8192 \
   --chunk_prefill_size 1024 \
   --num_top_tokens 512 \
   --num_top_tokens_in_prefill 512 \
   --num_recent_tokens 128 \
+  --num_sink_tokens 8 \
+  --full_attn_layers 0,1,2,4,7,14 \
+  --quest_token_budget 1024 \
   --master_port_base 26000 \
   --case_timeout_s 1800 \
   --continue_on_failure
 ```
-

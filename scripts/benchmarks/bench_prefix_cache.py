@@ -174,7 +174,10 @@ def _case_engine_kwargs(args: argparse.Namespace, case_name: str, max_prompt_len
         "recent_keep_tokens": int(args.num_recent_tokens),
         "decode_keep_tokens": int(args.num_top_tokens),
         "prefill_keep_tokens": int(args.num_top_tokens_in_prefill),
+        "chunk_prefill_accel_omnikv": bool(args.chunk_prefill_accel_omnikv),
+        "full_attn_layers": args.full_attn_layers,
         "quest_chunk_size": int(args.quest_chunk_size),
+        "quest_token_budget": int(args.quest_token_budget),
         "prefix_cache_block_size": _case_block_size(args, case_name),
         "prefix_cache_max_blocks": args.prefix_cache_max_blocks,
         "prefix_cache_salt": args.prefix_cache_salt,
@@ -188,6 +191,9 @@ def _case_engine_kwargs(args: argparse.Namespace, case_name: str, max_prompt_len
     hyper_params["enable_prefix_caching"] = bool(preset["enable_prefix_caching"])
     hyper_params["sparse_method"] = preset["method"]
     hyper_params["quest_chunk_size"] = int(args.quest_chunk_size)
+    hyper_params["quest_token_budget"] = int(args.quest_token_budget)
+    hyper_params["chunk_prefill_accel_omnikv"] = bool(args.chunk_prefill_accel_omnikv)
+    hyper_params["full_attn_layers"] = args.full_attn_layers
     hyper_params["prefix_cache_block_size"] = _case_block_size(args, case_name)
     hyper_params["max_model_len"] = int(max_prompt_len + args.output_len + args.max_model_len_margin)
     hyper_params["max_num_seqs_in_batch"] = int(args.max_active_requests)
@@ -212,6 +218,11 @@ def _sample_tokens(vocab_ids: list[int], rng: random.Random, length: int) -> lis
 
 
 def _token_count_plan(args: argparse.Namespace) -> dict[str, int]:
+    multiturn_first_prompt = (
+        int(args.system_prompt_len)
+        + int(args.session_prefix_len)
+        + int(args.user_len)
+    )
     multiturn_max_prompt = (
         int(args.system_prompt_len)
         + int(args.session_prefix_len)
@@ -219,10 +230,84 @@ def _token_count_plan(args: argparse.Namespace) -> dict[str, int]:
     )
     shared_prefix_max_prompt = int(args.shared_prefix_len) + int(args.shared_suffix_len)
     return {
+        "multiturn_first_prompt": multiturn_first_prompt,
         "multiturn_max_prompt": multiturn_max_prompt,
         "shared_prefix_max_prompt": shared_prefix_max_prompt,
         "max_prompt_len": max(multiturn_max_prompt, shared_prefix_max_prompt),
     }
+
+
+def _long_text_threshold(args: argparse.Namespace, *, is_prefill: bool) -> int:
+    base = int(args.num_sink_tokens) + int(args.num_top_tokens) + int(args.num_recent_tokens)
+    return base + (int(args.chunk_prefill_size) if is_prefill else 0)
+
+
+def _trace_sparse_path_summary(args: argparse.Namespace) -> dict[str, int | bool | str]:
+    plan = _token_count_plan(args)
+    prefill_threshold = _long_text_threshold(args, is_prefill=True)
+    decode_threshold = _long_text_threshold(args, is_prefill=False)
+    return {
+        "history_update": str(args.history_update),
+        "chunk_prefill_accel_omnikv": bool(args.chunk_prefill_accel_omnikv),
+        "omnikv_prefill_long_text_threshold": prefill_threshold,
+        "omnikv_decode_long_text_threshold": decode_threshold,
+        "quest_sparse_decode_threshold": int(args.quest_token_budget),
+        "max_prompt_len": int(plan["max_prompt_len"]),
+        "multiturn_first_prompt": int(plan["multiturn_first_prompt"]),
+        "multiturn_max_prompt": int(plan["multiturn_max_prompt"]),
+        "shared_prefix_max_prompt": int(plan["shared_prefix_max_prompt"]),
+    }
+
+
+def _validate_sparse_path_requirements(args: argparse.Namespace, cases: list[str], workloads: set[str]) -> None:
+    if args.allow_short_trace:
+        return
+
+    errors: list[str] = []
+    summary = _trace_sparse_path_summary(args)
+    prefill_threshold = int(summary["omnikv_prefill_long_text_threshold"])
+    quest_threshold = int(summary["quest_sparse_decode_threshold"])
+    shared_prompt = int(summary["shared_prefix_max_prompt"])
+    multiturn_first = int(summary["multiturn_first_prompt"])
+    multiturn_max = int(summary["multiturn_max_prompt"])
+
+    if "prefix_omnikv" in cases:
+        if not args.chunk_prefill_accel_omnikv:
+            errors.append(
+                "prefix_omnikv requires --chunk_prefill_accel_omnikv for a TTFT/prefill sparse-path benchmark."
+            )
+        if "shared_prefix" in workloads and shared_prompt <= prefill_threshold:
+            errors.append(
+                "shared_prefix prompt is too short for OmniKV prefill sparse path: "
+                f"shared_prefix_len + shared_suffix_len = {shared_prompt}, "
+                f"threshold = sink + top + recent + chunk = {prefill_threshold}."
+            )
+        if "multiturn" in workloads and multiturn_first <= prefill_threshold:
+            errors.append(
+                "multiturn first prompt is too short for OmniKV prefill sparse path: "
+                f"system + session + user = {multiturn_first}, "
+                f"threshold = sink + top + recent + chunk = {prefill_threshold}."
+            )
+
+    if "prefix_quest" in cases:
+        if "shared_prefix" in workloads and shared_prompt <= quest_threshold:
+            errors.append(
+                "shared_prefix prompt is too short for QuEST decode sparse path: "
+                f"shared_prefix_len + shared_suffix_len = {shared_prompt}, "
+                f"quest_token_budget = {quest_threshold}."
+            )
+        if "multiturn" in workloads and multiturn_max <= quest_threshold:
+            errors.append(
+                "multiturn trace is too short for QuEST decode sparse path: "
+                f"max multiturn prompt = {multiturn_max}, quest_token_budget = {quest_threshold}."
+            )
+
+    if errors:
+        raise ValueError(
+            "Prefix-cache performance benchmark trace does not enter the requested sparse path. "
+            "Increase prompt lengths or lower sparse budgets; pass --allow_short_trace only for "
+            "cache-lifecycle smoke tests.\n- " + "\n- ".join(errors)
+        )
 
 
 def _find_live_seq(llm: Any, seq_id: int) -> Any | None:
@@ -394,11 +479,20 @@ def _run_multiturn_workload(
                 payload = json.loads(line)
                 if payload.get("workload") == "multiturn" and payload.get("turn") == turn:
                     raw_generated[payload["request_key"]] = [int(x) for x in payload["generated_token_ids"]]
+        synthetic_history_tokens: dict[str, list[int]] = {}
+        if args.history_update == "synthetic":
+            for session_id in range(int(args.sessions)):
+                request_key = f"mt_s{session_id:04d}_t{turn:03d}"
+                synthetic_history_tokens[request_key] = _sample_tokens(vocab_ids, rng, int(args.output_len))
         for session_id in range(int(args.sessions)):
             request_key = f"mt_s{session_id:04d}_t{turn:03d}"
             generated = raw_generated.get(request_key, [])
             if by_key.get(request_key, {}).get("status") == "success":
-                histories[session_id] = prompt_by_session[session_id] + generated
+                if args.history_update == "generated":
+                    history_tokens = generated
+                else:
+                    history_tokens = synthetic_history_tokens[request_key]
+                histories[session_id] = prompt_by_session[session_id] + history_tokens
     return records
 
 
@@ -474,6 +568,7 @@ def _summarize_records(
     case_name: str,
     case_config: dict[str, Any],
     records: list[dict[str, Any]],
+    args: argparse.Namespace,
     cache_stats_before: dict[str, int],
     cache_stats_after: dict[str, int],
     peak_memory_gb: float,
@@ -492,6 +587,10 @@ def _summarize_records(
     total_generated_tokens = sum(generated_tokens)
     total_cached_tokens = sum(cached_tokens)
     total_eligible_tokens = sum(eligible_tokens)
+    trace_summary = _trace_sparse_path_summary(args)
+    prefill_threshold = int(trace_summary["omnikv_prefill_long_text_threshold"])
+    decode_threshold = int(trace_summary["omnikv_decode_long_text_threshold"])
+    quest_threshold = int(trace_summary["quest_sparse_decode_threshold"])
     stats_delta = {
         key: int(cache_stats_after.get(key, 0)) - int(cache_stats_before.get(key, 0))
         for key in sorted(set(cache_stats_before) | set(cache_stats_after))
@@ -546,6 +645,12 @@ def _summarize_records(
         "physical_kv_reuse_rate": total_cached_tokens / total_prompt_tokens if total_prompt_tokens else 0.0,
         "recomputed_prompt_tokens": total_prompt_tokens - total_cached_tokens,
         "hit_requests": sum(1 for value in cached_tokens if value > 0),
+        "long_prefill_requests": sum(1 for record in bench_success if int(record["prompt_tokens"]) > prefill_threshold),
+        "long_decode_requests": sum(1 for record in bench_success if int(record["prompt_tokens"]) > decode_threshold),
+        "quest_sparse_decode_eligible_requests": sum(
+            1 for record in bench_success if int(record["prompt_tokens"]) > quest_threshold
+        ),
+        "trace_sparse_path_summary": trace_summary,
         "mean_ttft_ms": _mean(ttfts) * 1000.0,
         "median_ttft_ms": _percentile(ttfts, 0.50) * 1000.0,
         "p90_ttft_ms": _percentile(ttfts, 0.90) * 1000.0,
@@ -583,7 +688,7 @@ def _run_case_worker(case_name: str, args_dict: dict[str, Any], case_dir: str) -
             torch.cuda.empty_cache()
             torch.cuda.reset_peak_memory_stats()
 
-        rng = random.Random(int(args.seed) + 1009 * (sorted(CASE_PRESETS).index(case_name) + 1))
+        rng = random.Random(int(args.seed))
         block_size = _case_block_size(args, case_name)
         token_plan = _token_count_plan(args)
         engine_kwargs = _case_engine_kwargs(args, case_name, token_plan["max_prompt_len"])
@@ -635,6 +740,7 @@ def _run_case_worker(case_name: str, args_dict: dict[str, Any], case_dir: str) -
             case_name=case_name,
             case_config=CASE_PRESETS[case_name],
             records=records,
+            args=args,
             cache_stats_before=cache_stats_before,
             cache_stats_after=cache_stats_after,
             peak_memory_gb=peak_memory_gb,
@@ -682,18 +788,22 @@ def _write_report(output_dir: Path, summaries: list[dict[str, Any]], args: argpa
         f"- Workloads: `{args.workloads}`",
         f"- Sessions/turns: `{args.sessions}/{args.turns}`",
         f"- Shared prefix prompts: `{args.shared_prompts}`",
+        f"- History update: `{args.history_update}`",
+        f"- Sparse-path thresholds: `{_trace_sparse_path_summary(args)}`",
         "",
-        "| Case | Status | Method | Prefix cache | Requests | Mean TTFT ms | P90 TTFT ms | Cache hit rate | Eligible hit rate | Recomputed prompt tokens | Peak GB |",
-        "| --- | --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
+        "| Case | Status | Method | Prefix cache | Requests | Long prefill reqs | QuEST sparse-decode reqs | Mean TTFT ms | P90 TTFT ms | Cache hit rate | Eligible hit rate | Recomputed prompt tokens | Peak GB |",
+        "| --- | --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
     ]
     for summary in summaries:
         lines.append(
-            "| {case} | {status} | {method} | {prefix} | {requests} | {mean_ttft:.2f} | {p90_ttft:.2f} | {hit:.4f} | {eligible:.4f} | {recomputed} | {mem:.2f} |".format(
+            "| {case} | {status} | {method} | {prefix} | {requests} | {long_prefill} | {quest_decode} | {mean_ttft:.2f} | {p90_ttft:.2f} | {hit:.4f} | {eligible:.4f} | {recomputed} | {mem:.2f} |".format(
                 case=summary.get("case", ""),
                 status=summary.get("status", ""),
                 method=summary.get("method", ""),
                 prefix=str(summary.get("enable_prefix_caching", "")),
                 requests=int(summary.get("bench_requests", 0) or 0),
+                long_prefill=int(summary.get("long_prefill_requests", 0) or 0),
+                quest_decode=int(summary.get("quest_sparse_decode_eligible_requests", 0) or 0),
                 mean_ttft=float(summary.get("mean_ttft_ms", 0.0) or 0.0),
                 p90_ttft=float(summary.get("p90_ttft_ms", 0.0) or 0.0),
                 hit=float(summary.get("cache_hit_rate", 0.0) or 0.0),
@@ -739,6 +849,7 @@ def _append_ledger(output_dir: Path, summaries: list[dict[str, Any]], args: argp
                 "shared_prefix_len": args.shared_prefix_len,
                 "shared_suffix_len": args.shared_suffix_len,
                 "output_len": args.output_len,
+                "history_update": args.history_update,
             },
             "dataset": "synthetic_token_trace",
             "split": "synthetic",
@@ -770,11 +881,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--objective", default="evaluate Sparse-vLLM prefix cache on realistic multi-turn traces")
     parser.add_argument("--dry_run", action="store_true")
     parser.add_argument("--continue_on_failure", action="store_true")
+    parser.add_argument("--allow_short_trace", action="store_true", help="Allow cache-lifecycle smoke traces that do not enter sparse paths.")
     parser.add_argument("--cuda_device", default=None, help="Physical GPU id to expose through CUDA_VISIBLE_DEVICES.")
     parser.add_argument("--case_timeout_s", type=float, default=0.0)
     parser.add_argument("--master_port_base", type=int, default=24000)
 
     parser.add_argument("--seed", type=int, default=20260609)
+    parser.add_argument("--history_update", choices=("synthetic", "generated"), default="synthetic")
     parser.add_argument("--sessions", type=int, default=8)
     parser.add_argument("--turns", type=int, default=4)
     parser.add_argument("--system_prompt_len", type=int, default=2048)
@@ -797,11 +910,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--prefix_cache_max_blocks", type=int, default=None)
     parser.add_argument("--prefix_cache_salt", default="prefix-cache-bench-v1")
     parser.add_argument("--quest_chunk_size", type=int, default=16)
+    parser.add_argument("--quest_token_budget", type=int, default=1024)
 
-    parser.add_argument("--num_sink_tokens", type=int, default=16)
+    parser.add_argument("--num_sink_tokens", type=int, default=8)
     parser.add_argument("--num_recent_tokens", type=int, default=128)
     parser.add_argument("--num_top_tokens", type=int, default=512)
     parser.add_argument("--num_top_tokens_in_prefill", type=int, default=512)
+    parser.add_argument("--chunk_prefill_accel_omnikv", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--full_attn_layers", default="0,1,2,4,7,14")
     parser.add_argument("--max_steps_per_round", type=int, default=20000)
     return parser.parse_args()
 
@@ -815,6 +931,7 @@ def main() -> None:
         raise ValueError(f"Unsupported workloads: {sorted(unsupported_workloads)}")
     if args.output_len < 2:
         raise ValueError("--output_len must be >= 2 so per-request prefix-hit metadata remains observable.")
+    _validate_sparse_path_requirements(args, cases, workloads)
     if args.cuda_device is not None:
         os.environ["CUDA_VISIBLE_DEVICES"] = str(args.cuda_device)
 
@@ -832,6 +949,7 @@ def main() -> None:
         "cases": cases,
         "workloads": sorted(workloads),
         "token_count_plan": _token_count_plan(args),
+        "trace_sparse_path_summary": _trace_sparse_path_summary(args),
         "case_engine_kwargs": {
             case: _case_engine_kwargs(args, case, _token_count_plan(args)["max_prompt_len"])
             for case in cases
