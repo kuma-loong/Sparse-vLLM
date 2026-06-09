@@ -138,6 +138,10 @@ class StandardCacheManager(CacheManager):
     def num_free_slots(self) -> int:
         return self._num_free_slots
 
+    @property
+    def num_free_rows(self) -> int:
+        return len(self.free_rows)
+
     def _require_prefix_cache(self) -> PrefixCacheIndex:
         if self.prefix_cache is None:
             raise RuntimeError("prefix cache is not enabled for this cache manager.")
@@ -173,6 +177,20 @@ class StandardCacheManager(CacheManager):
         hit_len = int(getattr(seq, "prefix_cache_hit_len", 0) or 0)
         suffix_len = int(seq.num_prompt_tokens - hit_len)
         return suffix_len + self._prefix_hit_evictable_slots(seq)
+
+    def prompt_admission_budgets(
+        self,
+        waiting_seqs: deque[Sequence],
+        chunk_prefill_size: int,
+    ) -> dict[str, int]:
+        budgets = super().prompt_admission_budgets(waiting_seqs, chunk_prefill_size)
+        budgets["rows"] = int(self.num_free_rows)
+        return budgets
+
+    def prompt_admission_costs(self, seq: Sequence) -> dict[str, int]:
+        costs = super().prompt_admission_costs(seq)
+        costs["rows"] = 1
+        return costs
 
     def prompt_logical_reservation_cost(self, seq: Sequence) -> int:
         return int(self.prompt_admission_cost(seq))

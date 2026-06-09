@@ -1,5 +1,6 @@
 import os
 import pickle
+import time
 import torch
 import torch.distributed as dist
 from sparsevllm.utils.log import logger
@@ -39,6 +40,7 @@ class ModelRunner:
         self.event = event
 
         # 初始化分布式环境并绑定对应的 GPU 卡
+        torch.cuda.set_device(rank)
         if not dist.is_initialized():
             master_port = int(os.getenv("SPARSEVLLM_MASTER_PORT", "2333"))
             dist.init_process_group(
@@ -47,7 +49,6 @@ class ModelRunner:
                 world_size=self.world_size,
                 rank=rank,
             )
-        torch.cuda.set_device(rank)
         
         default_dtype = torch.get_default_dtype()
         torch.set_default_dtype(hf_config.torch_dtype)
@@ -101,10 +102,10 @@ class ModelRunner:
             if rank == 0:
                 # Rank 0 创建共享内存用于发送方法调用指令
                 self.shm = SharedMemory(name="sparsevllm", create=True, size=2**20)
-                dist.barrier()
+                dist.barrier(device_ids=[rank])
             else:
                 # 其他 Rank 监听共享内存中的指令
-                dist.barrier()
+                dist.barrier(device_ids=[rank])
                 self.shm = SharedMemory(name="sparsevllm")
                 self.loop()
 
@@ -112,7 +113,7 @@ class ModelRunner:
         """释放资源并注销分布式进程组"""
         if self.world_size > 1:
             self.shm.close()
-            dist.barrier()
+            dist.barrier(device_ids=[self.rank])
             if self.rank == 0:
                 self.shm.unlink()
         torch.cuda.synchronize()
@@ -140,10 +141,24 @@ class ModelRunner:
         assert self.world_size > 1 and self.rank == 0
         data = pickle.dumps([method_name, *args])
         n = len(data)
+        if n + 4 > len(self.shm.buf):
+            raise RuntimeError(
+                f"Shared memory command is too large: {n + 4} > {len(self.shm.buf)}"
+            )
         self.shm.buf[0:4] = n.to_bytes(4, "little")
         self.shm.buf[4:n+4] = data
         for event in self.event:
             event.set()
+        timeout_s = float(os.getenv("SPARSEVLLM_TP_RPC_ACK_TIMEOUT_S", "30"))
+        deadline = time.monotonic() + timeout_s
+        for event in self.event:
+            while event.is_set():
+                if time.monotonic() > deadline:
+                    raise RuntimeError(
+                        "Timed out waiting for TP worker to read shared-memory RPC "
+                        f"method={method_name!r} timeout_s={timeout_s}."
+                    )
+                time.sleep(0.0001)
 
     def call(self, method_name, *args):
         """RPC 风格的调用：如果是 Rank 0 则先广播指令，然后所有进程执行本地逻辑"""
@@ -169,13 +184,22 @@ class ModelRunner:
     def free_slots(self, seq_id: int):
         """通知 CacheManager 释放该序列占用的物理显存位子"""
         with profiler.record("model_free_slots"):
-            if os.getenv("SPARSEVLLM_DEBUG_SLOTS", "0") == "1":
-                before = self.cache_manager.free_slot_stats()
-                logger.info("model_runner.free_slots seq_id={} before={}", seq_id, before)
-            self.cache_manager.free_seq(seq_id)
-            if os.getenv("SPARSEVLLM_DEBUG_SLOTS", "0") == "1":
-                after = self.cache_manager.free_slot_stats()
-                logger.info("model_runner.free_slots seq_id={} after={}", seq_id, after)
+            self._free_slots_one(int(seq_id))
+
+    def free_slots_batch(self, seq_ids: list[int]):
+        """Notify CacheManager to release multiple finished sequence rows."""
+        with profiler.record("model_free_slots_batch"):
+            for seq_id in seq_ids:
+                self._free_slots_one(int(seq_id))
+
+    def _free_slots_one(self, seq_id: int):
+        if os.getenv("SPARSEVLLM_DEBUG_SLOTS", "0") == "1":
+            before = self.cache_manager.free_slot_stats()
+            logger.info("model_runner.free_slots seq_id={} before={}", seq_id, before)
+        self.cache_manager.free_seq(seq_id)
+        if os.getenv("SPARSEVLLM_DEBUG_SLOTS", "0") == "1":
+            after = self.cache_manager.free_slot_stats()
+            logger.info("model_runner.free_slots seq_id={} after={}", seq_id, after)
 
     def _long_text_threshold(self, is_prefill: bool) -> int:
         if self.config.vllm_sparse_method == "deltakv-snapkv":

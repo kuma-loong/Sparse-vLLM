@@ -306,8 +306,11 @@ class LLMEngine:
             # 2. 显式处理抢占 (Eviction)：
             # 如果有序列被调度器踢出，立即广播指令让所有 Rank 释放其占用的物理槽位
             with profiler.record("preempt_free"):
-                for seq in preempted_seqs:
-                    self.model_runner.call("free_slots", seq.seq_id)
+                if preempted_seqs:
+                    self.model_runner.call(
+                        "free_slots_batch",
+                        [int(seq.seq_id) for seq in preempted_seqs],
+                    )
                 
             if not seqs:
                 # No progress can be made; avoid infinite busy-looping in callers.
@@ -382,9 +385,10 @@ class LLMEngine:
             # 遍历序列，如果已达到 EOS 或最大长度，则通知所有进程释放物理槽位
             with profiler.record("finished_free"):
                 finished_outputs = []
+                finished_seq_ids = []
                 for seq in seqs:
                     if seq.is_finished:
-                        self.model_runner.call("free_slots", seq.seq_id)
+                        finished_seq_ids.append(int(seq.seq_id))
                         finished_outputs.append(
                             (
                                 seq.seq_id,
@@ -393,6 +397,8 @@ class LLMEngine:
                                 seq.completion_top_logprobs,
                             )
                         )
+                if finished_seq_ids:
+                    self.model_runner.call("free_slots_batch", finished_seq_ids)
         
         # 计算吞吐量统计数据 (正数表示 Prefill，负数表示 Decode)
         num_tokens = sum(seq.current_chunk_size for seq in seqs) if is_prefill else -len(seqs)

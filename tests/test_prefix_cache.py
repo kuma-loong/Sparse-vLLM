@@ -179,6 +179,20 @@ def test_prefix_cache_fingerprint_isolates_salt_and_method():
     assert omnikv != quest
 
 
+def test_standard_prompt_admission_accounts_for_free_rows():
+    manager = _make_standard_manager_for_prefix(block_size=2)
+    manager.free_rows = deque([0])
+    seq = Sequence([1, 2, 3])
+
+    budgets = manager.prompt_admission_budgets(deque(), chunk_prefill_size=4)
+    costs = manager.prompt_admission_costs(seq)
+
+    assert budgets["rows"] == 1
+    assert costs["rows"] == 1
+    assert budgets["slots"] == manager.prompt_admission_free_slots()
+    assert costs["slots"] == manager.prompt_admission_cost(seq)
+
+
 def test_lookup_returns_longest_full_block_prefix():
     fp = build_prefix_cache_fingerprint(_cfg(), 4)
     index = PrefixCacheIndex(block_size=4, fingerprint=fp)
