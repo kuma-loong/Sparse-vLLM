@@ -175,7 +175,7 @@ def _case_engine_kwargs(args: argparse.Namespace, case_name: str, max_prompt_len
         "decode_keep_tokens": int(args.num_top_tokens),
         "prefill_keep_tokens": int(args.num_top_tokens_in_prefill),
         "chunk_prefill_accel_omnikv": bool(args.chunk_prefill_accel_omnikv),
-        "full_attn_layers": args.full_attn_layers,
+        "full_attention_layers": args.full_attention_layers,
         "quest_chunk_size": int(args.quest_chunk_size),
         "quest_token_budget": int(args.quest_token_budget),
         "prefix_cache_block_size": _case_block_size(args, case_name),
@@ -193,7 +193,7 @@ def _case_engine_kwargs(args: argparse.Namespace, case_name: str, max_prompt_len
     hyper_params["quest_chunk_size"] = int(args.quest_chunk_size)
     hyper_params["quest_token_budget"] = int(args.quest_token_budget)
     hyper_params["chunk_prefill_accel_omnikv"] = bool(args.chunk_prefill_accel_omnikv)
-    hyper_params["full_attn_layers"] = args.full_attn_layers
+    hyper_params["full_attention_layers"] = args.full_attention_layers
     hyper_params["prefix_cache_block_size"] = _case_block_size(args, case_name)
     hyper_params["max_model_len"] = int(max_prompt_len + args.output_len + args.max_model_len_margin)
     hyper_params["max_num_seqs_in_batch"] = int(args.max_active_requests)
@@ -955,7 +955,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--num_top_tokens", type=int, default=2048)
     parser.add_argument("--num_top_tokens_in_prefill", type=int, default=2048)
     parser.add_argument("--chunk_prefill_accel_omnikv", action=argparse.BooleanOptionalAction, default=True)
-    parser.add_argument("--full_attn_layers", default="0,1,2,4,7,14")
+    parser.add_argument(
+        "--full_attention_layers",
+        "--full_attn_layers",
+        dest="full_attention_layers",
+        default="0,1,2,4,7,14",
+    )
     parser.add_argument("--max_steps_per_round", type=int, default=20000)
     return parser.parse_args()
 

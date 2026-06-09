@@ -109,7 +109,7 @@ CUDA_VISIBLE_DEVICES=6 .venv/bin/python scripts/benchmarks/bench_prefix_cache.py
   --num_top_tokens 128 \
   --num_top_tokens_in_prefill 128 \
   --num_recent_tokens 64 \
-  --full_attn_layers 0,1,2,4,7,14 \
+  --full_attention_layers 0,1,2,4,7,14 \
   --quest_token_budget 128 \
   --master_port_base 25000 \
   --case_timeout_s 900 \
@@ -144,7 +144,7 @@ CUDA_VISIBLE_DEVICES=<idle_gpu> .venv/bin/python scripts/benchmarks/bench_prefix
   --num_top_tokens_in_prefill 2048 \
   --num_recent_tokens 256 \
   --num_sink_tokens 8 \
-  --full_attn_layers 0,1,2,4,7,14 \
+  --full_attention_layers 0,1,2,4,7,14 \
   --quest_token_budget 4096 \
   --master_port_base 26000 \
   --case_timeout_s 3600 \
@@ -178,7 +178,7 @@ CUDA_VISIBLE_DEVICES=<idle_gpu> .venv/bin/python scripts/benchmarks/bench_prefix
   --num_top_tokens_in_prefill 4096 \
   --num_recent_tokens 512 \
   --num_sink_tokens 8 \
-  --full_attn_layers 0,1,2,4,7,14 \
+  --full_attention_layers 0,1,2,4,7,14 \
   --quest_token_budget 8192 \
   --min_performance_prompt_len 16384 \
   --min_cacheable_prefix_len 16384 \
