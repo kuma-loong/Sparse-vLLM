@@ -1,17 +1,50 @@
 import os
 from dataclasses import dataclass
 from transformers import AutoConfig, Qwen3Config
-from typing import Union
+from typing import Any, Union
 from sparsevllm.method_registry import (
     DECODE_CUDA_GRAPH_SUPPORTED_METHODS,
     PREFILL_POLICY_AUTO,
+    PREFIX_CACHE_SUPPORTED_METHODS,
     SUPPORTED_SPARSE_METHODS,
     is_decode_cuda_graph_supported,
     is_deltakv_method,
     normalize_sparse_method,
     resolve_prefill_schedule_policy,
 )
+from sparsevllm.engine.prefix_cache import resolve_prefix_cache_block_size
 from sparsevllm.utils.log import logger
+
+
+def _coerce_bool_config(name: str, value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        raw = value.strip().lower()
+        if raw in {"1", "true", "yes", "on"}:
+            return True
+        if raw in {"0", "false", "no", "off"}:
+            return False
+    raise ValueError(f"{name} must be a boolean or explicit true/false string, got {value!r}.")
+
+
+def _coerce_optional_positive_int(name: str, value: Any) -> int | None:
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        raise ValueError(f"{name} must be a positive integer, got {value!r}.")
+    if isinstance(value, int):
+        parsed = value
+    elif isinstance(value, str):
+        raw = value.strip()
+        if not raw.isdecimal():
+            raise ValueError(f"{name} must be a positive integer, got {value!r}.")
+        parsed = int(raw)
+    else:
+        raise ValueError(f"{name} must be a positive integer, got {value!r}.")
+    if parsed <= 0:
+        raise ValueError(f"{name} must be > 0 when set, got {parsed}.")
+    return parsed
 
 
 def _default_decode_cuda_graph_capture_sizes(max_decoding_seqs: int) -> list[int]:
@@ -88,6 +121,13 @@ class Config:
     # Sparse Attention Config
     vllm_sparse_method: str = ""  # "", "streamingllm", "attention-sink", "attention_sink", "snapkv", "omnikv", "quest", "deltakv", "deltakv-triton", "deltakv-triton-v2", "deltakv-triton-v3", "deltakv-triton-v4", "deltakv-delta-quant", "deltakv_delta_quant", "deltakv-standalone", "deltakv-snapkv", "pyramidkv"
 
+    # Prefix Cache Config
+    enable_prefix_caching: bool = False
+    prefix_cache_block_size: int | None = None
+    prefix_cache_max_blocks: int | None = None
+    prefix_cache_salt: str = ""
+    prefix_cache_cache_decode_blocks: bool = False
+
     # General Sparse Config
     num_sink_tokens: int = 64
     num_recent_tokens: int = 512
@@ -163,6 +203,24 @@ class Config:
                 f"Unsupported vllm_sparse_method={self.vllm_sparse_method!r}. "
                 f"Supported methods: '', {supported}."
             )
+        self.enable_prefix_caching = _coerce_bool_config("enable_prefix_caching", self.enable_prefix_caching)
+        self.prefix_cache_cache_decode_blocks = _coerce_bool_config(
+            "prefix_cache_cache_decode_blocks",
+            self.prefix_cache_cache_decode_blocks,
+        )
+        self.prefix_cache_block_size = _coerce_optional_positive_int(
+            "prefix_cache_block_size",
+            self.prefix_cache_block_size,
+        )
+        self.prefix_cache_max_blocks = _coerce_optional_positive_int(
+            "prefix_cache_max_blocks",
+            self.prefix_cache_max_blocks,
+        )
+        if self.enable_prefix_caching and self.vllm_sparse_method not in PREFIX_CACHE_SUPPORTED_METHODS:
+            raise ValueError("prefix caching only supports vanilla, omnikv, quest.")
+        if self.prefix_cache_cache_decode_blocks:
+            raise ValueError("prefix_cache_cache_decode_blocks is not supported yet.")
+        self.prefix_cache_salt = str(self.prefix_cache_salt or "")
         self.prefill_schedule_policy = resolve_prefill_schedule_policy(
             self.vllm_sparse_method,
             self.prefill_schedule_policy,
@@ -199,6 +257,8 @@ class Config:
         if self.decode_cuda_graph_capture_sampling and not self.decode_cuda_graph:
             raise ValueError("decode_cuda_graph_capture_sampling requires decode_cuda_graph=True.")
         if self.decode_cuda_graph:
+            if self.enable_prefix_caching:
+                raise ValueError("prefix caching with decode_cuda_graph will be enabled after validation.")
             if not is_decode_cuda_graph_supported(self.vllm_sparse_method):
                 if is_deltakv_method(self.vllm_sparse_method):
                     raise ValueError("decode_cuda_graph does not support DeltaKV methods yet.")
@@ -247,6 +307,7 @@ class Config:
             raise ValueError("quest_token_budget 必须 > 0")
         if self.quest_skip_layers < 0:
             raise ValueError("quest_skip_layers 不能 < 0")
+        self.prefix_cache_block_size = resolve_prefix_cache_block_size(self)
 
         # Normalize compressor type strings.
         for attr in ("compressor_down_type", "compressor_up_type"):
