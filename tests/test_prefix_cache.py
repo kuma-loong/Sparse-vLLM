@@ -9,6 +9,7 @@ import pytest
 import torch
 
 from sparsevllm.config import Config
+from sparsevllm.engine.cache_manager.quest import QuestCacheManager
 from sparsevllm.engine.cache_manager.standard import StandardCacheManager
 from sparsevllm.engine.sequence import Sequence
 from sparsevllm.engine.prefix_cache import (
@@ -101,6 +102,53 @@ def _make_standard_manager_for_prefix(block_size=2):
     manager.prefix_runtime_states = {}
     manager.pending_prefix_blocks = {}
     return manager
+
+
+def _make_quest_manager_for_prefix(page_size=2):
+    cfg = _cfg(method="quest", block_size=page_size)
+    fingerprint = build_prefix_cache_fingerprint(cfg, page_size)
+    manager = object.__new__(QuestCacheManager)
+    manager.config = cfg
+    manager.enable_prefix_caching = True
+    manager.page_size = page_size
+    manager.num_pages = 10
+    manager.prefix_cache_block_size = page_size
+    manager.prefix_cache = PrefixCacheIndex(block_size=page_size, fingerprint=fingerprint)
+    manager.page_offsets_i32 = torch.arange(page_size, dtype=torch.int32)
+    manager.buffer_req_to_token_slots = torch.zeros((2, 16), dtype=torch.int32)
+    manager.buffer_req_to_page_slots = torch.full((2, 8), -1, dtype=torch.int32)
+    manager.free_pages_stack = torch.arange(10, dtype=torch.int32)
+    manager._num_free_pages = 10
+    manager.seq_id_to_row = {}
+    manager.free_rows = deque([0, 1])
+    manager.row_seq_lens = np.zeros((2,), dtype=np.int32)
+    manager.seq_id_to_prefix_blocks = {}
+    manager.seq_id_to_materialized_blocks = {}
+    manager.seq_id_to_cached_pages = {}
+    manager.prefix_runtime_states = {}
+    manager.pending_prefix_blocks = {}
+    return manager
+
+
+def _remove_free_page(manager, page_slot: int):
+    pages = [
+        int(page)
+        for page in manager.free_pages_stack[: manager._num_free_pages].tolist()
+        if int(page) != int(page_slot)
+    ]
+    manager.free_pages_stack[: len(pages)] = torch.tensor(pages, dtype=torch.int32)
+    manager._num_free_pages = len(pages)
+
+
+def _remove_free_slots(manager, slots: list[int]):
+    remove = {int(slot) for slot in slots}
+    free_slots = [
+        int(slot)
+        for slot in manager.free_slots_stack[: manager._num_free_slots].tolist()
+        if int(slot) not in remove
+    ]
+    manager.free_slots_stack[: len(free_slots)] = torch.tensor(free_slots, dtype=torch.int32)
+    manager._num_free_slots = len(free_slots)
 
 
 def test_usable_prefix_cache_tokens_leaves_logits_work():
@@ -279,6 +327,7 @@ def test_standard_attach_pins_prefix_slots_and_free_seq_keeps_cached_slots():
         slots=torch.tensor([10, 11], dtype=torch.int32),
         token_ids=(1, 2),
     )
+    _remove_free_slots(manager, [10, 11])
     manager.prefix_cache.insert_block(block)
     seq.prefix_cache_enabled = True
     seq.prefix_cache_hit_len = 2
@@ -294,10 +343,10 @@ def test_standard_attach_pins_prefix_slots_and_free_seq_keeps_cached_slots():
 
     manager._allocate(seq.seq_id, 1)
     assert manager.row_seq_lens[0] == 3
-    assert manager._num_free_slots == 89
+    assert manager._num_free_slots == 87
 
     manager.free_seq(seq.seq_id)
-    assert manager._num_free_slots == 90
+    assert manager._num_free_slots == 88
     assert block.ref_count == 0
     assert manager.seq_id_to_row == {}
 
@@ -354,3 +403,136 @@ def test_standard_admission_reserves_evictable_hit_blocks():
 
     block.ref_count = 1
     assert manager.prompt_admission_cost(seq) == 1
+
+
+def test_quest_attach_pins_pages_and_free_seq_keeps_cached_page():
+    manager = _make_quest_manager_for_prefix(page_size=2)
+    seq = Sequence([1, 2, 3])
+    key = manager.prefix_cache.hash_block([1, 2], None)
+    block = PrefixCacheBlock(
+        key=key,
+        parent_key=None,
+        block_size=2,
+        logical_block_idx=0,
+        slots=torch.tensor([10, 11], dtype=torch.int32),
+        page_slot=5,
+        token_ids=(1, 2),
+    )
+    _remove_free_page(manager, 5)
+    manager.prefix_cache.insert_block(block)
+    seq.prefix_cache_enabled = True
+    seq.prefix_cache_hit_len = 2
+    seq.prefix_cache_hit_blocks = 1
+    seq.prefix_cache_hit_last_key = key
+    seq.prefix_cache_block_size = 2
+    seq.prefix_cache_method = "quest"
+
+    manager._attach_prefix_cache_if_needed(seq)
+    assert manager.row_seq_lens[0] == 2
+    assert manager.buffer_req_to_page_slots[0, 0].item() == 5
+    assert manager.buffer_req_to_token_slots[0, :2].tolist() == [10, 11]
+    assert block.ref_count == 1
+
+    manager._allocate(seq.seq_id, 1)
+    assert manager.row_seq_lens[0] == 3
+    assert manager._num_free_pages == 8
+
+    manager.free_seq(seq.seq_id)
+    assert manager._num_free_pages == 9
+    assert block.ref_count == 0
+
+    evicted = manager.prefix_cache.evict_until_freeable(1)
+    manager._free_prefix_cache_blocks(evicted)
+    assert manager._num_free_pages == 10
+    reused = manager._allocate(Sequence([4]).seq_id, 1)
+    assert reused.tolist() == [10]
+
+
+def test_quest_allocate_can_fill_partial_page_without_free_pages():
+    manager = _make_quest_manager_for_prefix(page_size=2)
+    seq = Sequence([1, 2])
+    manager._num_free_pages = 1
+
+    first = manager._allocate(seq.seq_id, 1)
+    assert first.tolist() == [0]
+    assert manager._num_free_pages == 0
+
+    second = manager._allocate(seq.seq_id, 1)
+    assert second.tolist() == [1]
+    assert manager._num_free_pages == 0
+
+
+def test_quest_prefill_step_capacity_counts_partial_pages():
+    manager = _make_quest_manager_for_prefix(page_size=2)
+    seq = Sequence([1, 2])
+    manager._num_free_pages = 1
+    manager._allocate(seq.seq_id, 1)
+    manager._num_free_pages = 0
+
+    assert manager.prefill_step_free_slots() == 1
+    assert manager.prefill_step_free_slots_for(seq) == 1
+    assert manager.prefill_step_reservation_cost(seq, 1) == 1
+    assert manager.prefill_step_reservation_cost(Sequence([3]), 1) == 2
+    assert manager.prefill_step_free_slots_for(Sequence([3])) == 0
+
+
+def test_quest_decode_capacity_counts_requests_not_tokens():
+    manager = _make_quest_manager_for_prefix(page_size=2)
+    seq = Sequence([1, 2])
+    manager._num_free_pages = 1
+
+    assert manager.decode_step_free_slots() == 2
+    assert manager.decode_step_free_slots_for(seq) == 2
+    assert manager.decode_step_reservation_cost(seq) == 2
+
+    manager._allocate(seq.seq_id, 1)
+    manager._num_free_pages = 0
+    assert manager.decode_step_free_slots() == 1
+    assert manager.decode_step_free_slots_for(seq) == 1
+    assert manager.decode_step_reservation_cost(seq) == 1
+    assert manager.decode_step_free_slots_for(Sequence([3])) == 0
+    assert manager.decode_step_reservation_cost(Sequence([3])) == 2
+
+
+def test_quest_materializes_pages_only_after_forward_end():
+    manager = _make_quest_manager_for_prefix(page_size=2)
+    seq = Sequence([1, 2])
+    slots = torch.tensor([4, 5], dtype=torch.int32)
+
+    manager._record_prefix_materialization(seq, [1, 2], slots)
+    assert len(manager.prefix_cache) == 0
+
+    manager.on_forward_end([seq], is_prefill=True)
+    assert len(manager.prefix_cache) == 1
+    block = next(iter(manager.prefix_cache._blocks.values()))
+    assert block.ref_count == 1
+    assert block.page_slot == 2
+    assert block.slots.tolist() == [4, 5]
+    assert manager.seq_id_to_cached_pages[seq.seq_id] == {0}
+
+
+def test_quest_admission_is_page_aligned_and_reserves_hit_pages():
+    manager = _make_quest_manager_for_prefix(page_size=2)
+    manager._num_free_pages = 1
+    seq = Sequence([1, 2, 3])
+    key = manager.prefix_cache.hash_block([1, 2], None)
+    block = PrefixCacheBlock(
+        key=key,
+        parent_key=None,
+        block_size=2,
+        logical_block_idx=0,
+        slots=torch.tensor([10, 11], dtype=torch.int32),
+        page_slot=5,
+        token_ids=(1, 2),
+    )
+    _remove_free_page(manager, 5)
+    manager.prefix_cache.insert_block(block)
+    seq.prefix_cache_hit_len = 2
+    seq.prefix_cache_hit_blocks = 1
+    seq.prefix_cache_hit_last_key = key
+
+    assert manager.prompt_admission_free_slots() == 4
+    assert manager.prompt_admission_cost(seq) == 4
+
+    block.ref_count = 1
+    assert manager.prompt_admission_cost(seq) == 2

@@ -35,8 +35,20 @@ class FakeMemoryOracle:
     def prefill_step_free_slots(self):
         return self._free_slots
 
+    def prefill_step_free_slots_for(self, seq):
+        return self._free_slots
+
+    def prefill_step_reservation_cost(self, seq, scheduled_tokens):
+        return int(scheduled_tokens)
+
     def decode_step_free_slots(self):
         return self._free_slots
+
+    def decode_step_free_slots_for(self, seq):
+        return self._free_slots
+
+    def decode_step_reservation_cost(self, seq):
+        return 1
 
     def reserved_prefill_slots(self, waiting, chunk_prefill_size):
         return 0
