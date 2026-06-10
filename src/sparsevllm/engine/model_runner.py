@@ -113,7 +113,6 @@ class ModelRunner:
         """释放资源并注销分布式进程组"""
         if self.world_size > 1:
             self.shm.close()
-            dist.barrier(device_ids=[self.rank])
             if self.rank == 0:
                 self.shm.unlink()
         torch.cuda.synchronize()
@@ -136,7 +135,7 @@ class ModelRunner:
         self.event.clear()
         return method_name, args
 
-    def write_shm(self, method_name, *args):
+    def write_shm(self, method_name, *args, wait_for_ack: bool = True):
         """序列化方法名 and 参数并写入共享内存"""
         assert self.world_size > 1 and self.rank == 0
         data = pickle.dumps([method_name, *args])
@@ -149,6 +148,8 @@ class ModelRunner:
         self.shm.buf[4:n+4] = data
         for event in self.event:
             event.set()
+        if not wait_for_ack:
+            return
         timeout_s = float(os.getenv("SPARSEVLLM_TP_RPC_ACK_TIMEOUT_S", "30"))
         deadline = time.monotonic() + timeout_s
         for event in self.event:
@@ -163,7 +164,7 @@ class ModelRunner:
     def call(self, method_name, *args):
         """RPC 风格的调用：如果是 Rank 0 则先广播指令，然后所有进程执行本地逻辑"""
         if self.world_size > 1 and self.rank == 0:
-            self.write_shm(method_name, *args)
+            self.write_shm(method_name, *args, wait_for_ack=(method_name != "exit"))
         method = getattr(self, method_name, None)
         # Ensure *all* runner-side ops (including sparse post-processing like DeltaKV eviction)
         # run without autograd bookkeeping to avoid large activation graphs / OOM.

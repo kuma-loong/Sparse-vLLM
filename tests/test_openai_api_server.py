@@ -195,6 +195,54 @@ class OpenAIAPIServerTest(unittest.IsolatedAsyncioTestCase):
         finally:
             dispatcher.close()
 
+    async def test_dispatcher_close_does_not_wait_forever_for_active_step(self):
+        from sparsevllm.entrypoints.openai import api_server
+
+        class Tokenizer:
+            def encode(self, _prompt):
+                return [1]
+
+            def decode(self, token_ids, skip_special_tokens=True):
+                return "".join(str(token_id) for token_id in token_ids)
+
+        class Engine:
+            def __init__(self):
+                self.tokenizer = Tokenizer()
+                self.last_step_token_outputs = []
+                self.step_started = threading.Event()
+                self.release_step = threading.Event()
+                self.exited = threading.Event()
+
+            def add_request(self, _prompt, _sampling_params):
+                return 1
+
+            def abort_request(self, _seq_id):
+                pass
+
+            def step(self):
+                self.step_started.set()
+                self.release_step.wait(timeout=5)
+                return [], 0
+
+            def exit(self):
+                self.exited.set()
+
+        engine = Engine()
+        dispatcher = api_server.AsyncEngineDispatcher(engine)
+        with patch.object(api_server, "DISPATCHER_SHUTDOWN_JOIN_TIMEOUT_S", 0.01):
+            sampling_params = type("SamplingParams", (), {"max_tokens": 1})()
+            handle = await dispatcher.submit("prompt", sampling_params, 0)
+            try:
+                self.assertTrue(await asyncio.to_thread(engine.step_started.wait, 5))
+                started = time.perf_counter()
+                await asyncio.to_thread(dispatcher.close)
+                self.assertLess(time.perf_counter() - started, 1.0)
+                self.assertTrue(engine.exited.is_set())
+            finally:
+                handle.cancelled.set()
+                engine.release_step.set()
+                dispatcher._thread.join(timeout=1.0)
+
     async def test_completion_route_error_cancels_sibling_handles(self):
         from fastapi import HTTPException
 

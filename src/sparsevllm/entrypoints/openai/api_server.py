@@ -33,6 +33,7 @@ SEMANTIC_ENGINE_ARGS = {
     "deltakv_neighbor_count",
     "observation_layers",
 }
+DISPATCHER_SHUTDOWN_JOIN_TIMEOUT_S = 1.0
 
 
 class CompletionRequest(BaseModel):
@@ -112,6 +113,7 @@ class AsyncEngineDispatcher:
         self._pending: queue.Queue[_QueuedRequest | None] = queue.Queue()
         self._aborts: queue.Queue[int] = queue.Queue()
         self._closing = threading.Event()
+        self._closed = threading.Event()
         self._failed_message: str | None = None
         self._thread = threading.Thread(target=self._run, name="sparsevllm-openai-dispatcher", daemon=True)
         self._thread.start()
@@ -154,9 +156,12 @@ class AsyncEngineDispatcher:
             self._aborts.put(handle.seq_id)
 
     def close(self):
+        if self._closed.is_set():
+            return
+        self._closed.set()
         self._closing.set()
         self._pending.put(None)
-        self._thread.join()
+        self._thread.join(timeout=DISPATCHER_SHUTDOWN_JOIN_TIMEOUT_S)
         self.engine.exit()
 
     def _put(self, request: _ActiveRequest | _QueuedRequest, item: dict[str, Any]):

@@ -4,6 +4,7 @@ import time
 from multiprocessing import get_context
 from multiprocessing.shared_memory import SharedMemory
 from types import SimpleNamespace
+from unittest.mock import patch
 from uuid import uuid4
 
 from sparsevllm.engine.model_runner import ModelRunner
@@ -48,6 +49,60 @@ def test_write_shm_waits_until_worker_reads_command():
         writer.join(timeout=1.0)
         shm.close()
         shm.unlink()
+
+
+def test_exit_rpc_does_not_wait_for_worker_ack():
+    ctx = get_context("spawn")
+    event = ctx.Event()
+    shm = SharedMemory(
+        name=f"sparsevllm_test_exit_rpc_{os.getpid()}_{uuid4().hex}",
+        create=True,
+        size=2**20,
+    )
+    exited: list[bool] = []
+    runner = object.__new__(ModelRunner)
+    runner.world_size = 2
+    runner.rank = 0
+    runner.event = [event]
+    runner.shm = shm
+    runner.exit = lambda: exited.append(True)
+
+    try:
+        ModelRunner.call(runner, "exit")
+
+        assert event.is_set()
+        assert exited == [True]
+    finally:
+        if event.is_set():
+            event.clear()
+        shm.close()
+        shm.unlink()
+
+
+def test_model_runner_exit_does_not_use_tp_barrier():
+    closed: list[str] = []
+
+    class FakeShm:
+        def close(self):
+            closed.append("close")
+
+        def unlink(self):
+            closed.append("unlink")
+
+    runner = object.__new__(ModelRunner)
+    runner.world_size = 2
+    runner.rank = 0
+    runner.shm = FakeShm()
+
+    with patch("sparsevllm.engine.model_runner.dist.barrier") as barrier, patch(
+        "sparsevllm.engine.model_runner.dist.destroy_process_group"
+    ) as destroy_process_group, patch("sparsevllm.engine.model_runner.torch.cuda.synchronize") as synchronize:
+        ModelRunner.exit(runner)
+
+    barrier.assert_not_called()
+    synchronize.assert_called_once_with()
+    destroy_process_group.assert_called_once_with()
+    assert closed == ["close", "unlink"]
 
 
 def test_free_slots_batch_releases_each_seq_id():
