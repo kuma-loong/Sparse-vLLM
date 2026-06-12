@@ -1,7 +1,8 @@
-import os
 from dataclasses import dataclass
-from transformers import AutoConfig, Qwen3Config
+import os
+from transformers import Qwen3Config
 from typing import Any, Union
+from sparsevllm.models.adapters import get_model_adapter, load_and_normalize_hf_config
 from sparsevllm.method_registry import (
     DECODE_CUDA_GRAPH_SUPPORTED_METHODS,
     PREFILL_POLICY_AUTO,
@@ -114,7 +115,7 @@ class Config:
     gpu_memory_utilization: float = 0.8
     tensor_parallel_size: int = 1
     enforce_eager: bool = True
-    hf_config: Union[Qwen3Config, AutoConfig] | None = None
+    hf_config: Union[Qwen3Config, Any] | None = None
     eos: int = -1
     num_kvcache_slots: int | list = -1
 
@@ -278,18 +279,14 @@ class Config:
         if isinstance(self.deltakv_path, str):
             deltakv_path = self.deltakv_path.strip()
             self.deltakv_path = None if deltakv_path.lower() in {"", "none", "null"} else deltakv_path
-        try:
-            self.hf_config = AutoConfig.from_pretrained(self.model, trust_remote_code=True)
-        except Exception as e:
-            raise RuntimeError(
-                "AutoConfig.from_pretrained failed. Refusing to silently fall back to raw "
-                f"`config.json`. model={self.model} error={type(e).__name__}: {e}"
-            ) from e
+        self.hf_config = load_and_normalize_hf_config(self.model)
         if getattr(self.hf_config, "model_type", "") in {"deepseek_v2", "deepseek_v32"}:
             raise NotImplementedError(
                 f"Unsupported Sparse-vLLM model_type={self.hf_config.model_type!r}. "
-                "Supported model types: qwen2, qwen3."
+                "Supported model types: qwen2, qwen3, qwen3_5."
             )
+        self.model_adapter = get_model_adapter(self.hf_config)
+        self.model_adapter.validate_engine_config(self)
         if self.max_model_len > self.hf_config.max_position_embeddings:
             logger.warning('max_model_len > model.max_position_embeddings 输出可能不正常')
             self.hf_config.max_position_embeddings = self.max_model_len

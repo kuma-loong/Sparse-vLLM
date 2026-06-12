@@ -100,14 +100,14 @@ class StandardCacheManager(CacheManager):
 
     def allocate_kv_cache(self):
         available_memory, slot_bytes_per_layer = self._get_available_slots_info()
-        num_layers = self.num_layers
+        num_layers = self.num_cache_layers
 
         slot_bytes = num_layers * slot_bytes_per_layer
         self.config.num_kvcache_slots = available_memory // slot_bytes
         assert self.config.num_kvcache_slots > 0, "可用显存不足以分配 KV Cache"
 
         logger.info(
-            f"Standard Mode: Each layer can accommodate {self.config.num_kvcache_slots} tokens."
+            f"Standard Mode: Each KV-cache layer can accommodate {self.config.num_kvcache_slots} tokens."
         )
         self.kv_cache = torch.empty(
             2,
@@ -123,10 +123,12 @@ class StandardCacheManager(CacheManager):
         return self.layer_batch_state
 
     def get_layer_kv_cache(self, layer_idx: int) -> tuple[torch.Tensor, torch.Tensor]:
-        return self.kv_cache[0, layer_idx], self.kv_cache[1, layer_idx]
+        cache_idx = self.cache_layer_idx(layer_idx)
+        return self.kv_cache[0, cache_idx], self.kv_cache[1, cache_idx]
 
     def get_layer_store_view(self, layer_idx: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        return self.kv_cache[0, layer_idx], self.kv_cache[1, layer_idx], self.layer_batch_state.slot_mapping
+        k_cache, v_cache = self.get_layer_kv_cache(layer_idx)
+        return k_cache, v_cache, self.layer_batch_state.slot_mapping
 
     def get_layer_compute_tensors(self, layer_idx: int, sparse_controller):
         raise NotImplementedError

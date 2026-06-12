@@ -9,8 +9,7 @@ from multiprocessing.shared_memory import SharedMemory
 
 from sparsevllm.config import Config
 from sparsevllm.engine.sequence import Sequence
-from sparsevllm.models.qwen2 import Qwen2ForCausalLM
-from sparsevllm.models.qwen3 import Qwen3ForCausalLM
+from sparsevllm.models.adapters import get_model_adapter
 from sparsevllm.layers.sampler import Sampler
 from sparsevllm.utils.context import set_context, get_context, reset_context
 from sparsevllm.utils.loader import load_model, sync_deltakv_config_from_checkpoint
@@ -55,13 +54,15 @@ class ModelRunner:
         torch.set_default_device("cuda")
         
         # 加载对应的模型分片 (Shards)
-        if hf_config.model_type == "qwen2":
-            self.model = Qwen2ForCausalLM(hf_config)
-        elif hf_config.model_type == "qwen3":
-            self.model = Qwen3ForCausalLM(hf_config)
-        else:
-            raise NotImplementedError(f"Unsupported Sparse-vLLM model_type={hf_config.model_type!r}.")
-        load_model(self.model, config.model, rank=rank, world_size=self.world_size)
+        self.model_adapter = get_model_adapter(hf_config)
+        self.model = self.model_adapter.create_model(hf_config)
+        load_model(
+            self.model,
+            config.model,
+            rank=rank,
+            world_size=self.world_size,
+            weight_name_mapper=self.model_adapter.map_weight_name,
+        )
         
         self.sampler = Sampler()
 
@@ -197,6 +198,8 @@ class ModelRunner:
         if os.getenv("SPARSEVLLM_DEBUG_SLOTS", "0") == "1":
             before = self.cache_manager.free_slot_stats()
             logger.info("model_runner.free_slots seq_id={} before={}", seq_id, before)
+        if hasattr(self.model, "free_seq_state"):
+            self.model.free_seq_state(seq_id)
         self.cache_manager.free_seq(seq_id)
         if os.getenv("SPARSEVLLM_DEBUG_SLOTS", "0") == "1":
             after = self.cache_manager.free_slot_stats()

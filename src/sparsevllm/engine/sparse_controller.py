@@ -45,6 +45,14 @@ class SparseController:
         self.obs_layer_ids = self.config.obs_layer_ids
         self.full_attn_layers = self.config.full_attn_layers
         self.num_layers = self.config.hf_config.num_hidden_layers
+        self.attention_layer_indices = tuple(
+            getattr(
+                self.config.hf_config,
+                "sparsevllm_attention_layer_indices",
+                tuple(range(self.num_layers)),
+            )
+        )
+        self.attention_layer_index_set = set(int(idx) for idx in self.attention_layer_indices)
 
         self.num_sink = self.config.num_sink_tokens
         self.num_recent = self.config.num_recent_tokens
@@ -77,6 +85,18 @@ class SparseController:
 
         for i in range(self.num_layers):
             state = self.layer_batch_sparse_states[i]
+            state.attn_score = None
+            state.active_indices = None
+            state.active_slots = None
+            state.active_compressed_indices = None
+            state.deltakv_free_temp_slots = False
+            if i not in self.attention_layer_index_set:
+                state.context_lens = None
+                state.max_context_len = None
+                state.req_indices = None
+                state.global_req_indices = None
+                continue
+
             batch_state = self.cache_manager.get_layer_batch_states(i)
             
             # 统一语义：context_lens 代表当前 attn 可见长度 （即使是动态稀疏方法）
@@ -89,15 +109,6 @@ class SparseController:
             state.max_context_len = batch_state.max_context_len
             state.req_indices = batch_state.req_indices
             state.global_req_indices = batch_state.req_indices
-            state.attn_score = None
-
-            # 默认视图
-            state.active_indices = None
-            # 默认应该是全量的；active 开头的属性，只对 omnikv，deltakv，quest 这些不会物理删除token，但是有动态稀疏性的方法起效
-            state.active_slots = None
-            state.active_compressed_indices = None
-            state.deltakv_free_temp_slots = False
-
             # 为需要收集注意力分数的层分配 attn score 的对应 tensor
             if self._needs_attn_score(i, is_prefill, seqs):
                 if getattr(ctx, "decode_cuda_graph_static", False) and state.context_lens is not None:
@@ -355,7 +366,7 @@ class SparseController:
 
     @torch.no_grad()
     def _snapkv_prefill_eviction(self, seqs: list[Sequence]):
-        for layer_idx in range(self.num_layers):
+        for layer_idx in self.attention_layer_indices:
             state = self.layer_batch_sparse_states[layer_idx]
             attn_scores = state.attn_score
             if attn_scores is None:
@@ -383,7 +394,7 @@ class SparseController:
 
     @torch.no_grad()
     def _snapkv_decode_eviction(self, seqs: list[Sequence]):
-        for layer_idx in range(self.num_layers):
+        for layer_idx in self.attention_layer_indices:
             state = self.layer_batch_sparse_states[layer_idx]
             attn_scores = state.attn_score
             if attn_scores is None:
@@ -417,7 +428,7 @@ class SparseController:
         if budget is None:
             return
 
-        for layer_idx in range(self.num_layers):
+        for layer_idx in self.attention_layer_indices:
             state = self.layer_batch_sparse_states[layer_idx]
             for b_idx, seq in enumerate(seqs):
                 if not seq.is_last_chunk_prefill:
@@ -434,7 +445,7 @@ class SparseController:
         if budget is None:
             return
 
-        for layer_idx in range(self.num_layers):
+        for layer_idx in self.attention_layer_indices:
             state = self.layer_batch_sparse_states[layer_idx]
             for b_idx, seq in enumerate(seqs):
                 kv_len = int(state.context_lens[b_idx])
@@ -616,6 +627,8 @@ class SparseController:
         self.cache_manager.deltakv_snapkv_finalize_static_prune(finalize_seqs, combined_scores)
     
     def _needs_attn_score(self, layer_idx: int, is_prefill: bool, seqs: list[Sequence]) -> bool:
+        if int(layer_idx) not in self.attention_layer_index_set:
+            return False
         if self.sparse_method == 'deltakv-snapkv':
             if not is_prefill or get_context().is_long_text is False:
                 return False

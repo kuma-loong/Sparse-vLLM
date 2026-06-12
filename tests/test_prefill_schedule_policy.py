@@ -182,7 +182,7 @@ class PrefillPolicyConfigTest(unittest.TestCase):
     def make_config(self, **kwargs):
         with tempfile.TemporaryDirectory() as tmp:
             model_dir = Path(tmp)
-            with patch("sparsevllm.config.AutoConfig.from_pretrained", return_value=self.hf_config()):
+            with patch("sparsevllm.models.adapters.AutoConfig.from_pretrained", return_value=self.hf_config()):
                 return Config(model=str(model_dir), **kwargs)
 
     def test_auto_and_empty_policy_resolve_from_registry(self):

@@ -450,7 +450,7 @@ class ResearchFailFastTest(unittest.TestCase):
                 '{"model_type": "qwen2", "torch_dtype": "float16", "max_position_embeddings": 32768}\n',
                 encoding="utf-8",
             )
-            with patch("sparsevllm.config.AutoConfig.from_pretrained", side_effect=RuntimeError("boom")):
+            with patch("sparsevllm.models.adapters.AutoConfig.from_pretrained", side_effect=RuntimeError("boom")):
                 with self.assertRaisesRegex(RuntimeError, "Refusing to silently fall back"):
                     Config(model=str(model_dir))
 
@@ -463,7 +463,7 @@ class ResearchFailFastTest(unittest.TestCase):
             intermediate_size=32,
         )
         with tempfile.TemporaryDirectory() as tmp:
-            with patch("sparsevllm.config.AutoConfig.from_pretrained", return_value=hf_config):
+            with patch("sparsevllm.models.adapters.AutoConfig.from_pretrained", return_value=hf_config):
                 with self.assertRaisesRegex(NotImplementedError, "Unsupported Sparse-vLLM model_type"):
                     Config(model=tmp)
 
@@ -476,7 +476,7 @@ class ResearchFailFastTest(unittest.TestCase):
             intermediate_size=32,
         )
         with tempfile.TemporaryDirectory() as tmp:
-            with patch("sparsevllm.config.AutoConfig.from_pretrained", return_value=hf_config):
+            with patch("sparsevllm.models.adapters.AutoConfig.from_pretrained", return_value=hf_config):
                 with self.assertRaisesRegex(ValueError, "requires deltakv_path"):
                     Config(model=tmp, vllm_sparse_method="deltakv")
                 with self.assertRaisesRegex(ValueError, "requires deltakv_path"):

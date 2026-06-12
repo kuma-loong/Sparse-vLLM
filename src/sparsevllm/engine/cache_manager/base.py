@@ -35,6 +35,22 @@ class CacheManager(ABC):
         self.world_size = world_size
         self.hf_config = config.hf_config
         self.num_layers = self.hf_config.num_hidden_layers
+        self.attention_layer_indices = tuple(
+            int(idx)
+            for idx in getattr(
+                self.hf_config,
+                "sparsevllm_attention_layer_indices",
+                tuple(range(self.num_layers)),
+            )
+        )
+        if not self.attention_layer_indices:
+            raise ValueError("Sparse-vLLM cache manager requires at least one attention layer.")
+        self.attention_layer_index_set = set(self.attention_layer_indices)
+        self.layer_to_cache_idx = {
+            layer_idx: cache_idx
+            for cache_idx, layer_idx in enumerate(self.attention_layer_indices)
+        }
+        self.num_cache_layers = len(self.attention_layer_indices)
 
         self.num_kv_heads = self.hf_config.num_key_value_heads // world_size
         self.head_dim = getattr(
@@ -47,6 +63,16 @@ class CacheManager(ABC):
         self.max_buffer_rows = config.max_num_seqs_in_batch * REDUNDANCY_BATCH_SIZE_FACTOR
 
         self.kv_cache = None
+
+    def has_kv_cache_layer(self, layer_idx: int) -> bool:
+        return int(layer_idx) in self.attention_layer_index_set
+
+    def cache_layer_idx(self, layer_idx: int) -> int:
+        layer_idx = int(layer_idx)
+        try:
+            return self.layer_to_cache_idx[layer_idx]
+        except KeyError as exc:
+            raise RuntimeError(f"Layer {layer_idx} does not own a KV cache in this model.") from exc
 
     @staticmethod
     def create(config: Config, rank: int, world_size: int) -> "CacheManager":

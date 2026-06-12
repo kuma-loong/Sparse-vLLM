@@ -6,9 +6,9 @@ import torch
 from torch import nn
 from safetensors.torch import load_file
 from transformers import AutoModel
+from transformers.utils.import_utils import is_torchdynamo_compiling
 from transformers.models.llava_onevision.modeling_llava_onevision import (
     FlashAttentionKwargs,
-    KwargsForCausalLM,
     LlavaOnevisionCausalLMOutputWithPast,
     LlavaOnevisionForConditionalGeneration,
     LlavaOnevisionModel,
@@ -16,8 +16,13 @@ from transformers.models.llava_onevision.modeling_llava_onevision import (
     LlavaOnevisionMultiModalProjector,
     LlavaOnevisionPreTrainedModel,
     Unpack,
-    is_torchdynamo_compiling,
 )
+try:
+    from transformers.models.llava_onevision.modeling_llava_onevision import KwargsForCausalLM
+except ImportError:
+    from transformers.utils import TransformersKwargs
+
+    KwargsForCausalLM = TransformersKwargs
 
 from deltakv.configs.model_config_cls import KVQwen2Config
 from deltakv.modeling.cache_factory import create_deltakv_cache, is_deltakv_cache_instance

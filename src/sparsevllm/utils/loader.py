@@ -377,8 +377,32 @@ def load_deltakv_compressors_to_cache_manager(cache_manager, path: str):
     print(f"Successfully loaded {loaded_count} DeltaKV compressor weights into cache manager from {path}")
 
 
-def load_model(model: nn.Module, path: str, *, rank: int | None = None, world_size: int | None = None):
+def load_model(
+    model: nn.Module,
+    path: str,
+    *,
+    rank: int | None = None,
+    world_size: int | None = None,
+    weight_name_mapper=None,
+):
     packed_modules_mapping = getattr(model, "packed_modules_mapping", {})
+    if weight_name_mapper is None:
+        ignored_prefixes = tuple(getattr(model, "ignored_weight_prefixes", ()) or ())
+        prefix_replacements = tuple(getattr(model, "weight_prefix_replacements", ()) or ())
+        strip_prefixes = tuple(getattr(model, "weight_prefixes_to_strip", ()) or ())
+
+        def weight_name_mapper(name: str) -> str | None:
+            for prefix in ignored_prefixes:
+                if name.startswith(prefix):
+                    return None
+            for prefix, replacement in prefix_replacements:
+                if name.startswith(prefix):
+                    return str(replacement) + name[len(prefix) :]
+            for prefix in strip_prefixes:
+                if name.startswith(prefix):
+                    return name[len(prefix) :]
+            return name
+
     files = sorted(glob(os.path.join(path, "*.safetensors")))
     assert len(files) > 0, f"No safetensors found in {path}"
 
@@ -398,10 +422,14 @@ def load_model(model: nn.Module, path: str, *, rank: int | None = None, world_si
                 )
     
     loaded_count = 0
+    skipped_count = 0
     for file in files:
         with safe_open(file, "pt", "cpu") as f:
             for source_weight_name in f.keys():
-                param_name = source_weight_name
+                param_name = weight_name_mapper(source_weight_name)
+                if param_name is None:
+                    skipped_count += 1
+                    continue
                 for k in packed_modules_mapping:
                     if k in param_name:
                         v, shard_id = packed_modules_mapping[k]
@@ -418,4 +446,7 @@ def load_model(model: nn.Module, path: str, *, rank: int | None = None, world_si
                     loaded_count += 1
     
     assert loaded_count > 0, f"No weights were loaded from {path}"
-    print(f"Successfully loaded {loaded_count} weights from {path}")
+    msg = f"Successfully loaded {loaded_count} weights from {path}"
+    if skipped_count:
+        msg += f" (skipped {skipped_count} adapter-declared weights)"
+    print(msg)
