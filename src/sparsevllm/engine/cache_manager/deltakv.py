@@ -64,23 +64,23 @@ class DeltaKVCacheManager(CacheManager):
 
         self.allocate_kv_cache()
 
-        self.free_slots_stack_full = torch.arange(self.full_num_slots, dtype=torch.int32, device="cuda")
+        self.free_slots_stack_full = torch.arange(self.full_num_slots, dtype=torch.int32, device=self.device)
         self._num_free_slots_full = self.full_num_slots
 
-        self.free_slots_stack_deltakv_full = torch.arange(self.deltakv_full_num_slots, dtype=torch.int32, device="cuda")
+        self.free_slots_stack_deltakv_full = torch.arange(self.deltakv_full_num_slots, dtype=torch.int32, device=self.device)
         self._num_free_slots_deltakv_full = self.deltakv_full_num_slots
 
-        self.free_slots_stack_deltakv_latent = torch.arange(self.deltakv_latent_num_slots, dtype=torch.int32, device="cuda")
+        self.free_slots_stack_deltakv_latent = torch.arange(self.deltakv_latent_num_slots, dtype=torch.int32, device=self.device)
         self._num_free_slots_deltakv_latent = self.deltakv_latent_num_slots
 
         self.full_layer_slots_map = torch.zeros(
-            (self.max_buffer_rows, self.max_model_len), dtype=torch.int32, device="cuda"
+            (self.max_buffer_rows, self.max_model_len), dtype=torch.int32, device=self.device
         )
         self.sparse_layer_raw_slots_map = torch.full(
-            (self.max_buffer_rows, self.max_model_len), -1, dtype=torch.int32, device="cuda"
+            (self.max_buffer_rows, self.max_model_len), -1, dtype=torch.int32, device=self.device
         )
         self.sparse_layer_latent_slots_map = torch.full(
-            (self.max_buffer_rows, self.max_model_len), -1, dtype=torch.int32, device="cuda"
+            (self.max_buffer_rows, self.max_model_len), -1, dtype=torch.int32, device=self.device
         )
 
         self.seq_id_to_row: dict[int, int] = {}
@@ -102,7 +102,7 @@ class DeltaKVCacheManager(CacheManager):
             max_position=self.max_model_len,
             base=self.hf_config.rope_theta,
             rope_scaling=None,
-        ).cuda()
+        ).to(device=self.device)
         # cos_sin_cache shape: (max_pos, 1, head_dim) - 包含 (cos, sin)
         self.cos_sin_cache = self.rotary_emb.cos_sin_cache
 
@@ -123,8 +123,8 @@ class DeltaKVCacheManager(CacheManager):
         self.compress_down = []
         self.compress_up = []
         for _ in range(num_deltakv_layers):
-            self.compress_down.append(create_compressor(is_down=True, config=config).cuda())
-            self.compress_up.append(create_compressor(is_down=False, config=config).cuda())
+            self.compress_down.append(create_compressor(is_down=True, config=config).to(device=self.device))
+            self.compress_up.append(create_compressor(is_down=False, config=config).to(device=self.device))
 
     def _deltakv_reset_view_cache(self):
         self._deltakv_view_cache_key = None
@@ -325,7 +325,7 @@ class DeltaKVCacheManager(CacheManager):
             self.num_kv_heads,
             self.head_dim,
             dtype=self.hf_config.torch_dtype,
-            device="cuda",
+            device=self.device,
         )
 
         self.deltakv_full_kv_cache = torch.empty(
@@ -335,7 +335,7 @@ class DeltaKVCacheManager(CacheManager):
             self.num_kv_heads,
             self.head_dim,
             dtype=self.hf_config.torch_dtype,
-            device="cuda",
+            device=self.device,
         )
         self.deltakv_prefill_staging_kv_cache = torch.empty(
             2,
@@ -343,26 +343,26 @@ class DeltaKVCacheManager(CacheManager):
             self.num_kv_heads,
             self.head_dim,
             dtype=self.hf_config.torch_dtype,
-            device="cuda",
+            device=self.device,
         )
         self.deltakv_latent_cache = torch.empty(
             num_deltakv_layers,
             self.deltakv_latent_num_slots,
             config.kv_compressed_size,
             dtype=self.hf_config.torch_dtype,
-            device="cuda",
+            device=self.device,
         )
         self.deltakv_latent_to_full_slots = torch.full(
             (num_deltakv_layers, self.deltakv_latent_num_slots, config.deltakv_k_neighbors),
             -1,
             dtype=torch.int32,
-            device="cuda",
+            device=self.device,
         )
         self.deltakv_slot_to_pos = torch.full(
             (self.deltakv_full_num_slots,),
             -1,
             dtype=torch.int32,
-            device="cuda",
+            device=self.device,
         )
 
     def get_layer_batch_states(self, layer_idx: int) -> LayerBatchStates:
@@ -576,15 +576,15 @@ class DeltaKVCacheManager(CacheManager):
         self._num_free_slots_deltakv_full -= size
 
         self.sparse_layer_raw_slots_map[row_idx, cur_len: cur_len + size] = select_index
-        self.deltakv_slot_to_pos[select_index] = torch.arange(cur_len, cur_len + size, device="cuda", dtype=torch.int32)
+        self.deltakv_slot_to_pos[select_index] = torch.arange(cur_len, cur_len + size, device=self.device, dtype=torch.int32)
         return select_index
 
     @torch.no_grad()
     def _allocate_deltakv_full_positions(self, seq_id: int, positions: torch.Tensor) -> torch.Tensor:
-        positions = positions.to(device="cuda", dtype=torch.int32).contiguous()
+        positions = positions.to(device=self.device, dtype=torch.int32).contiguous()
         size = int(positions.numel())
         if size == 0:
-            return torch.empty((0,), dtype=torch.int32, device="cuda")
+            return torch.empty((0,), dtype=torch.int32, device=self.device)
         usable = self._num_free_slots_deltakv_full - int(getattr(self, "_deltakv_temp_full_reserve", 0) or 0)
         if usable < size:
             raise RuntimeError(
@@ -624,8 +624,8 @@ class DeltaKVCacheManager(CacheManager):
         select_indices = self.free_slots_stack_full[ptr - batch_size: ptr]
         self._num_free_slots_full -= batch_size
 
-        rows_gpu = torch.tensor(row_indices, dtype=torch.long, device="cuda")
-        cols_gpu = torch.tensor(cur_lens, dtype=torch.long, device="cuda")
+        rows_gpu = torch.tensor(row_indices, dtype=torch.long, device=self.device)
+        cols_gpu = torch.tensor(cur_lens, dtype=torch.long, device=self.device)
         self.full_layer_slots_map[rows_gpu, cols_gpu] = select_indices
         return select_indices
 
@@ -648,8 +648,8 @@ class DeltaKVCacheManager(CacheManager):
         select_indices = self.free_slots_stack_deltakv_full[ptr - batch_size: ptr]
         self._num_free_slots_deltakv_full -= batch_size
 
-        rows_gpu = torch.tensor(row_indices, dtype=torch.long, device="cuda")
-        cols_gpu = torch.tensor(cur_lens, dtype=torch.long, device="cuda")
+        rows_gpu = torch.tensor(row_indices, dtype=torch.long, device=self.device)
+        cols_gpu = torch.tensor(cur_lens, dtype=torch.long, device=self.device)
         self.sparse_layer_raw_slots_map[rows_gpu, cols_gpu] = select_indices
         self.deltakv_slot_to_pos[select_indices] = cols_gpu.to(torch.int32)
         return select_indices
@@ -729,8 +729,8 @@ class DeltaKVCacheManager(CacheManager):
 
     def _tensor_from_positions(self, positions: tuple[int, ...]) -> torch.Tensor:
         if not positions:
-            return torch.empty((0,), dtype=torch.int32, device="cuda")
-        return torch.tensor(positions, dtype=torch.int32, device="cuda")
+            return torch.empty((0,), dtype=torch.int32, device=self.device)
+        return torch.tensor(positions, dtype=torch.int32, device=self.device)
 
     def _prepare_full_prefill_staging_plan(self, seq: Sequence, row_idx: int, total_len: int):
         if total_len > int(self.deltakv_prefill_staging_num_slots):
@@ -757,29 +757,29 @@ class DeltaKVCacheManager(CacheManager):
         center_slots = (
             torch.stack([raw_by_pos[int(pos)] for pos in plan_cpu.center_positions]).to(torch.int32)
             if plan_cpu.center_positions
-            else torch.empty((0,), dtype=torch.int32, device="cuda")
+            else torch.empty((0,), dtype=torch.int32, device=self.device)
         )
         sink_slots = (
             self.sparse_layer_raw_slots_map[row_idx, : plan_cpu.sink_len].to(torch.int32)
             if plan_cpu.sink_len > 0
-            else torch.empty((0,), dtype=torch.int32, device="cuda")
+            else torch.empty((0,), dtype=torch.int32, device=self.device)
         )
 
         if latent_pos.numel() > 0:
             latent_slots = self._allocate_deltakv_latent(int(latent_pos.numel())).to(torch.int32)
             self.sparse_layer_latent_slots_map[row_idx, latent_pos.to(torch.long)] = latent_slots
         else:
-            latent_slots = torch.empty((0,), dtype=torch.int32, device="cuda")
+            latent_slots = torch.empty((0,), dtype=torch.int32, device=self.device)
 
         if plan_cpu.evict_len > 0:
-            evict_pos = torch.arange(plan_cpu.evict_start, plan_cpu.evict_end, device="cuda", dtype=torch.int32)
+            evict_pos = torch.arange(plan_cpu.evict_start, plan_cpu.evict_end, device=self.device, dtype=torch.int32)
             center_rel = (center_pos - int(plan_cpu.evict_start)).to(torch.long)
-            to_compress_mask = torch.ones((plan_cpu.evict_len,), device="cuda", dtype=torch.bool)
+            to_compress_mask = torch.ones((plan_cpu.evict_len,), device=self.device, dtype=torch.bool)
             if center_rel.numel() > 0:
                 to_compress_mask[center_rel] = False
         else:
-            evict_pos = torch.empty((0,), dtype=torch.int32, device="cuda")
-            to_compress_mask = torch.empty((0,), dtype=torch.bool, device="cuda")
+            evict_pos = torch.empty((0,), dtype=torch.int32, device=self.device)
+            to_compress_mask = torch.empty((0,), dtype=torch.bool, device=self.device)
 
         self.row_deltakv_compressed_lens[row_idx] = int(plan_cpu.evict_len)
         self._after_full_prefill_plan_prepared(
@@ -824,7 +824,7 @@ class DeltaKVCacheManager(CacheManager):
             return torch.empty(
                 (0, 2 * self.num_kv_heads * self.head_dim),
                 dtype=self.hf_config.torch_dtype,
-                device="cuda",
+                device=self.device,
             )
         gather_kernel = getattr(self, "_deltakv_gather_kv_unrope", None)
         if gather_kernel is not None:
@@ -958,11 +958,11 @@ class DeltaKVCacheManager(CacheManager):
             positions_np = np.empty(total_chunk_tokens, dtype=np.int64)
             cu_seqlens_q = [0]
 
-            full_slot_mapping = torch.empty(total_chunk_tokens, dtype=torch.int32, device="cuda")
+            full_slot_mapping = torch.empty(total_chunk_tokens, dtype=torch.int32, device=self.device)
             if use_full_prefill_staging:
-                deltakv_slot_mapping = torch.arange(total_chunk_tokens, dtype=torch.int32, device="cuda")
+                deltakv_slot_mapping = torch.arange(total_chunk_tokens, dtype=torch.int32, device=self.device)
             else:
-                deltakv_slot_mapping = torch.empty(total_chunk_tokens, dtype=torch.int32, device="cuda")
+                deltakv_slot_mapping = torch.empty(total_chunk_tokens, dtype=torch.int32, device=self.device)
             context_lens_list = []
             req_indices = []
 
@@ -1008,8 +1008,8 @@ class DeltaKVCacheManager(CacheManager):
                 cu_seqlens_q.append(cu_seqlens_q[-1] + chunk_size)
                 token_offset += chunk_size
 
-            context_lens = torch.tensor(context_lens_list, dtype=torch.int32, device="cuda")
-            req_indices_tensor = torch.tensor(req_indices, dtype=torch.int32, device="cuda")
+            context_lens = torch.tensor(context_lens_list, dtype=torch.int32, device=self.device)
+            req_indices_tensor = torch.tensor(req_indices, dtype=torch.int32, device=self.device)
 
             full_state = self.full_layer_batch_states
             full_state.slot_mapping = full_slot_mapping
@@ -1029,7 +1029,7 @@ class DeltaKVCacheManager(CacheManager):
                     (len(seqs), max_context_len),
                     -1,
                     dtype=torch.int32,
-                    device="cuda",
+                    device=self.device,
                 )
                 offset = 0
                 for b_idx, seq in enumerate(seqs):
@@ -1038,20 +1038,20 @@ class DeltaKVCacheManager(CacheManager):
                         offset,
                         offset + chunk_size,
                         dtype=torch.int32,
-                        device="cuda",
+                        device=self.device,
                     )
                     offset += chunk_size
                 self._deltakv_prefill_staging_active_slots = active_slots
                 self._deltakv_prefill_staging_req_indices = torch.arange(
                     len(seqs),
                     dtype=torch.int32,
-                    device="cuda",
+                    device=self.device,
                 )
                 self._deltakv_prefill_staging_context_lens = context_lens
 
-            input_ids = torch.from_numpy(input_ids_np).to("cuda")
-            positions = torch.from_numpy(positions_np).to("cuda")
-            cu_seqlens_q = torch.tensor(cu_seqlens_q, dtype=torch.int32, device="cuda")
+            input_ids = torch.from_numpy(input_ids_np).to(self.device)
+            positions = torch.from_numpy(positions_np).to(self.device)
+            cu_seqlens_q = torch.tensor(cu_seqlens_q, dtype=torch.int32, device=self.device)
             return input_ids, positions, cu_seqlens_q
 
     def _prepare_decode(self, seqs: list[Sequence]):
@@ -1061,8 +1061,8 @@ class DeltaKVCacheManager(CacheManager):
             positions_list = [seq.num_tokens - 1 for seq in seqs]
             seq_ids = [seq.seq_id for seq in seqs]
 
-            full_slot_mapping = torch.empty((batch_size,), dtype=torch.int32, device="cuda")
-            deltakv_slot_mapping = torch.empty((batch_size,), dtype=torch.int32, device="cuda")
+            full_slot_mapping = torch.empty((batch_size,), dtype=torch.int32, device=self.device)
+            deltakv_slot_mapping = torch.empty((batch_size,), dtype=torch.int32, device=self.device)
 
             full_slots = self._allocate_batch_full(seq_ids, 1)
             deltakv_slots = self._allocate_batch_deltakv_full(seq_ids, 1)
@@ -1074,9 +1074,9 @@ class DeltaKVCacheManager(CacheManager):
             context_lens = torch.tensor(
                 self.row_seq_lens[row_indices],
                 dtype=torch.int32,
-                device="cuda",
+                device=self.device,
             )
-            req_indices = torch.tensor(row_indices, dtype=torch.int32, device="cuda")
+            req_indices = torch.tensor(row_indices, dtype=torch.int32, device=self.device)
 
             full_state = self.full_layer_batch_states
             full_state.slot_mapping = full_slot_mapping
@@ -1088,13 +1088,13 @@ class DeltaKVCacheManager(CacheManager):
             deltakv_state.context_lens = context_lens
             deltakv_state.req_indices = req_indices
 
-            input_ids = torch.tensor(input_ids_list, dtype=torch.int64, device="cuda")
-            positions = torch.tensor(positions_list, dtype=torch.int64, device="cuda")
+            input_ids = torch.tensor(input_ids_list, dtype=torch.int64, device=self.device)
+            positions = torch.tensor(positions_list, dtype=torch.int64, device=self.device)
             return input_ids, positions, None
 
     def get_compressed_lens(self, req_indices: torch.Tensor) -> torch.Tensor:
         compressed = self.row_deltakv_compressed_lens[req_indices.cpu().numpy()]
-        return torch.tensor(compressed, dtype=torch.int32, device="cuda")
+        return torch.tensor(compressed, dtype=torch.int32, device=self.device)
 
     @staticmethod
     def _metric_l2(kv_states, all_centers):
@@ -1279,7 +1279,7 @@ class DeltaKVCacheManager(CacheManager):
 
         # Select new centers (prototypes) by fixed stride within the evicted block.
         with profiler.record("deltakv_evict_select_centers"):
-            center_rel = torch.arange(0, evict_len, cluster_step, device="cuda", dtype=torch.long)
+            center_rel = torch.arange(0, evict_len, cluster_step, device=self.device, dtype=torch.long)
             new_center_slots = raw_slots_block[center_rel].to(torch.int32)
 
         # Initialize per-layer center slots (previous centers, without current block).
@@ -1293,7 +1293,7 @@ class DeltaKVCacheManager(CacheManager):
         # De-RoPE KV for the whole evicted block per layer, compute assignments, and store latents
         # for non-center tokens only. Center tokens stay as full KV references (and remain mapped).
         with profiler.record("deltakv_evict_build_masks"):
-            is_center = torch.zeros((evict_len,), device="cuda", dtype=torch.bool)
+            is_center = torch.zeros((evict_len,), device=self.device, dtype=torch.bool)
             is_center[center_rel] = True
             to_compress_mask = ~is_center
             num_to_compress = int(to_compress_mask.sum().item())
@@ -1310,7 +1310,7 @@ class DeltaKVCacheManager(CacheManager):
         # Allocate shared latent slots for this block (shared index across layers).
         with profiler.record("deltakv_evict_alloc_latent"):
             latent_slots = self._allocate_deltakv_latent(num_to_compress).to(torch.int32)
-            pos_all = torch.arange(evict_start, evict_end, device="cuda", dtype=torch.long)
+            pos_all = torch.arange(evict_start, evict_end, device=self.device, dtype=torch.long)
             pos_to_compress = pos_all[to_compress_mask]
             # Map position -> latent slot for compressed (non-center) tokens.
             self.sparse_layer_latent_slots_map[row_idx, pos_to_compress] = latent_slots
@@ -1527,14 +1527,14 @@ class DeltaKVCacheManager(CacheManager):
         if layer_idx in self.full_layer_to_idx:
             raise ValueError("deltakv_reconstruct should only be called for sparse layers.")
         if active_compressed_indices is None:
-            active_compressed_indices = torch.empty((req_indices.numel(), 0), device="cuda", dtype=torch.int32)
+            active_compressed_indices = torch.empty((req_indices.numel(), 0), device=self.device, dtype=torch.int32)
 
         bsz = int(req_indices.numel())
         if bsz == 0:
-            empty0 = torch.empty((0,), device="cuda", dtype=torch.int32)
-            return torch.empty((0, 0), device="cuda", dtype=torch.int32), empty0, empty0, empty0, empty0, empty0, empty0
+            empty0 = torch.empty((0,), device=self.device, dtype=torch.int32)
+            return torch.empty((0, 0), device=self.device, dtype=torch.int32), empty0, empty0, empty0, empty0, empty0, empty0
 
-        local_req = torch.arange(bsz, device="cuda", dtype=torch.int32)
+        local_req = torch.arange(bsz, device=self.device, dtype=torch.int32)
         sink = int(self.config.num_sink_tokens)
 
         with profiler.record("deltakv_build_view_read_lens"):
@@ -1561,7 +1561,7 @@ class DeltaKVCacheManager(CacheManager):
                     raise RuntimeError("DeltaKV: negative buffer length; compressed_lens is inconsistent.")
 
                 if active_compressed_indices.numel() == 0 or total_len <= sink or comp_len <= 0:
-                    top_pos = torch.empty((0,), device="cuda", dtype=torch.int32)
+                    top_pos = torch.empty((0,), device=self.device, dtype=torch.int32)
                 else:
                     cand = active_compressed_indices[b].to(torch.int32)
                     valid = (cand >= sink) & (cand < sink + comp_len) & (cand < total_len)
@@ -1573,10 +1573,10 @@ class DeltaKVCacheManager(CacheManager):
                 max_s = max(max_s, ctx_len_b)
                 plans.append((row, total_len, sink_len, buffer_start, buffer_len, top_pos))
 
-        new_context_lens = torch.tensor(new_context_lens_list, device="cuda", dtype=torch.int32)
+        new_context_lens = torch.tensor(new_context_lens_list, device=self.device, dtype=torch.int32)
 
         with profiler.record("deltakv_build_view_alloc_active_slots"):
-            active_slots = torch.zeros((bsz, max_s), device="cuda", dtype=torch.int32)
+            active_slots = torch.zeros((bsz, max_s), device=self.device, dtype=torch.int32)
 
         temp_slots_all = []
         recon_pos = []
@@ -1615,7 +1615,7 @@ class DeltaKVCacheManager(CacheManager):
                     active_slots[b, sink_len + k_b: sink_len + k_b + buffer_len] = buf_slots
 
         if not temp_slots_all:
-            empty = torch.empty((0,), device="cuda", dtype=torch.int32)
+            empty = torch.empty((0,), device=self.device, dtype=torch.int32)
             return active_slots, local_req, new_context_lens, empty, empty, empty, empty
 
         with profiler.record("deltakv_build_view_pack_recon"):
@@ -1729,7 +1729,7 @@ class DeltaKVCacheTritonManagerV2(DeltaKVCacheTritonManager):
             if slots.numel() == 0:
                 return torch.empty(
                     (0, 2 * self.num_kv_heads * self.head_dim),
-                    device="cuda",
+                    device=self.device,
                     dtype=self.hf_config.torch_dtype,
                 )
 
@@ -1789,7 +1789,7 @@ class DeltaKVCacheTritonManagerV2(DeltaKVCacheTritonManager):
                         raise RuntimeError("DeltaKV eviction expects raw slots for the buffer block.")
 
                     with profiler.record("deltakv_evict_triton_select_centers"):
-                        center_rel = torch.arange(0, evict_len, cluster_step, device="cuda", dtype=torch.long)
+                        center_rel = torch.arange(0, evict_len, cluster_step, device=self.device, dtype=torch.long)
                         new_center_slots = raw_slots_block[center_rel].to(torch.int32)
 
                     with profiler.record("deltakv_evict_triton_prev_centers"):
@@ -1802,7 +1802,7 @@ class DeltaKVCacheTritonManagerV2(DeltaKVCacheTritonManager):
                             )
 
                     with profiler.record("deltakv_evict_triton_build_masks"):
-                        is_center = torch.zeros((evict_len,), device="cuda", dtype=torch.bool)
+                        is_center = torch.zeros((evict_len,), device=self.device, dtype=torch.bool)
                         is_center[center_rel] = True
                         to_compress_mask = ~is_center
                         num_to_compress = int(to_compress_mask.sum().item())
@@ -1817,7 +1817,7 @@ class DeltaKVCacheTritonManagerV2(DeltaKVCacheTritonManager):
 
                     with profiler.record("deltakv_evict_triton_alloc_latent"):
                         latent_slots = self._allocate_deltakv_latent(num_to_compress).to(torch.int32)
-                        pos_all = torch.arange(evict_start, evict_end, device="cuda", dtype=torch.int32)
+                        pos_all = torch.arange(evict_start, evict_end, device=self.device, dtype=torch.int32)
                         pos_to_compress = pos_all[to_compress_mask]
                         self.sparse_layer_latent_slots_map[row_idx, pos_to_compress.to(torch.long)] = latent_slots
 

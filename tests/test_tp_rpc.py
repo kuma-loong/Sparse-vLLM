@@ -93,15 +93,17 @@ def test_model_runner_exit_does_not_use_tp_barrier():
     runner.world_size = 2
     runner.rank = 0
     runner.shm = FakeShm()
+    synchronized: list[str] = []
+    runner.platform = SimpleNamespace(synchronize=lambda: synchronized.append("sync"))
 
     with patch("sparsevllm.engine.model_runner.dist.barrier") as barrier, patch(
         "sparsevllm.engine.model_runner.dist.destroy_process_group"
-    ) as destroy_process_group, patch("sparsevllm.engine.model_runner.torch.cuda.synchronize") as synchronize:
+    ) as destroy_process_group:
         ModelRunner.exit(runner)
 
     barrier.assert_not_called()
-    synchronize.assert_called_once_with()
     destroy_process_group.assert_called_once_with()
+    assert synchronized == ["sync"]
     assert closed == ["close", "unlink"]
 
 

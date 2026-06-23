@@ -36,7 +36,7 @@ class DeltaKVSnapKVCacheManager(DeltaKVStandaloneCacheManager):
             (self.max_buffer_rows, self.max_model_len),
             -1,
             dtype=torch.int32,
-            device="cuda",
+            device=self.device,
         )
         self._snapkv_finalized_seq_ids: set[int] = set()
         self._snapkv_view_cache_key: tuple[int, int] | None = None
@@ -127,7 +127,7 @@ class DeltaKVSnapKVCacheManager(DeltaKVStandaloneCacheManager):
             self.num_kv_heads,
             self.head_dim,
             dtype=self.hf_config.torch_dtype,
-            device="cuda",
+            device=self.device,
         )
         self.deltakv_prefill_staging_kv_cache = torch.empty(
             2,
@@ -135,7 +135,7 @@ class DeltaKVSnapKVCacheManager(DeltaKVStandaloneCacheManager):
             self.num_kv_heads,
             self.head_dim,
             dtype=self.hf_config.torch_dtype,
-            device="cuda",
+            device=self.device,
         )
         self.deltakv_decode_reconstruct_kv_cache = torch.empty(
             2,
@@ -143,7 +143,7 @@ class DeltaKVSnapKVCacheManager(DeltaKVStandaloneCacheManager):
             self.num_kv_heads,
             self.head_dim,
             dtype=self.hf_config.torch_dtype,
-            device="cuda",
+            device=self.device,
         )
         self.deltakv_temp_kv_cache = self.deltakv_decode_reconstruct_kv_cache
         self.deltakv_latent_cache = torch.empty(
@@ -151,19 +151,19 @@ class DeltaKVSnapKVCacheManager(DeltaKVStandaloneCacheManager):
             self.deltakv_latent_num_slots,
             config.kv_compressed_size,
             dtype=self.hf_config.torch_dtype,
-            device="cuda",
+            device=self.device,
         )
         self.deltakv_latent_to_full_slots = torch.full(
             (num_layers, self.deltakv_latent_num_slots, config.deltakv_k_neighbors),
             -1,
             dtype=torch.int32,
-            device="cuda",
+            device=self.device,
         )
         self.deltakv_slot_to_pos = torch.full(
             (self.deltakv_full_num_slots,),
             -1,
             dtype=torch.int32,
-            device="cuda",
+            device=self.device,
         )
 
     def _reset_snapkv_view_cache(self):
@@ -220,7 +220,7 @@ class DeltaKVSnapKVCacheManager(DeltaKVStandaloneCacheManager):
         keep_latent = keep_latent.to(torch.int32).contiguous()
         num_keep = int(keep_latent.numel())
         if num_keep == 0:
-            return torch.empty((0,), dtype=torch.int32, device="cuda")
+            return torch.empty((0,), dtype=torch.int32, device=self.device)
 
         usable = self._num_free_slots_deltakv_full - int(getattr(self, "_deltakv_temp_full_reserve", 0) or 0)
         if usable < num_keep:
@@ -366,8 +366,8 @@ class DeltaKVSnapKVCacheManager(DeltaKVStandaloneCacheManager):
             total_temp += total_len
             new_context_lens_list.append(total_len)
 
-        active_local_slots = torch.full((bsz, max_s), -1, device="cuda", dtype=torch.int32)
-        active_physical_slots = torch.full((bsz, max_s), -1, device="cuda", dtype=torch.int32)
+        active_local_slots = torch.full((bsz, max_s), -1, device=self.device, dtype=torch.int32)
+        active_physical_slots = torch.full((bsz, max_s), -1, device=self.device, dtype=torch.int32)
         raw_src = []
         raw_dst_local = []
         recon_pos = []
@@ -376,7 +376,7 @@ class DeltaKVSnapKVCacheManager(DeltaKVStandaloneCacheManager):
 
         offset = 0
         for b, row, total_len, sink_len, comp_len, buffer_start, buffer_len in plans:
-            local_seq = torch.arange(offset, offset + total_len, device="cuda", dtype=torch.int32)
+            local_seq = torch.arange(offset, offset + total_len, device=self.device, dtype=torch.int32)
             offset += total_len
             active_local_slots[b, :total_len] = local_seq
 
@@ -389,7 +389,7 @@ class DeltaKVSnapKVCacheManager(DeltaKVStandaloneCacheManager):
                 raw_dst_local.append(local_seq[:sink_len])
 
             if comp_len > 0:
-                comp_logical_pos = torch.arange(sink, sink + comp_len, device="cuda", dtype=torch.int32)
+                comp_logical_pos = torch.arange(sink, sink + comp_len, device=self.device, dtype=torch.int32)
                 comp_local_out = local_seq[sink_len: sink_len + comp_len]
                 comp_raw_slots = self.sparse_layer_raw_slots_map[row, comp_logical_pos.to(torch.long)].to(torch.int32)
                 raw_mask = comp_raw_slots >= 0
@@ -417,17 +417,17 @@ class DeltaKVSnapKVCacheManager(DeltaKVStandaloneCacheManager):
                 raw_src.append(buf_slots)
                 raw_dst_local.append(local_seq[sink_len + comp_len: sink_len + comp_len + buffer_len])
 
-        raw_src_all_i32 = torch.cat(raw_src, dim=0).to(torch.int32) if raw_src else torch.empty((0,), device="cuda", dtype=torch.int32)
-        raw_dst_local_all_i32 = torch.cat(raw_dst_local, dim=0).to(torch.int32) if raw_dst_local else torch.empty((0,), device="cuda", dtype=torch.int32)
-        recon_pos_all_i32 = torch.cat(recon_pos, dim=0).to(torch.int32) if recon_pos else torch.empty((0,), device="cuda", dtype=torch.int32)
-        recon_latent_all_i32 = torch.cat(recon_latent, dim=0).to(torch.int32) if recon_latent else torch.empty((0,), device="cuda", dtype=torch.int32)
-        recon_out_local_all_i32 = torch.cat(recon_out_local, dim=0).to(torch.int32) if recon_out_local else torch.empty((0,), device="cuda", dtype=torch.int32)
+        raw_src_all_i32 = torch.cat(raw_src, dim=0).to(torch.int32) if raw_src else torch.empty((0,), device=self.device, dtype=torch.int32)
+        raw_dst_local_all_i32 = torch.cat(raw_dst_local, dim=0).to(torch.int32) if raw_dst_local else torch.empty((0,), device=self.device, dtype=torch.int32)
+        recon_pos_all_i32 = torch.cat(recon_pos, dim=0).to(torch.int32) if recon_pos else torch.empty((0,), device=self.device, dtype=torch.int32)
+        recon_latent_all_i32 = torch.cat(recon_latent, dim=0).to(torch.int32) if recon_latent else torch.empty((0,), device=self.device, dtype=torch.int32)
+        recon_out_local_all_i32 = torch.cat(recon_out_local, dim=0).to(torch.int32) if recon_out_local else torch.empty((0,), device=self.device, dtype=torch.int32)
 
         value: dict[str, torch.Tensor | int | dict[int, torch.Tensor]] = {
             "active_local_slots": active_local_slots,
             "active_physical_slots": active_physical_slots,
-            "new_context_lens": torch.tensor(new_context_lens_list, device="cuda", dtype=torch.int32),
-            "local_req": torch.arange(bsz, device="cuda", dtype=torch.int32),
+            "new_context_lens": torch.tensor(new_context_lens_list, device=self.device, dtype=torch.int32),
+            "local_req": torch.arange(bsz, device=self.device, dtype=torch.int32),
             "total_temp": total_temp,
             "bsz": bsz,
             "max_s": max_s,
@@ -585,7 +585,7 @@ class DeltaKVSnapKVCacheManager(DeltaKVStandaloneCacheManager):
                 self._snapkv_finalized_seq_ids.add(seq_id)
                 continue
 
-            comp_logical = torch.arange(sink, sink + comp_len, device="cuda", dtype=torch.int32)
+            comp_logical = torch.arange(sink, sink + comp_len, device=self.device, dtype=torch.int32)
             comp_abs = self._resolve_comp_abs_pos(row_idx, comp_logical)
             comp_raw = self.sparse_layer_raw_slots_map[row_idx, comp_logical.to(torch.long)].to(torch.int32)
             comp_latent = self.sparse_layer_latent_slots_map[row_idx, comp_logical.to(torch.long)].to(torch.int32)
@@ -607,7 +607,7 @@ class DeltaKVSnapKVCacheManager(DeltaKVStandaloneCacheManager):
             keep_abs = comp_abs[keep_mask]
             keep_raw = comp_raw[keep_mask]
             keep_latent = comp_latent[keep_mask]
-            materialized_latent = torch.empty((0,), dtype=torch.int32, device="cuda")
+            materialized_latent = torch.empty((0,), dtype=torch.int32, device=self.device)
             if keep_abs.numel() > 0:
                 order = torch.argsort(keep_abs)
                 keep_abs = keep_abs[order]
@@ -653,7 +653,7 @@ class DeltaKVSnapKVCacheManager(DeltaKVStandaloneCacheManager):
             self.row_deltakv_comp_abs_pos[row_idx, sink:total_len] = -1
 
             if new_comp_len > 0:
-                comp_dst = torch.arange(sink, sink + new_comp_len, device="cuda", dtype=torch.long)
+                comp_dst = torch.arange(sink, sink + new_comp_len, device=self.device, dtype=torch.long)
                 self.sparse_layer_raw_slots_map[row_idx, comp_dst] = keep_raw.to(torch.int32)
                 self.row_deltakv_comp_abs_pos[row_idx, comp_dst] = keep_abs.to(torch.int32)
 

@@ -113,7 +113,7 @@ class DeltaKVDeltaQuantCacheManager(DeltaKVCacheTritonManagerV4):
             self.num_kv_heads,
             self.head_dim,
             dtype=self.hf_config.torch_dtype,
-            device="cuda",
+            device=self.device,
         )
         self.deltakv_full_kv_cache = torch.empty(
             2,
@@ -122,7 +122,7 @@ class DeltaKVDeltaQuantCacheManager(DeltaKVCacheTritonManagerV4):
             self.num_kv_heads,
             self.head_dim,
             dtype=self.hf_config.torch_dtype,
-            device="cuda",
+            device=self.device,
         )
         self.deltakv_prefill_staging_kv_cache = torch.empty(
             2,
@@ -130,7 +130,7 @@ class DeltaKVDeltaQuantCacheManager(DeltaKVCacheTritonManagerV4):
             self.num_kv_heads,
             self.head_dim,
             dtype=self.hf_config.torch_dtype,
-            device="cuda",
+            device=self.device,
         )
 
         latent_width = kv_dim // 8 if quant_bits == 4 else kv_dim
@@ -140,7 +140,7 @@ class DeltaKVDeltaQuantCacheManager(DeltaKVCacheTritonManagerV4):
             self.deltakv_latent_num_slots,
             latent_width,
             dtype=latent_dtype,
-            device="cuda",
+            device=self.device,
         )
         if quant_bits == 4:
             self.deltakv_latent_scales = torch.empty(
@@ -148,7 +148,7 @@ class DeltaKVDeltaQuantCacheManager(DeltaKVCacheTritonManagerV4):
                 self.deltakv_latent_num_slots,
                 1,
                 dtype=self.hf_config.torch_dtype,
-                device="cuda",
+                device=self.device,
             )
             self.deltakv_latent_mins = torch.empty_like(self.deltakv_latent_scales)
         else:
@@ -159,13 +159,13 @@ class DeltaKVDeltaQuantCacheManager(DeltaKVCacheTritonManagerV4):
             (num_deltakv_layers, self.deltakv_latent_num_slots, config.deltakv_k_neighbors),
             -1,
             dtype=torch.int32,
-            device="cuda",
+            device=self.device,
         )
         self.deltakv_slot_to_pos = torch.full(
             (self.deltakv_full_num_slots,),
             -1,
             dtype=torch.int32,
-            device="cuda",
+            device=self.device,
         )
 
     def _init_compressor_modules(self, config, num_deltakv_layers: int):
@@ -282,7 +282,7 @@ class DeltaKVDeltaQuantCacheManager(DeltaKVCacheTritonManagerV4):
                 if (raw_slots_block < 0).any():
                     raise RuntimeError("DeltaKV delta-quant eviction expects raw slots for the buffer block.")
 
-                center_rel = torch.arange(0, evict_len, cluster_step, device="cuda", dtype=torch.long)
+                center_rel = torch.arange(0, evict_len, cluster_step, device=self.device, dtype=torch.long)
                 new_center_slots = raw_slots_block[center_rel].to(torch.int32)
                 sink_slots = self.sparse_layer_raw_slots_map[row_idx, :sink].to(torch.int32)
                 prev_center_slots_by_layer: dict[int, torch.Tensor] = {}
@@ -290,7 +290,7 @@ class DeltaKVDeltaQuantCacheManager(DeltaKVCacheTritonManagerV4):
                     existing = self.row_deltakv_center_slots[row_idx][layer_idx]
                     prev_center_slots_by_layer[layer_idx] = sink_slots if existing is None else existing.to(torch.int32)
 
-                is_center = torch.zeros((evict_len,), device="cuda", dtype=torch.bool)
+                is_center = torch.zeros((evict_len,), device=self.device, dtype=torch.bool)
                 is_center[center_rel] = True
                 to_compress_mask = ~is_center
                 num_to_compress = int(to_compress_mask.sum().item())
@@ -303,7 +303,7 @@ class DeltaKVDeltaQuantCacheManager(DeltaKVCacheTritonManagerV4):
                     continue
 
                 latent_slots = self._allocate_deltakv_latent(num_to_compress).to(torch.int32)
-                pos_all = torch.arange(evict_start, evict_end, device="cuda", dtype=torch.int32)
+                pos_all = torch.arange(evict_start, evict_end, device=self.device, dtype=torch.int32)
                 pos_to_compress = pos_all[to_compress_mask]
                 self.sparse_layer_latent_slots_map[row_idx, pos_to_compress.to(torch.long)] = latent_slots
                 raw_slots_block_i32 = raw_slots_block.to(torch.int32)

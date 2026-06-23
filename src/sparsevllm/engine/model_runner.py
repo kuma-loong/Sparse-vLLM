@@ -16,8 +16,8 @@ from sparsevllm.utils.context import set_context, get_context, reset_context
 from sparsevllm.utils.loader import load_model, sync_deltakv_config_from_checkpoint
 
 from sparsevllm.engine.cache_manager import CacheManager
-from sparsevllm.engine.decode_cuda_graph import DecodeCudaGraphRunner
 from sparsevllm.engine.sparse_controller import SparseController
+import sparsevllm.platforms as platforms
 from sparsevllm.utils.profiler import profiler
 
 class ModelRunner:
@@ -38,13 +38,17 @@ class ModelRunner:
         self.world_size = config.tensor_parallel_size
         self.rank = rank
         self.event = event
+        self.platform = platforms.current_platform
+        self.platform.validate_inference()
+        self.platform.init_backend()
+        self.device = self.platform.get_device(rank)
 
-        # 初始化分布式环境并绑定对应的 GPU 卡
-        torch.cuda.set_device(rank)
+        # 初始化分布式环境并绑定对应的设备
+        self.platform.set_device(self.device)
         if not dist.is_initialized():
             master_port = int(os.getenv("SPARSEVLLM_MASTER_PORT", "2333"))
             dist.init_process_group(
-                "nccl",
+                self.platform.get_distributed_backend(),
                 f"tcp://localhost:{master_port}",
                 world_size=self.world_size,
                 rank=rank,
@@ -52,7 +56,7 @@ class ModelRunner:
         
         default_dtype = torch.get_default_dtype()
         torch.set_default_dtype(hf_config.torch_dtype)
-        torch.set_default_device("cuda")
+        torch.set_default_device(self.device)
         
         # 加载对应的模型分片 (Shards)
         if hf_config.model_type == "qwen2":
@@ -84,7 +88,14 @@ class ModelRunner:
 
         self.decode_cuda_graph_runner = None
         if self.config.decode_cuda_graph:
-            self.decode_cuda_graph_runner = DecodeCudaGraphRunner(
+            self.platform.validate_config(self.config)
+            graph_runner_cls = self.platform.get_decode_graph_runner_cls()
+            if graph_runner_cls is None:
+                raise RuntimeError(
+                    f"decode graph is enabled, but platform {self.platform.name!r} "
+                    "does not provide a decode graph runner."
+                )
+            self.decode_cuda_graph_runner = graph_runner_cls(
                 cache_manager=self.cache_manager,
                 sparse_controller=self.sparse_controller,
                 run_model=self.run_model,
@@ -102,10 +113,10 @@ class ModelRunner:
             if rank == 0:
                 # Rank 0 创建共享内存用于发送方法调用指令
                 self.shm = SharedMemory(name="sparsevllm", create=True, size=2**20)
-                dist.barrier(device_ids=[rank])
+                dist.barrier(device_ids=self.platform.barrier_device_ids(rank))
             else:
                 # 其他 Rank 监听共享内存中的指令
-                dist.barrier(device_ids=[rank])
+                dist.barrier(device_ids=self.platform.barrier_device_ids(rank))
                 self.shm = SharedMemory(name="sparsevllm")
                 self.loop()
 
@@ -115,7 +126,7 @@ class ModelRunner:
             self.shm.close()
             if self.rank == 0:
                 self.shm.unlink()
-        torch.cuda.synchronize()
+        self.platform.synchronize()
         dist.destroy_process_group()
 
     def loop(self):
@@ -254,10 +265,20 @@ class ModelRunner:
         temperatures = [seq.temperature for seq in seqs]
         top_ps = [seq.top_p for seq in seqs]
         top_ks = [seq.top_k for seq in seqs]
+        pin_memory = self.platform.supports_pin_memory()
         return (
-            torch.tensor(temperatures, dtype=torch.float32, pin_memory=True).cuda(non_blocking=True),
-            torch.tensor(top_ps, dtype=torch.float32, pin_memory=True).cuda(non_blocking=True),
-            torch.tensor(top_ks, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True),
+            torch.tensor(temperatures, dtype=torch.float32, pin_memory=pin_memory).to(
+                device=self.device,
+                non_blocking=pin_memory,
+            ),
+            torch.tensor(top_ps, dtype=torch.float32, pin_memory=pin_memory).to(
+                device=self.device,
+                non_blocking=pin_memory,
+            ),
+            torch.tensor(top_ks, dtype=torch.int64, pin_memory=pin_memory).to(
+                device=self.device,
+                non_blocking=pin_memory,
+            ),
         )
 
     def set_decode_cuda_graph_max_context_len_override(self, max_context_len: int | None):
