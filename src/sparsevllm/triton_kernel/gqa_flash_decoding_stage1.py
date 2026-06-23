@@ -99,25 +99,25 @@ def _fwd_kernel_flash_decode_stage1(
         sum_exp = sum_exp * logic_scale + tl.sum(exp_logic, axis=1)
         max_logic = new_max_logic
 
-    need_store = tl.where(block_n_size == 0, 0, 1)
-    for _ in range(0, need_store, 1):
-        off_mid_o = (
-            cur_batch * stride_mid_ob
-            + cur_q_head_range[:, None] * stride_mid_oh
-            + seq_start_block * stride_mid_os
-            + offs_d[None, :]
-        )
-        off_mid_o_logexpsum = cur_batch * stride_mid_o_eb + cur_q_head_range * stride_mid_o_eh + seq_start_block
-        tl.store(
-            Mid_O + off_mid_o,
-            acc / sum_exp[:, None],
-            mask=cur_q_head_range[:, None] < (cur_kv_head + 1) * gqa_group_size,
-        )
-        tl.store(
-            Mid_O_LogExpSum + off_mid_o_logexpsum,
-            max_logic + tl.log(sum_exp),
-            mask=cur_q_head_range < (cur_kv_head + 1) * gqa_group_size,
-        )
+    off_mid_o = (
+        cur_batch * stride_mid_ob
+        + cur_q_head_range[:, None] * stride_mid_oh
+        + seq_start_block * stride_mid_os
+        + offs_d[None, :]
+    )
+    off_mid_o_logexpsum = cur_batch * stride_mid_o_eb + cur_q_head_range * stride_mid_o_eh + seq_start_block
+    safe_sum_exp = tl.where(block_n_size == 0, 1.0, sum_exp)
+    neutral_o = tl.zeros([Q_HEAD_NUM, BLOCK_DMODEL], dtype=tl.float32)
+    tl.store(
+        Mid_O + off_mid_o,
+        tl.where(block_n_size == 0, neutral_o, acc / safe_sum_exp[:, None]),
+        mask=cur_q_head_range[:, None] < (cur_kv_head + 1) * gqa_group_size,
+    )
+    tl.store(
+        Mid_O_LogExpSum + off_mid_o_logexpsum,
+        tl.where(block_n_size == 0, -float("inf"), max_logic + tl.log(safe_sum_exp)),
+        mask=cur_q_head_range < (cur_kv_head + 1) * gqa_group_size,
+    )
     return
 
 
@@ -195,15 +195,16 @@ def _fwd_kernel_flash_decode_stage1_with_score(
         sum_exp = sum_exp * logic_scale + tl.sum(exp_logic, axis=1)
         max_logic = new_max_logic
 
-    need_store = tl.where(block_n_size == 0, 0, 1)
-    for _ in range(0, need_store, 1):
-        off_mid_o = (cur_batch * stride_mid_ob + cur_q_head_range[:, None] * stride_mid_oh + 
-                     seq_start_block * stride_mid_os + offs_d[None, :])
-        off_mid_o_logexpsum = cur_batch * stride_mid_o_eb + cur_q_head_range * stride_mid_o_eh + seq_start_block
-        tl.store(Mid_O + off_mid_o, acc / sum_exp[:, None],
-                 mask=cur_q_head_range[:, None] < (cur_kv_head + 1) * gqa_group_size)
-        tl.store(Mid_O_LogExpSum + off_mid_o_logexpsum, max_logic + tl.log(sum_exp),
-                 mask=cur_q_head_range < (cur_kv_head + 1) * gqa_group_size)
+    off_mid_o = (cur_batch * stride_mid_ob + cur_q_head_range[:, None] * stride_mid_oh +
+                 seq_start_block * stride_mid_os + offs_d[None, :])
+    off_mid_o_logexpsum = cur_batch * stride_mid_o_eb + cur_q_head_range * stride_mid_o_eh + seq_start_block
+    safe_sum_exp = tl.where(block_n_size == 0, 1.0, sum_exp)
+    neutral_o = tl.zeros([Q_HEAD_NUM, BLOCK_DMODEL], dtype=tl.float32)
+    tl.store(Mid_O + off_mid_o, tl.where(block_n_size == 0, neutral_o, acc / safe_sum_exp[:, None]),
+             mask=cur_q_head_range[:, None] < (cur_kv_head + 1) * gqa_group_size)
+    tl.store(Mid_O_LogExpSum + off_mid_o_logexpsum,
+             tl.where(block_n_size == 0, -float("inf"), max_logic + tl.log(safe_sum_exp)),
+             mask=cur_q_head_range < (cur_kv_head + 1) * gqa_group_size)
     return
 
 
@@ -281,15 +282,16 @@ def _fwd_kernel_flash_decode_stage1_with_score_2d(
         sum_exp = sum_exp * logic_scale + tl.sum(exp_logic, axis=1)
         max_logic = new_max_logic
 
-    need_store = tl.where(block_n_size == 0, 0, 1)
-    for _ in range(0, need_store, 1):
-        off_mid_o = (cur_batch * stride_mid_ob + cur_q_head_range[:, None] * stride_mid_oh + 
-                     seq_start_block * stride_mid_os + offs_d[None, :])
-        off_mid_o_logexpsum = cur_batch * stride_mid_o_eb + cur_q_head_range * stride_mid_o_eh + seq_start_block
-        tl.store(Mid_O + off_mid_o, acc / sum_exp[:, None],
-                 mask=cur_q_head_range[:, None] < (cur_kv_head + 1) * gqa_group_size)
-        tl.store(Mid_O_LogExpSum + off_mid_o_logexpsum, max_logic + tl.log(sum_exp),
-                 mask=cur_q_head_range < (cur_kv_head + 1) * gqa_group_size)
+    off_mid_o = (cur_batch * stride_mid_ob + cur_q_head_range[:, None] * stride_mid_oh +
+                 seq_start_block * stride_mid_os + offs_d[None, :])
+    off_mid_o_logexpsum = cur_batch * stride_mid_o_eb + cur_q_head_range * stride_mid_o_eh + seq_start_block
+    safe_sum_exp = tl.where(block_n_size == 0, 1.0, sum_exp)
+    neutral_o = tl.zeros([Q_HEAD_NUM, BLOCK_DMODEL], dtype=tl.float32)
+    tl.store(Mid_O + off_mid_o, tl.where(block_n_size == 0, neutral_o, acc / safe_sum_exp[:, None]),
+             mask=cur_q_head_range[:, None] < (cur_kv_head + 1) * gqa_group_size)
+    tl.store(Mid_O_LogExpSum + off_mid_o_logexpsum,
+             tl.where(block_n_size == 0, -float("inf"), max_logic + tl.log(safe_sum_exp)),
+             mask=cur_q_head_range < (cur_kv_head + 1) * gqa_group_size)
     return
 
 

@@ -3,7 +3,8 @@ import json
 import sys
 import subprocess
 import re
-from typing import Union
+import traceback
+from typing import Any, Union
 from pathlib import Path
 
 from tqdm import tqdm
@@ -23,6 +24,14 @@ DATA_PREFIX_PATH = os.getenv(
     os.getenv("DELTAKV_DATA_DIR", "/root/autodl-fs/datasets/LongBench/"),
 )
 NO_CHAT_TEMPLATE_DATASETS = {"trec", "triviaqa", "samsum", "lsht", "lcc", "repobench-p"}
+SAMPLE_STATUSES = {
+    "success",
+    "invalid_input",
+    "model_failed",
+    "parse_failed",
+    "metric_failed",
+    "skipped_by_policy",
+}
 
 
 def get_longbench_data_path(dataset, use_longbench_e):
@@ -129,6 +138,100 @@ def strip_thinking_content(text: str) -> str:
     return text
 
 
+def _append_jsonl(path: str | os.PathLike[str], record: dict[str, Any]) -> None:
+    Path(path).parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "a", encoding="utf-8") as f:
+        json.dump(record, f, ensure_ascii=False)
+        f.write("\n")
+
+
+def _artifact_paths(out_root: str) -> dict[str, str]:
+    return {
+        "raw": os.path.join(out_root, "raw_outputs.jsonl"),
+        "parsed": os.path.join(out_root, "parsed_outputs.jsonl"),
+        "sample": os.path.join(out_root, "sample_results.jsonl"),
+    }
+
+
+def _sample_base_record(
+    *,
+    dataset: str,
+    batch_offset: int,
+    json_obj: dict[str, Any],
+    prompt_tokens: int | None = None,
+) -> dict[str, Any]:
+    source_idx = json_obj.get("_longbench_source_idx")
+    if source_idx is None:
+        source_idx = json_obj.get("_source_idx", batch_offset)
+    return {
+        "dataset": dataset,
+        "sample_idx": int(batch_offset),
+        "source_idx": int(source_idx),
+        "prompt_tokens": None if prompt_tokens is None else int(prompt_tokens),
+        "answers": json_obj.get("answers"),
+        "all_classes": json_obj.get("all_classes"),
+        "length": json_obj.get("length"),
+    }
+
+
+def _write_sample_record(
+    *,
+    out_root: str,
+    task_out_path: str,
+    record: dict[str, Any],
+) -> None:
+    status = record.get("status")
+    if status not in SAMPLE_STATUSES:
+        raise ValueError(f"Invalid sample status {status!r}; expected one of {sorted(SAMPLE_STATUSES)}.")
+
+    paths = _artifact_paths(out_root)
+    raw_record = {
+        key: record.get(key)
+        for key in (
+            "dataset",
+            "sample_idx",
+            "source_idx",
+            "status",
+            "prompt_tokens",
+            "raw_pred",
+            "error",
+            "traceback",
+        )
+        if key in record
+    }
+    parsed_record = {
+        key: record.get(key)
+        for key in (
+            "dataset",
+            "sample_idx",
+            "source_idx",
+            "status",
+            "prompt_tokens",
+            "pred",
+            "error",
+        )
+        if key in record
+    }
+    _append_jsonl(paths["raw"], raw_record)
+    _append_jsonl(paths["parsed"], parsed_record)
+    _append_jsonl(paths["sample"], record)
+
+    # Keep the historical per-task files for benchmark/long_bench/eval.py.
+    task_record = {
+        "status": record["status"],
+        "pred": record.get("pred", ""),
+        "raw_pred": record.get("raw_pred", record.get("pred", "")),
+        "answers": record.get("answers"),
+        "all_classes": record.get("all_classes"),
+        "length": record.get("length"),
+        "prompt_tokens": record.get("prompt_tokens"),
+        "source_idx": record.get("source_idx"),
+    }
+    if "error" in record:
+        task_record["error"] = record["error"]
+    _append_jsonl(task_out_path, task_record)
+
+
 def build_kvzip_prompt_parts(prompt_format, json_obj, use_kvzip_template=True):
     if "{context}" not in prompt_format:
         raise ValueError("KVzip LongBench adapter requires '{context}' in the prompt template.")
@@ -198,81 +301,191 @@ def get_pred(rank, data, dataset_info, args, model, tokenizer, model_max_length)
     max_gen = args.max_new_tokens_override if args.max_new_tokens_override is not None else dataset_info['max_gen']
     max_length = model_max_length if model_max_length else dataset_info['max_length']
     out_path = dataset_info['out_path']
+    out_root = dataset_info['out_root']
 
     batch_size = args.batch_size
+    failures: list[dict[str, Any]] = []
     for i in tqdm(range(0, len(data), batch_size), desc=f'[Rank {rank}] {dataset}'):
         batch_data = data[i:i + batch_size]
         prompts = []
+        prepared_records: list[dict[str, Any]] = []
         for json_obj in batch_data:
-            if args.sparse_method == "kvzip" and args.backend == "hf":
-                use_kvzip_template = not args.no_chat_template and dataset not in NO_CHAT_TEMPLATE_DATASETS
-                prompt_parts = build_kvzip_prompt_parts(
-                    prompt_format,
-                    json_obj,
-                    use_kvzip_template=use_kvzip_template,
-                )
-                query_ids = tokenizer(
-                    prompt_parts["query_text"],
-                    truncation=False,
-                    return_tensors="pt",
-                ).input_ids[0]
-                max_context_length = max(max_length - len(query_ids), 1)
-                context_ids = tokenizer(
-                    prompt_parts["prefill_text"],
-                    truncation=False,
-                    return_tensors="pt",
-                ).input_ids[0]
-                if len(context_ids) > max_context_length:
-                    half = int(max_context_length / 2)
-                    if half == 0:
-                        prompt_parts["prefill_text"] = tokenizer.decode(
-                            context_ids[-max_context_length:],
-                            skip_special_tokens=True,
-                        )
-                    else:
-                        prompt_parts["prefill_text"] = (
-                            tokenizer.decode(context_ids[:half], skip_special_tokens=True) +
-                            tokenizer.decode(context_ids[-half:], skip_special_tokens=True)
-                        )
-                prompts.append(prompt_parts)
-            else:
-                prompt = prompt_format.format(**json_obj)
-                tokenized_prompt = tokenizer(prompt, truncation=False, return_tensors="pt").input_ids[0]
-                if len(tokenized_prompt) > max_length:
-                    half = int(max_length / 2)
-                    prompt = (
-                            tokenizer.decode(tokenized_prompt[:half], skip_special_tokens=True) +
-                            tokenizer.decode(tokenized_prompt[-half:], skip_special_tokens=True)
+            selected_idx = int(json_obj.get("_longbench_selected_idx", i + len(prepared_records)))
+            prompt_tokens = json_obj.get("_longbench_prompt_tokens")
+            try:
+                if "answers" not in json_obj or "all_classes" not in json_obj:
+                    raise ValueError("LongBench sample must contain answers and all_classes fields.")
+
+                if args.sparse_method == "kvzip" and args.backend == "hf":
+                    use_kvzip_template = not args.no_chat_template and dataset not in NO_CHAT_TEMPLATE_DATASETS
+                    prompt_parts = build_kvzip_prompt_parts(
+                        prompt_format,
+                        json_obj,
+                        use_kvzip_template=use_kvzip_template,
                     )
-                prompts.append(build_chat(tokenizer, prompt, dataset, args.no_chat_template, args.thinking_mode))
+                    query_ids = tokenizer(
+                        prompt_parts["query_text"],
+                        truncation=False,
+                        return_tensors="pt",
+                    ).input_ids[0]
+                    max_context_length = max(max_length - len(query_ids), 1)
+                    context_ids = tokenizer(
+                        prompt_parts["prefill_text"],
+                        truncation=False,
+                        return_tensors="pt",
+                    ).input_ids[0]
+                    if prompt_tokens is None:
+                        prompt_tokens = int(len(context_ids) + len(query_ids))
+                    if len(context_ids) > max_context_length:
+                        half = int(max_context_length / 2)
+                        if half == 0:
+                            prompt_parts["prefill_text"] = tokenizer.decode(
+                                context_ids[-max_context_length:],
+                                skip_special_tokens=True,
+                            )
+                        else:
+                            prompt_parts["prefill_text"] = (
+                                tokenizer.decode(context_ids[:half], skip_special_tokens=True) +
+                                tokenizer.decode(context_ids[-half:], skip_special_tokens=True)
+                            )
+                    prompt = prompt_parts
+                else:
+                    prompt = prompt_format.format(**json_obj)
+                    tokenized_prompt = tokenizer(prompt, truncation=False, return_tensors="pt").input_ids[0]
+                    if len(tokenized_prompt) > max_length:
+                        half = int(max_length / 2)
+                        prompt = (
+                                tokenizer.decode(tokenized_prompt[:half], skip_special_tokens=True) +
+                                tokenizer.decode(tokenized_prompt[-half:], skip_special_tokens=True)
+                        )
+                    prompt = build_chat(tokenizer, prompt, dataset, args.no_chat_template, args.thinking_mode)
+                    if prompt_tokens is None:
+                        add_special_tokens = True
+                        if tokenizer.bos_token is None or prompt.startswith(tokenizer.bos_token):
+                            add_special_tokens = False
+                        prompt_tokens = len(tokenizer.encode(prompt, add_special_tokens=add_special_tokens))
+                prompts.append(prompt)
+                prepared_records.append(
+                    _sample_base_record(
+                        dataset=dataset,
+                        batch_offset=selected_idx,
+                        json_obj=json_obj,
+                        prompt_tokens=prompt_tokens,
+                    )
+                )
+            except Exception as exc:
+                record = _sample_base_record(
+                    dataset=dataset,
+                    batch_offset=selected_idx,
+                    json_obj=json_obj,
+                    prompt_tokens=prompt_tokens,
+                )
+                record.update(
+                    {
+                        "status": "invalid_input",
+                        "pred": "",
+                        "raw_pred": "",
+                        "error": repr(exc),
+                        "traceback": traceback.format_exc(),
+                    }
+                )
+                _write_sample_record(out_root=out_root, task_out_path=out_path, record=record)
+                failures.append(record)
+
+        if failures:
+            break
 
         eos_token_id = [tokenizer.eos_token_id]
         if hasattr(tokenizer, 'eot_token_id'):
             eos_token_id.append(tokenizer.eot_token_id)
 
-        preds = model(
-            prompts,
-            max_new_tokens=max_gen,
-            num_beams=1,
-            do_sample=args.temperature > 0,
-            temperature=args.temperature,
-            top_p=args.top_p,
-            top_k=args.top_k,
-            eos_token_id=eos_token_id,
-        )
+        try:
+            preds = model(
+                prompts,
+                max_new_tokens=max_gen,
+                num_beams=1,
+                do_sample=args.temperature > 0,
+                temperature=args.temperature,
+                top_p=args.top_p,
+                top_k=args.top_k,
+                eos_token_id=eos_token_id,
+            )
+        except Exception as exc:
+            for record in prepared_records:
+                failed = dict(record)
+                failed.update(
+                    {
+                        "status": "model_failed",
+                        "pred": "",
+                        "raw_pred": "",
+                        "error": repr(exc),
+                        "traceback": traceback.format_exc(),
+                    }
+                )
+                _write_sample_record(out_root=out_root, task_out_path=out_path, record=failed)
+                failures.append(failed)
+            break
 
         if isinstance(preds, str): preds = [preds]
+        if len(preds) != len(prepared_records):
+            error = (
+                f"Model returned {len(preds)} predictions for "
+                f"{len(prepared_records)} prompts in dataset={dataset}."
+            )
+            for record in prepared_records:
+                failed = dict(record)
+                failed.update(
+                    {
+                        "status": "parse_failed",
+                        "pred": "",
+                        "raw_pred": "",
+                        "error": error,
+                    }
+                )
+                _write_sample_record(out_root=out_root, task_out_path=out_path, record=failed)
+                failures.append(failed)
+            break
 
-        for json_obj, pred in zip(batch_data, preds):
-            if args.thinking_mode == "on_strip":
-                pred = strip_thinking_content(pred)
-            with open(out_path, "a", encoding="utf-8") as f:
-                json.dump({
-                    "pred": pred, "answers": json_obj["answers"],
-                    "all_classes": json_obj["all_classes"],
-                    "length": json_obj["length"]
-                }, f, ensure_ascii=False)
-                f.write('\n')
+        for record, pred in zip(prepared_records, preds):
+            raw_pred = pred
+            try:
+                if not isinstance(raw_pred, str):
+                    raise TypeError(f"Model prediction must be str, got {type(raw_pred).__name__}.")
+                parsed_pred = strip_thinking_content(raw_pred) if args.thinking_mode == "on_strip" else raw_pred
+            except Exception as exc:
+                failed = dict(record)
+                failed.update(
+                    {
+                        "status": "parse_failed",
+                        "pred": "",
+                        "raw_pred": raw_pred if isinstance(raw_pred, str) else repr(raw_pred),
+                        "error": repr(exc),
+                        "traceback": traceback.format_exc(),
+                    }
+                )
+                _write_sample_record(out_root=out_root, task_out_path=out_path, record=failed)
+                failures.append(failed)
+                continue
+
+            ok = dict(record)
+            ok.update(
+                {
+                    "status": "success",
+                    "pred": parsed_pred,
+                    "raw_pred": raw_pred,
+                }
+            )
+            _write_sample_record(out_root=out_root, task_out_path=out_path, record=ok)
+
+        if failures:
+            break
+
+    if failures:
+        first = failures[0]
+        raise RuntimeError(
+            f"LongBench prediction failed for dataset={dataset}, rank={rank}, "
+            f"status={first.get('status')}, source_idx={first.get('source_idx')}: {first.get('error')}"
+        )
 
 
 def worker(rank, world_size, datasets, dataset2prompt, dataset2maxlen, args, out_root, max_length_limit):
@@ -288,6 +501,58 @@ def worker(rank, world_size, datasets, dataset2prompt, dataset2maxlen, args, out
         
         data = [json.loads(line) for line in open(data_path, 'r', encoding="utf-8")]
         if args.num_samples: data = data[:args.num_samples]
+
+        if args.min_prompt_tokens is not None:
+            from benchmark.sparsevllm_regression.longbench_mini import select_longbench_mini_samples
+
+            selected, selection_meta = select_longbench_mini_samples(
+                data=data,
+                tokenizer=tokenizer,
+                dataset=dataset,
+                prompt_format=dataset2prompt[dataset],
+                min_prompt_tokens=int(args.min_prompt_tokens),
+                samples_per_task=int(args.samples_per_task),
+                min_required_samples=int(args.min_required_samples),
+                no_chat_template=bool(args.no_chat_template),
+                thinking_mode=args.thinking_mode,
+            )
+            if rank == 0:
+                _append_jsonl(os.path.join(out_root, "longbench_mini_selection.jsonl"), selection_meta)
+            if selection_meta["status"] == "skipped_by_policy":
+                if rank == 0:
+                    skipped = {
+                        "dataset": dataset,
+                        "sample_idx": -1,
+                        "source_idx": -1,
+                        "prompt_tokens": None,
+                        "answers": None,
+                        "all_classes": None,
+                        "length": None,
+                        "status": "skipped_by_policy",
+                        "pred": "",
+                        "raw_pred": "",
+                        "error": (
+                            f"Only {selection_meta['selected_rows']} samples reached "
+                            f"min_prompt_tokens={selection_meta['min_prompt_tokens']}; "
+                            f"min_required_samples={selection_meta['min_required_samples']}."
+                        ),
+                        "selection": selection_meta,
+                    }
+                    _write_sample_record(
+                        out_root=out_root,
+                        task_out_path=os.path.join(out_root, f"{dataset}.jsonl"),
+                        record=skipped,
+                    )
+                continue
+
+            selected_data: list[dict[str, Any]] = []
+            for selected_idx, item in enumerate(selected):
+                row = dict(item.row)
+                row["_longbench_source_idx"] = int(item.source_idx)
+                row["_longbench_selected_idx"] = int(selected_idx)
+                row["_longbench_prompt_tokens"] = int(item.prompt_tokens)
+                selected_data.append(row)
+            data = selected_data
         
         data_subset = data[rank::world_size]
         if not data_subset: continue
@@ -297,7 +562,8 @@ def worker(rank, world_size, datasets, dataset2prompt, dataset2maxlen, args, out
             'prompt_format': dataset2prompt[dataset],
             'max_gen': dataset2maxlen[dataset],
             'max_length': max_length_limit,
-            'out_path': os.path.join(out_root, f"{dataset}.jsonl")
+            'out_path': os.path.join(out_root, f"{dataset}.jsonl"),
+            'out_root': out_root,
         }
         
         get_pred(rank, data_subset, dataset_info, args, model, tokenizer, model_max_length)
@@ -372,6 +638,9 @@ def parse_args():
     parser.add_argument("--top_k", type=int, default=20)
     parser.add_argument("--thinking_mode", type=str, default="off", choices=["off", "on_strip"])
     parser.add_argument("--max_new_tokens_override", type=int, default=None)
+    parser.add_argument("--min_prompt_tokens", type=int, default=None)
+    parser.add_argument("--samples_per_task", type=int, default=20)
+    parser.add_argument("--min_required_samples", type=int, default=5)
     parser.add_argument("--worker_rank", type=int, default=-1)
     parser.add_argument("--worker_world_size", type=int, default=1)
     parser.add_argument("--output_root", type=str, default=None)
@@ -414,13 +683,44 @@ if __name__ == '__main__':
         for dataset in datasets:
             with open(os.path.join(out_root, f"{dataset}.jsonl"), 'w') as f:
                 pass
+        for artifact in ("raw_outputs.jsonl", "parsed_outputs.jsonl", "sample_results.jsonl", "longbench_mini_selection.jsonl"):
+            with open(os.path.join(out_root, artifact), "w", encoding="utf-8") as f:
+                pass
 
     max_length_limit = 120_000 + 1000
     args.max_model_len = max_length_limit
 
+    if args.worker_rank < 0:
+        resolved_config = {
+            "model": args.model,
+            "model_path": args.model_path,
+            "tokenizer_path": args.tokenizer_path or args.model_path,
+            "backend": args.backend,
+            "sparse_method": args.sparse_method,
+            "deltakv_checkpoint_path": args.deltakv_checkpoint_path,
+            "datasets": datasets,
+            "longbench_data_root": DATA_PREFIX_PATH,
+            "max_model_len": args.max_model_len,
+            "decoding": {
+                "temperature": args.temperature,
+                "top_p": args.top_p,
+                "top_k": args.top_k,
+                "max_new_tokens_override": args.max_new_tokens_override,
+            },
+            "selection": {
+                "min_prompt_tokens": args.min_prompt_tokens,
+                "samples_per_task": args.samples_per_task,
+                "min_required_samples": args.min_required_samples,
+            },
+            "args": vars(args),
+        }
+        with open(os.path.join(out_root, "resolved_config.json"), "w", encoding="utf-8") as f:
+            json.dump(resolved_config, f, ensure_ascii=False, indent=2)
+            f.write("\n")
+
     if args.worker_rank >= 0:
         worker(args.worker_rank, args.worker_world_size, datasets, dataset2prompt, dataset2maxlen, args, out_root, max_length_limit)
-    elif args.ws > 1 and args.sparse_method == "kvzip":
+    elif args.ws > 1 and (args.sparse_method == "kvzip" or args.backend == "sparsevllm"):
         launch_single_gpu_workers(args, out_root)
     elif args.ws > 1:
         processes = []
@@ -443,7 +743,7 @@ if __name__ == '__main__':
 
     if args.worker_rank < 0:
         # 记录评测信息到日志文件
-        log_path = os.path.join(BASE_PATH, "longbench_eval.log")
+        log_path = os.path.join(out_root, "longbench_eval.log")
         with open(log_path, "a", encoding="utf-8") as f:
             f.write(f"Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
             f.write(f"Command: python {' '.join(sys.argv)}\n")
@@ -461,21 +761,17 @@ if __name__ == '__main__':
         if args.e:
             eval_cmd.append("--e")
 
-        try:
-            subprocess.run(eval_cmd, check=True)
+        subprocess.run(eval_cmd, check=True)
 
-            # 读取评测结果并写入日志
-            result_path = os.path.join(out_root, "result.json")
-            if os.path.exists(result_path):
-                with open(result_path, "r", encoding="utf-8") as f:
-                    scores = json.load(f)
+        # 读取评测结果并写入日志
+        result_path = os.path.join(out_root, "result.json")
+        if not os.path.exists(result_path):
+            raise FileNotFoundError(f"LongBench evaluation did not write result.json: {result_path}")
+        with open(result_path, "r", encoding="utf-8") as f:
+            scores = json.load(f)
 
-                with open(log_path, "a", encoding="utf-8") as f:
-                    f.write(f"Evaluation Results ({'LongBench-E' if args.e else 'LongBench'}):\n")
-                    f.write(json.dumps(scores, indent=4, ensure_ascii=False))
-                    f.write("\n" + "="*80 + "\n\n")
-                print(f"评测结果已成功写入日志: {log_path}")
-            else:
-                print(f"未找到评测结果文件: {result_path}")
-        except subprocess.CalledProcessError as e:
-            print(f"评测脚本执行失败: {e}")
+        with open(log_path, "a", encoding="utf-8") as f:
+            f.write(f"Evaluation Results ({'LongBench-E' if args.e else 'LongBench'}):\n")
+            f.write(json.dumps(scores, indent=4, ensure_ascii=False))
+            f.write("\n" + "="*80 + "\n\n")
+        print(f"评测结果已成功写入日志: {log_path}")

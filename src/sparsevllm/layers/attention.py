@@ -1,51 +1,10 @@
 import torch
 from torch import nn
-import triton
-import triton.language as tl
 
-from sparsevllm.triton_kernel.context_flashattention_nopad import context_attention_fwd
-from sparsevllm.triton_kernel.flash_decoding_stage1 import flash_decode_stage1 as mha_flash_decode_stage1
-from sparsevllm.triton_kernel.flash_decoding_stage1 import flash_decode_stage1_with_score as mha_flash_decode_stage1_with_score
-from sparsevllm.triton_kernel.gqa_flash_decoding_stage1 import flash_decode_stage1 as gqa_flash_decode_stage1
-from sparsevllm.triton_kernel.gqa_flash_decoding_stage1 import flash_decode_stage1_with_score as gqa_flash_decode_stage1_with_score
-from sparsevllm.triton_kernel.flash_decoding_stage2 import flash_decode_stage2
+from sparsevllm.layers.attention_backend import TritonAttentionBackend
 from sparsevllm.utils.context import get_context
-from sparsevllm.utils.log import logger
 
 from sparsevllm.engine.sparse_controller import SparseController
-
-
-@triton.jit
-def store_kvcache_kernel(
-    key_ptr,
-    key_stride,
-    value_ptr,
-    value_stride,
-    k_cache_ptr,
-    v_cache_ptr,
-    slot_mapping_ptr,
-    D: tl.constexpr,
-):
-    idx = tl.program_id(0)
-    slot = tl.load(slot_mapping_ptr + idx)
-    if slot == -1: return
-    key_offsets = idx * key_stride + tl.arange(0, D)
-    value_offsets = idx * value_stride + tl.arange(0, D)
-    key = tl.load(key_ptr + key_offsets)
-    value = tl.load(value_ptr + value_offsets)
-    cache_offsets = slot * D + tl.arange(0, D)
-    tl.store(k_cache_ptr + cache_offsets, key)
-    tl.store(v_cache_ptr + cache_offsets, value)
-
-
-def store_kvcache(key: torch.Tensor, value: torch.Tensor, k_cache: torch.Tensor, v_cache: torch.Tensor, slot_mapping: torch.Tensor):
-    N, num_heads, head_dim = key.shape
-    D = num_heads * head_dim
-    assert key.stride(-1) == 1 and value.stride(-1) == 1
-    assert key.stride(1) == head_dim and value.stride(1) == head_dim
-    assert k_cache.stride(-1) == 1
-    assert slot_mapping.numel() == N
-    store_kvcache_kernel[(N,)](key, key.stride(0), value, value.stride(0), k_cache, v_cache, slot_mapping, D)
 
 
 def get_decode_workspace(
@@ -101,73 +60,93 @@ class Attention(nn.Module):
         self.head_dim = head_dim
         self.scale = scale
         self.num_kv_heads = num_kv_heads
+        self.attention_backend = TritonAttentionBackend()
 
-    def forward(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor):
+    def forward(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+    ):
         context = get_context()
         cache_manager = context.cache_manager
         sparse_controller: SparseController = context.sparse_controller
         layer_idx = context.now_layer_idx
-        store_k_cache, store_v_cache, slot_mapping = cache_manager.get_layer_store_view(layer_idx)
 
-        # 1. 写入 KV Cache (物理行为)
-        # 无论是 DeltaKV 还是全量/SnapKV，均先将当前 KV 写入物理槽位 (对于 DeltaKV，是写入 Base Pool 作为 Recent)
-        store_kvcache(k, v, store_k_cache, store_v_cache, slot_mapping)
-        cache_manager.on_kv_stored(layer_idx, k, slot_mapping)
-
-        # 2. 获取逻辑视图
-        layer_active_slots, layer_active_indices, layer_req_indices, layer_context_lens, layer_attn_score, deltakv_temp_slots = \
-            sparse_controller.get_read_view(layer_idx)
-
-        assert layer_active_slots is not None
-        b_req_idx = layer_req_indices
-
-        try:
-            k_cache, v_cache = cache_manager.get_layer_compute_tensors(layer_idx, sparse_controller)
-        except NotImplementedError:
-            k_cache, v_cache = cache_manager.get_layer_kv_cache(layer_idx)
-
-        # --- 通用稀疏/全量路径 (使用 Triton) ---
+        temp_slots = None
         try:
             if context.is_prefill:
+                selection = sparse_controller.get_prefill_selection(layer_idx)
+                prefill_view = cache_manager.build_prefill_compute_view(
+                    layer_idx,
+                    k,
+                    v,
+                    selection,
+                )
+                temp_slots = prefill_view.temp_slots
+
                 if context.cu_seqlens_q is None or context.cu_seqlens_q.numel() <= 1:
                     return torch.empty_like(q)
 
                 b_start_loc = context.cu_seqlens_q[:-1]
                 chunk_lens = context.cu_seqlens_q[1:] - context.cu_seqlens_q[:-1]
-                b_seq_len = layer_context_lens
-                b_prompt_cache_len = b_seq_len - chunk_lens
-                max_context_len = sparse_controller.get_layer_max_context_len(layer_idx)
-                max_input_len = int(max_context_len) if max_context_len is not None else b_seq_len.max().item()
+                max_context_len = prefill_view.max_context_len
+                if max_context_len is not None:
+                    max_input_len = int(max_context_len)
+                elif torch.cuda.is_available() and torch.cuda.is_current_stream_capturing():
+                    max_input_len = int(prefill_view.active_slots.shape[1])
+                else:
+                    max_input_len = prefill_view.context_lens.max().item()
 
-                # Triton 路径需要物理槽位 layer_active_slots 用于 Req_to_tokens 寻址
-                # 它内部通过 prompt_cache_len 实现因果掩码，目前不需要显式的 pos_ids
-                o = torch.empty_like(q)
-                context_attention_fwd(
-                    q, k_cache, v_cache, o,
-                    b_req_idx, b_start_loc, b_seq_len, b_prompt_cache_len, max_input_len,
-                    layer_active_slots,
-                    attn_score=layer_attn_score,
+                o = self.attention_backend.run_prefill(
+                    q,
+                    prefill_view,
+                    b_start_loc=b_start_loc,
+                    chunk_lens=chunk_lens,
+                    max_input_len=max_input_len,
                 )
             else:    # decode
                 batch_size = q.shape[0]
-                layer_active_slots, b_req_idx, layer_context_lens = cache_manager.build_decode_view(
+                selection = sparse_controller.get_decode_selection(
                     layer_idx,
                     q,
-                    layer_active_slots,
-                    b_req_idx,
-                    layer_context_lens,
+                )
+                decode_view = cache_manager.build_decode_compute_view(
+                    layer_idx,
+                    q,
+                    selection,
                     num_heads=self.num_heads,
                     num_kv_heads=self.num_kv_heads,
                 )
+                temp_slots = decode_view.temp_slots
 
-                max_context_len = sparse_controller.get_layer_max_context_len(layer_idx)
-                if max_context_len is not None:
-                    max_len_in_batch = int(max_context_len)
-                    if layer_active_slots.dim() == 2:
-                        max_len_in_batch = min(max_len_in_batch, int(layer_active_slots.shape[1]))
-                else:
-                    max_len_in_batch = layer_context_lens.max().item()
-                BLOCK_SEQ = 256
+                max_context_len = decode_view.max_context_len
+                static_cap = getattr(cache_manager, "_decode_static_max_context_len", None)
+                if static_cap is not None:
+                    max_context_len = max(
+                        int(max_context_len) if max_context_len is not None else 0,
+                        int(static_cap),
+                    )
+                if max_context_len is None:
+                    raise RuntimeError(f"static decode requires max_context_len, got None at layer={layer_idx}")
+                max_len_in_batch = int(max_context_len)
+                if decode_view.active_slots.dim() == 2:
+                    slot_table_len = int(decode_view.active_slots.shape[1])
+                    if not (torch.cuda.is_available() and torch.cuda.is_current_stream_capturing()):
+                        actual_max_len = int(decode_view.context_lens.max().item()) if decode_view.context_lens.numel() > 0 else 0
+                        if actual_max_len > slot_table_len:
+                            raise RuntimeError(
+                                "decode context length exceeds active slot table width: "
+                                f"layer={layer_idx} context_lens_max={actual_max_len} "
+                                f"slot_table_len={slot_table_len}"
+                            )
+                    if max_len_in_batch > slot_table_len:
+                        max_len_in_batch = slot_table_len
+                    if max_len_in_batch <= 0:
+                        raise RuntimeError(
+                            f"decode requires a positive context length, got {max_len_in_batch} at layer={layer_idx}"
+                        )
+                BLOCK_SEQ = cache_manager.get_decode_block_seq(layer_idx, 256)
                 num_seq_blocks = (max_len_in_batch + BLOCK_SEQ - 1) // BLOCK_SEQ
 
                 mid_o, mid_o_logexpsum = get_decode_workspace(
@@ -179,37 +158,20 @@ class Attention(nn.Module):
                     q.device,
                 )
 
-                is_gqa = self.num_heads > self.num_kv_heads
-                if layer_attn_score is not None:
-                    if is_gqa:
-                        gqa_flash_decode_stage1_with_score(
-                            q, k_cache, v_cache, layer_active_slots, b_req_idx, layer_context_lens,
-                            max_len_in_batch, mid_o, mid_o_logexpsum, layer_attn_score, BLOCK_SEQ,
-                        )
-                    else:
-                        mha_flash_decode_stage1_with_score(
-                            q, k_cache, v_cache, layer_active_slots, b_req_idx, layer_context_lens,
-                            max_len_in_batch, mid_o, mid_o_logexpsum, layer_attn_score, BLOCK_SEQ,
-                        )
-                else:
-                    if is_gqa:
-                        gqa_flash_decode_stage1(
-                            q, k_cache, v_cache, layer_active_slots, b_req_idx, layer_context_lens,
-                            max_len_in_batch, mid_o, mid_o_logexpsum, BLOCK_SEQ,
-                        )
-                    else:
-                        mha_flash_decode_stage1(
-                            q, k_cache, v_cache, layer_active_slots, b_req_idx, layer_context_lens,
-                            max_len_in_batch, mid_o, mid_o_logexpsum, BLOCK_SEQ,
-                        )
-
-                o = torch.empty_like(q)
-                flash_decode_stage2(mid_o, mid_o_logexpsum, layer_context_lens, o, BLOCK_SEQ)
+                o = self.attention_backend.run_decode(
+                    q,
+                    decode_view,
+                    mid_o=mid_o,
+                    mid_o_logexpsum=mid_o_logexpsum,
+                    max_len_in_batch=max_len_in_batch,
+                    block_seq=BLOCK_SEQ,
+                    num_heads=self.num_heads,
+                    num_kv_heads=self.num_kv_heads,
+                )
 
             sparse_controller.on_layer_attention_end(layer_idx)
             cache_manager.on_layer_attention_end(layer_idx)
             return o
         finally:
-            # DeltaKV reconstructs some KV into scratch slots; recycle them immediately after use.
-            if deltakv_temp_slots is not None and deltakv_temp_slots.numel() > 0:
-                cache_manager.free_temp_deltakv_full(deltakv_temp_slots)
+            if temp_slots is not None and temp_slots.numel() > 0:
+                cache_manager.release_layer_temp_slots(layer_idx, temp_slots)

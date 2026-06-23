@@ -3,7 +3,7 @@ from typing import Optional, Union
 from torch import nn
 from transformers.models.qwen2.modeling_qwen2 import (
     Qwen2Attention, Unpack, FlashAttentionKwargs, Callable, eager_attention_forward, ALL_ATTENTION_FUNCTIONS, Qwen2DecoderLayer, Qwen2Model, Qwen2ForCausalLM,
-    KwargsForCausalLM, apply_rotary_pos_emb
+    TransformersKwargs as KwargsForCausalLM, apply_rotary_pos_emb
 )
 from deltakv.modeling.cache_pipeline import SnapKVCache
 from deltakv.configs.model_config_cls import KVQwen2Config
@@ -154,7 +154,9 @@ class Qwen2PyramidKVForCausalLM(Qwen2ForCausalLM):
             logits_to_keep: Union[int, torch.Tensor] = 0,
             **kwargs: Unpack[KwargsForCausalLM],
     ):
-        assert input_ids is not None and attention_mask is None
+        assert input_ids is not None
+        if attention_mask is not None:
+            assert attention_mask.all(), "目前只支持 bs = 1"
         assert input_ids.shape[0] == 1
         assert position_ids is None and use_cache
 
@@ -180,7 +182,12 @@ class Qwen2PyramidKVForCausalLM(Qwen2ForCausalLM):
             chunk_input_ids = [input_ids]
 
         for _ipt_ids in chunk_input_ids:
-            outputs = super().forward(_ipt_ids, past_key_values=past_key_values, use_cache=True)
+            outputs = super().forward(
+                _ipt_ids,
+                past_key_values=past_key_values,
+                use_cache=True,
+                logits_to_keep=logits_to_keep,
+            )
             past_key_values = outputs.past_key_values
 
         return outputs

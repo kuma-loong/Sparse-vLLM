@@ -1,16 +1,13 @@
-from typing import Optional, Tuple
+from typing import List, Optional, Tuple, Union
 
 import torch
 import torch.functional as F
+from torch.nn import CrossEntropyLoss
 
 import transformers.models
+from transformers.modeling_outputs import BaseModelOutputWithPast, CausalLMOutputWithPast
 from transformers.models.llama.modeling_llama import (
     LlamaForCausalLM,
-    CausalLMOutputWithPast,
-    List,
-    Union,
-    CrossEntropyLoss,
-    BaseModelOutputWithPast,
     apply_rotary_pos_emb,
 )
 import types
@@ -498,8 +495,10 @@ def enable_tuple_kv_cache_for_llama():
     transformers.models.llama.modeling_llama.LlamaModel.forward = old_llama_model_forward
     transformers.models.llama.modeling_llama.LlamaDecoderLayer.forward = old_llama_decoder_layer_forward
     transformers.models.llama.modeling_llama.LlamaAttention.forward = old_flash_attention_2_forward
-    transformers.models.llama.modeling_llama.LlamaSdpaAttention.forward = old_flash_attention_2_forward
-    transformers.models.llama.modeling_llama.LlamaFlashAttention2.forward = old_flash_attention_2_forward
+    if hasattr(transformers.models.llama.modeling_llama, "LlamaSdpaAttention"):
+        transformers.models.llama.modeling_llama.LlamaSdpaAttention.forward = old_flash_attention_2_forward
+    if hasattr(transformers.models.llama.modeling_llama, "LlamaFlashAttention2"):
+        transformers.models.llama.modeling_llama.LlamaFlashAttention2.forward = old_flash_attention_2_forward
     transformers.models.llama.modeling_llama.LlamaAttention._upad_input = _upad_input
     transformers.models.llama.modeling_llama.LlamaAttention._flash_attention_forward = _flash_attention_forward
     transformers.models.llama.modeling_llama.LlamaForCausalLM.forward = old_llama_for_causal_lm_forward

@@ -247,6 +247,7 @@ def enable_quest_attention_eval(model, args):
     # 根据模型配置动态确定层数，并在此处初始化 layer_id 以支持多次调用
     num_layers = getattr(model.config, "num_hidden_layers", 32)
     current_layer_id = num_layers
+    model_rotary_emb = getattr(getattr(model, "model", None), "rotary_emb", None)
 
     def _enable_recursive(module):
         nonlocal current_layer_id
@@ -261,5 +262,19 @@ def enable_quest_attention_eval(model, args):
                 child.forward = types.MethodType(forward, child)
                 child.token_budget = args.token_budget
                 child.chunk_size = args.chunk_size
+                # Newer Transformers LlamaAttention keeps these dimensions on
+                # config instead of exposing the old Quest-expected attributes.
+                child.num_heads = getattr(child, "num_heads", child.config.num_attention_heads)
+                child.num_key_value_heads = getattr(
+                    child, "num_key_value_heads", child.config.num_key_value_heads
+                )
+                child.hidden_size = getattr(child, "hidden_size", child.config.hidden_size)
+                if not hasattr(child, "rotary_emb"):
+                    if model_rotary_emb is None:
+                        raise AttributeError(
+                            "Quest attention patch requires a rotary_emb module on "
+                            "attention layers or model.model.rotary_emb."
+                        )
+                    child.rotary_emb = model_rotary_emb
 
     _enable_recursive(model)

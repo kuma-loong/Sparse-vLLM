@@ -12,7 +12,6 @@ from pathlib import Path
 
 import pandas as pd
 import torch
-from transformers import LlavaOnevisionProcessor
 
 PROJECT_ROOT = Path(__file__).resolve().parents[3]
 if str(PROJECT_ROOT) not in sys.path:
@@ -39,7 +38,7 @@ CHOICES = {"A", "B", "C", "D"}
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="Benchmark LLaVA-OneVision vanilla and DeltaKV delta-quant on Video-MME."
+        description="Benchmark LLaVA-OneVision vanilla and DeltaKV less-memory on Video-MME."
     )
     parser.add_argument("--model_path", default="/data2/haojitai/models/llava-onevision-qwen2-0.5b-ov-hf")
     parser.add_argument("--deltakv_checkpoint_path", default="none")
@@ -54,7 +53,7 @@ def parse_args():
         help="Comma-separated duration filters: short, medium, long, or all.",
     )
     parser.add_argument("--domains", default="", help="Optional comma-separated Video-MME domain filters.")
-    parser.add_argument("--methods", default="vanilla,deltakv_delta_quant")
+    parser.add_argument("--methods", default="vanilla")
     parser.add_argument("--num_samples", type=int, default=16, help="Rows to evaluate after filtering. Use -1 for all rows.")
     parser.add_argument("--sample_start", type=int, default=0)
     parser.add_argument("--batch_size", type=int, default=1)
@@ -77,13 +76,20 @@ def parse_args():
     parser.add_argument("--chunk_prefill_accel_omnikv", action="store_true")
     parser.add_argument("--full_attention_layers", default="0,1,2,3,8,16,22")
     parser.add_argument("--visual_keep_ratio", type=float, default=1.0)
-    parser.add_argument("--delta_quant_bits", type=int, default=4, choices=[4])
     parser.add_argument("--deltakv_center_ratio", type=float, default=0.1)
     parser.add_argument("--deltakv_neighbor_count", type=int, default=1)
     parser.add_argument("--frame_cache_dir", default="")
     parser.add_argument("--reuse_frame_cache", action="store_true")
     parser.add_argument("--frame_load_workers", type=int, default=1)
-    parser.add_argument("--preprocess_prefetch_batches", type=int, default=0, choices=[0, 1])
+    parser.add_argument(
+        "--preprocess_prefetch_batches",
+        type=int,
+        default=0,
+        help=(
+            "Number of future batches to preprocess concurrently while generation runs. "
+            "0 disables prefetch. Values >1 use multiple CPU preprocessor workers and preserve output order."
+        ),
+    )
     parser.add_argument("--frame_sampling_backend", default="decord", choices=["decord"])
     parser.add_argument("--use_subtitles", action="store_true")
     parser.add_argument("--seed", type=int, default=0)
@@ -360,7 +366,6 @@ def build_run_info(args, dataset_info: dict, row_count: int) -> dict:
             "hf_prefill_chunk_size": args.hf_prefill_chunk_size,
             "full_attention_layers": args.full_attention_layers,
             "visual_keep_ratio": args.visual_keep_ratio,
-            "delta_quant_bits": args.delta_quant_bits,
             "deltakv_center_ratio": args.deltakv_center_ratio,
             "deltakv_neighbor_count": args.deltakv_neighbor_count,
             "chunk_prefill_accel_omnikv": bool(args.chunk_prefill_accel_omnikv),
@@ -429,6 +434,8 @@ def main():
     )
     run_info = build_run_info(args, dataset_info, len(rows))
 
+    from transformers import LlavaOnevisionProcessor
+
     processor = LlavaOnevisionProcessor.from_pretrained(
         args.model_path,
         trust_remote_code=True,
@@ -443,9 +450,9 @@ def main():
             method_label = "vanilla"
             policy = None
         else:
-            from benchmark.multimodal.model_adapters.llava_onevision import load_llava_delta_quant_model
+            from benchmark.multimodal.model_adapters.llava_onevision import load_llava_deltakv_model
 
-            model, policy = load_llava_delta_quant_model(args, dtype, device)
+            model, policy = load_llava_deltakv_model(args, dtype, device)
             method_label = policy["method"]
 
         result = streaming.run_method(method_label, model, processor, rows, args, dtype, device, policy=policy)

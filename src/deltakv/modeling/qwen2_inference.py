@@ -13,6 +13,7 @@ from transformers.models.qwen2.modeling_qwen2 import (
 from deltakv.configs.model_config_cls import KVQwen2Config
 from deltakv.modeling.cache_factory import (
     DELTA_COMPRESSED_LATENT_W_FULL,
+    DELTA_COMPRESSED_QUANT_KIVI_FULL_FP8_REF,
     DELTA_ORIGIN_W_FULL,
     DELTA_ORIGIN_WO_FULL,
 )
@@ -46,6 +47,11 @@ Qwen2DeltaCompressedLatentWFull = _variant_class(
     Qwen2KVCompress,
     DELTA_COMPRESSED_LATENT_W_FULL,
 )
+Qwen2DeltaCompressedQuantKiviFullFp8Ref = _variant_class(
+    "Qwen2DeltaCompressedQuantKiviFullFp8Ref",
+    Qwen2KVCompress,
+    DELTA_COMPRESSED_QUANT_KIVI_FULL_FP8_REF,
+)
 Qwen2DeltaOriginWoFull = _variant_class("Qwen2DeltaOriginWoFull", Qwen2KVCompress, DELTA_ORIGIN_WO_FULL)
 Qwen2DeltaOriginWFull = _variant_class("Qwen2DeltaOriginWFull", Qwen2KVCompress, DELTA_ORIGIN_W_FULL)
 
@@ -55,6 +61,7 @@ __all__ = [
     "Qwen2ModelKVCompress",
     "Qwen2KVCompress",
     "Qwen2DeltaCompressedLatentWFull",
+    "Qwen2DeltaCompressedQuantKiviFullFp8Ref",
     "Qwen2DeltaOriginWoFull",
     "Qwen2DeltaOriginWFull",
 ]

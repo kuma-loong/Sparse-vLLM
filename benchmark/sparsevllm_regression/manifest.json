@@ -1,0 +1,309 @@
+{
+  "version": 1,
+  "models": {
+    "qwen25_7b": {
+      "family": "qwen2",
+      "model_path_env": "DELTAKV_MODEL_QWEN25_7B",
+      "tokenizer_path_env": "DELTAKV_TOKENIZER_QWEN25_7B",
+      "compressor_path_env": "DELTAKV_COMPRESSOR_QWEN25_7B"
+    },
+    "qwen25_32b": {
+      "family": "qwen2",
+      "model_path_env": "DELTAKV_MODEL_QWEN25_32B",
+      "tokenizer_path_env": "DELTAKV_TOKENIZER_QWEN25_32B",
+      "compressor_path_env": "DELTAKV_COMPRESSOR_QWEN25_32B"
+    },
+    "qwen3_4b": {
+      "family": "qwen3",
+      "model_path_env": "DELTAKV_MODEL_QWEN3_4B",
+      "tokenizer_path_env": "DELTAKV_TOKENIZER_QWEN3_4B",
+      "compressor_path_env": "DELTAKV_COMPRESSOR_QWEN3_4B"
+    },
+    "llama31_8b": {
+      "family": "llama",
+      "model_path_env": "DELTAKV_MODEL_LLAMA31_8B",
+      "tokenizer_path_env": "DELTAKV_TOKENIZER_LLAMA31_8B",
+      "compressor_path_env": "DELTAKV_COMPRESSOR_LLAMA31_8B"
+    }
+  },
+  "methods": {
+    "vanilla": {
+      "sparse_method": "vanilla",
+      "requires_compressor": false,
+      "hf_logits_reference": true,
+      "config": {
+        "sparse_method": "vanilla",
+        "engine_prefill_chunk_size": 4096,
+        "gpu_memory_utilization": 0.9
+      },
+      "memory": {"expected_savings": 0.0}
+    },
+    "streamingllm": {
+      "sparse_method": "streamingllm",
+      "requires_compressor": false,
+      "hf_logits_reference": false,
+      "config": {
+        "sparse_method": "streamingllm",
+        "engine_prefill_chunk_size": 4096,
+        "sink_keep_tokens": 0,
+        "recent_keep_tokens": 3104,
+        "decode_keep_tokens": 3072,
+        "gpu_memory_utilization": 0.9
+      },
+      "memory": {"expected_savings": 0.3}
+    },
+    "snapkv": {
+      "sparse_method": "snapkv",
+      "requires_compressor": false,
+      "hf_logits_reference": true,
+      "config": {
+        "sparse_method": "snapkv",
+        "engine_prefill_chunk_size": 4096,
+        "sink_keep_tokens": 0,
+        "recent_keep_tokens": 32,
+        "decode_keep_tokens": 3072,
+        "snapkv_window_size": 32,
+        "pool_kernel_size": 7,
+        "gpu_memory_utilization": 0.9
+      },
+      "memory": {"expected_savings": 0.3}
+    },
+    "pyramidkv": {
+      "sparse_method": "pyramidkv",
+      "requires_compressor": false,
+      "hf_logits_reference": true,
+      "config": {
+        "sparse_method": "pyramidkv",
+        "engine_prefill_chunk_size": 4096,
+        "sink_keep_tokens": 0,
+        "recent_keep_tokens": 32,
+        "decode_keep_tokens": 5120,
+        "snapkv_window_size": 32,
+        "pool_kernel_size": 7,
+        "pyramidkv_start_layer": 0,
+        "pyramidkv_start_ratio": 0.5,
+        "pyramidkv_least_ratio": 0.1,
+        "gpu_memory_utilization": 0.9
+      },
+      "memory": {"expected_savings": 0.3}
+    },
+    "omnikv": {
+      "sparse_method": "omnikv",
+      "requires_compressor": false,
+      "hf_logits_reference": true,
+      "config": {
+        "sparse_method": "omnikv",
+        "engine_prefill_chunk_size": 4096,
+        "full_attention_layers": "0,3,9,13,16,21,28",
+        "sink_keep_tokens": 0,
+        "recent_keep_tokens": 32,
+        "decode_keep_tokens": 1342,
+        "pool_kernel_size": 1,
+        "gpu_memory_utilization": 0.9
+      },
+      "model_configs": {
+        "qwen25_7b": {
+          "full_attention_layers": "0,2,4,11,16,22"
+        },
+        "qwen3_4b": {
+          "full_attention_layers": "0,1,3,9,13,16,21,28"
+        },
+        "llama31_8b": {
+          "full_attention_layers": "0,2,7,13,16,26"
+        }
+      },
+      "memory": {"expected_savings": 0.3}
+    },
+    "quest": {
+      "sparse_method": "quest",
+      "requires_compressor": false,
+      "hf_logits_reference": false,
+      "config": {
+        "sparse_method": "quest",
+        "engine_prefill_chunk_size": 4096,
+        "quest_chunk_size": 16,
+        "quest_token_budget": 3104,
+        "quest_skip_layers": 0,
+        "decode_keep_tokens": 3072,
+        "sink_keep_tokens": 0,
+        "recent_keep_tokens": 32,
+        "gpu_memory_utilization": 0.9
+      },
+      "memory": {"expected_savings": 0.3}
+    },
+    "deltakv": {
+      "sparse_method": "deltakv",
+      "requires_compressor": true,
+      "compressor_path_env": "DELTAKV_COMPRESSOR_PATH",
+      "hf_logits_reference": true,
+      "config": {
+        "sparse_method": "deltakv",
+        "engine_prefill_chunk_size": 512,
+        "full_attention_layers": "0,3,9,13,16,21,28",
+        "sink_keep_tokens": 8,
+        "recent_keep_tokens": 128,
+        "decode_keep_tokens": 1342,
+        "deltakv_latent_dim": 512,
+        "deltakv_center_ratio": 0.1,
+        "deltakv_neighbor_count": 4,
+        "deltakv_latent_quant_bits": 4,
+        "deltakv_latent_quant_group_size": 32,
+        "full_layer_kv_quant_bits": 4,
+        "full_layer_kivi_group_size": 32,
+        "full_layer_kivi_residual_length": 32,
+        "enable_full_layer_kivi_quant": true,
+        "enable_sparse_ref_fp8": false,
+        "cluster_metric": "l2",
+        "use_compression": true,
+        "pool_kernel_size": 1,
+        "deltakv_full_pool_reserve_ratio": 0.2,
+        "gpu_memory_utilization": 0.9
+      },
+      "model_configs": {
+        "qwen25_7b": {
+          "full_attention_layers": "0,2,4,11,16,22",
+          "deltakv_latent_dim": 256
+        },
+        "qwen3_4b": {
+          "full_attention_layers": "0,1,3,9,13,16,21,28"
+        },
+        "llama31_8b": {
+          "full_attention_layers": "0,2,7,13,16,26"
+        }
+      },
+      "memory": {"expected_savings": 0.3}
+    },
+    "deltakv-less-memory": {
+      "sparse_method": "deltakv-less-memory",
+      "requires_compressor": true,
+      "compressor_path_env": "DELTAKV_COMPRESSOR_PATH",
+      "hf_logits_reference": true,
+      "config": {
+        "sparse_method": "deltakv-less-memory",
+        "hf_sparse_method": "delta_compressed_quant_kivi_full_fp8_ref",
+        "engine_prefill_chunk_size": 512,
+        "full_attention_layers": "0,3,9,13,16,21,28",
+        "sink_keep_tokens": 8,
+        "recent_keep_tokens": 128,
+        "decode_keep_tokens": 1342,
+        "deltakv_latent_dim": 512,
+        "deltakv_center_ratio": 0.1,
+        "deltakv_neighbor_count": 4,
+        "deltakv_latent_quant_bits": 4,
+        "deltakv_latent_quant_group_size": 32,
+        "full_layer_kv_quant_bits": 4,
+        "full_layer_kivi_group_size": 32,
+        "full_layer_kivi_residual_length": 32,
+        "enable_full_layer_kivi_quant": true,
+        "enable_sparse_ref_fp8": false,
+        "cluster_metric": "l2",
+        "use_compression": true,
+        "pool_kernel_size": 1,
+        "deltakv_full_pool_reserve_ratio": 0.2,
+        "gpu_memory_utilization": 0.9
+      },
+      "model_configs": {
+        "qwen25_7b": {
+          "full_attention_layers": "0,2,4,11,16,22",
+          "deltakv_latent_dim": 256
+        },
+        "qwen3_4b": {
+          "full_attention_layers": "0,1,3,9,13,16,21,28"
+        },
+        "llama31_8b": {
+          "full_attention_layers": "0,2,7,13,16,26"
+        }
+      },
+      "memory": {"expected_savings": 0.3}
+    },
+    "deltakv-less-memory-cudagraph": {
+      "sparse_method": "deltakv-less-memory-cudagraph",
+      "requires_compressor": true,
+      "compressor_path_env": "DELTAKV_COMPRESSOR_PATH",
+      "hf_logits_reference": true,
+      "config": {
+        "sparse_method": "deltakv-less-memory-cudagraph",
+        "hf_sparse_method": "delta_compressed_quant_kivi_full_fp8_ref",
+        "engine_prefill_chunk_size": 512,
+        "full_attention_layers": "0,3,9,13,16,21,28",
+        "sink_keep_tokens": 8,
+        "recent_keep_tokens": 128,
+        "decode_keep_tokens": 1342,
+        "deltakv_latent_dim": 512,
+        "deltakv_center_ratio": 0.1,
+        "deltakv_neighbor_count": 4,
+        "deltakv_latent_quant_bits": 4,
+        "deltakv_latent_quant_group_size": 32,
+        "full_layer_kv_quant_bits": 4,
+        "full_layer_kivi_group_size": 32,
+        "full_layer_kivi_residual_length": 32,
+        "enable_full_layer_kivi_quant": true,
+        "enable_sparse_ref_fp8": false,
+        "cluster_metric": "l2",
+        "use_compression": true,
+        "pool_kernel_size": 1,
+        "deltakv_full_pool_reserve_ratio": 0.2,
+        "gpu_memory_utilization": 0.9
+      },
+      "model_configs": {
+        "qwen25_7b": {
+          "full_attention_layers": "0,2,4,11,16,22",
+          "deltakv_latent_dim": 256
+        },
+        "qwen3_4b": {
+          "full_attention_layers": "0,1,3,9,13,16,21,28"
+        },
+        "llama31_8b": {
+          "full_attention_layers": "0,2,7,13,16,26"
+        }
+      },
+      "memory": {"expected_savings": 0.3}
+    }
+  },
+  "quality": {
+    "tasks": ["qasper", "hotpotqa", "multi_news", "trec", "passage_retrieval_en", "lcc"],
+    "batch_size": 100,
+    "sparsevllm_max_num_seqs_in_batch": 16,
+    "sparsevllm_max_decoding_seqs": 16,
+    "min_prompt_tokens": 0,
+    "samples_per_task": 50,
+    "min_required_samples": 50,
+    "temperature": 0.0,
+    "top_p": 1.0,
+    "top_k": 1
+  },
+  "logits": {
+    "cases": "longbench",
+    "longbench_task": "hotpotqa",
+    "longbench_sample_idx": 0,
+    "teacher_forced_decode_steps": 3,
+    "p99_abs_diff_threshold": 0.1
+  },
+  "performance": {
+    "lengths": [32000, 64000],
+    "batch_sizes": [4, 8],
+    "output_len": 256,
+    "decode_cuda_graph": true,
+    "enforce_eager": false
+  },
+  "stress": {
+    "length": 16000,
+    "request_counts": [80],
+    "output_len": 64,
+    "max_num_seqs_in_batch": 80,
+    "max_decoding_seqs": 80,
+    "max_decode_steps_after_full": 32
+  },
+  "outputs": [
+    "resolved_manifest.json",
+    "raw_outputs.jsonl",
+    "parsed_outputs.jsonl",
+    "sample_results.jsonl",
+    "metrics.json",
+    "logits_alignment.json",
+    "perf.jsonl",
+    "memory.json",
+    "stress.json",
+    "grade_summary.json"
+  ]
+}

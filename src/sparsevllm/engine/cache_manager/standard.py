@@ -11,7 +11,7 @@ from sparsevllm.engine.sequence import Sequence
 from sparsevllm.utils.log import logger, log_level
 from sparsevllm.utils.profiler import profiler
 
-from .base import CacheManager, LayerBatchStates
+from .base import CacheManager, LayerBatchStates, SparseSelection
 
 
 class StandardCacheManager(CacheManager):
@@ -63,7 +63,8 @@ class StandardCacheManager(CacheManager):
     def get_layer_store_view(self, layer_idx: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         return self.kv_cache[0, layer_idx], self.kv_cache[1, layer_idx], self.layer_batch_state.slot_mapping
 
-    def get_layer_compute_tensors(self, layer_idx: int, sparse_controller):
+    def get_layer_compute_tensors(self, layer_idx: int, selection: SparseSelection | None = None):
+        del selection
         raise NotImplementedError
 
     def get_layer_buffer_req_to_token_slots(self, layer_idx: int) -> torch.Tensor:
@@ -72,6 +73,29 @@ class StandardCacheManager(CacheManager):
     @property
     def num_free_slots(self) -> int:
         return self._num_free_slots
+
+    @property
+    def num_free_rows(self) -> int:
+        return len(self.free_rows)
+
+    def prompt_admission_budgets(
+        self,
+        waiting_seqs: deque[Sequence],
+        chunk_prefill_size: int,
+    ) -> dict[str, int]:
+        budgets = super().prompt_admission_budgets(waiting_seqs, chunk_prefill_size)
+        budgets["rows"] = int(self.num_free_rows)
+        return budgets
+
+    def prompt_admission_costs(self, seq: Sequence) -> dict[str, int]:
+        costs = super().prompt_admission_costs(seq)
+        costs["rows"] = 1
+        return costs
+
+    def free_slot_stats(self) -> dict[str, int]:
+        stats = super().free_slot_stats()
+        stats["free_rows"] = int(self.num_free_rows)
+        return stats
 
     def _get_free_row(self, seq_id: int) -> int:
         if seq_id in self.seq_id_to_row:

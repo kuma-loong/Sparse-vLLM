@@ -50,6 +50,17 @@ def flash_decode_stage2(mid_out, mid_out_logexpsum, B_Seqlen, O, block_seq):
     assert Lk in {16, 32, 64, 128}
     batch, head_num = mid_out.shape[0], mid_out.shape[1]
     grid = (batch, head_num)
+    if not torch.cuda.is_current_stream_capturing():
+        max_seq_len = int(B_Seqlen.max().item()) if B_Seqlen.numel() > 0 else 0
+        needed_blocks = (max_seq_len + block_seq - 1) // block_seq
+        if mid_out.shape[2] < needed_blocks or mid_out_logexpsum.shape[2] < needed_blocks:
+            raise RuntimeError(
+                "flash_decode_stage2 bounds check failed: "
+                f"max_seq_len={max_seq_len} block_seq={block_seq} "
+                f"needed_blocks={needed_blocks} "
+                f"mid_out_blocks={mid_out.shape[2]} "
+                f"mid_lse_blocks={mid_out_logexpsum.shape[2]}"
+            )
     
     _fwd_kernel_flash_decode_stage2[grid](
         B_Seqlen, mid_out, mid_out_logexpsum, O,

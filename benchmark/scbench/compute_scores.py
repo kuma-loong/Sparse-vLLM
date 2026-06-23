@@ -15,7 +15,26 @@ from args import parse_args
 from repo_qa_utils import compute_score as compute_repoqa_score
 from tqdm import tqdm
 
-ROUGE_SCORER = evaluate.load("rouge")
+
+def _load_rouge_scorer():
+    cached_roots = [
+        Path.home()
+        / ".cache/huggingface/modules/evaluate_modules/metrics/evaluate-metric--rouge",
+        Path(os.environ.get("HF_HOME", ""))
+        / "modules/evaluate_modules/metrics/evaluate-metric--rouge",
+    ]
+    for root in cached_roots:
+        if not root:
+            continue
+        for rouge_script in sorted(root.glob("*/rouge.py")):
+            return evaluate.load(str(rouge_script))
+    raise FileNotFoundError(
+        "Could not find cached evaluate rouge.py. Run a smoke eval once with "
+        "network access or cache the evaluate rouge metric before SCBench."
+    )
+
+
+ROUGE_SCORER = _load_rouge_scorer()
 
 
 def normalize_answer(s: str) -> str:

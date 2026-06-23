@@ -1,23 +1,22 @@
 from __future__ import annotations
 
-from .base import CacheManager, LayerBatchStates
+from .base import CacheManager, DecodeComputeView, LayerBatchStates, PrefillComputeView, SparseSelection
 
 __all__ = [
     "CacheManager",
+    "DecodeComputeView",
     "LayerBatchStates",
+    "PrefillComputeView",
+    "SparseSelection",
     "StandardCacheManager",
     "StreamingLLMCacheManager",
     "SnapKVCacheManager",
     "QuestCacheManager",
     "OmniKVCacheManager",
     "DeltaKVCacheManager",
-    "DeltaKVCacheTritonManager",
-    "DeltaKVCacheTritonManagerV2",
-    "DeltaKVCacheTritonManagerV3",
     "DeltaKVCacheTritonManagerV4",
-    "DeltaKVDeltaQuantCacheManager",
-    "DeltaKVStandaloneCacheManager",
-    "DeltaKVSnapKVCacheManager",
+    "DeltaKVLessMemoryCacheManager",
+    "DeltaKVLessMemoryCudaGraphCacheManager",
 ]
 
 
@@ -42,27 +41,21 @@ def __getattr__(name: str):
         from .omnikv import OmniKVCacheManager
 
         return OmniKVCacheManager
-    if name in {
-        "DeltaKVCacheManager",
-        "DeltaKVCacheTritonManager",
-        "DeltaKVCacheTritonManagerV2",
-        "DeltaKVCacheTritonManagerV3",
-        "DeltaKVCacheTritonManagerV4",
-    }:
-        from . import deltakv as _deltakv
+    if name == "DeltaKVCacheManager":
+        from .deltakv_runtime import DeltaKVCacheManager
 
-        return getattr(_deltakv, name)
-    if name == "DeltaKVDeltaQuantCacheManager":
-        from .deltakv_delta_quant import DeltaKVDeltaQuantCacheManager
+        return DeltaKVCacheManager
+    if name == "DeltaKVCacheTritonManagerV4":
+        from .deltakv_base import DeltaKVCacheTritonManagerV4
 
-        return DeltaKVDeltaQuantCacheManager
-    if name == "DeltaKVStandaloneCacheManager":
-        from .deltakv_standalone import DeltaKVStandaloneCacheManager
+        return DeltaKVCacheTritonManagerV4
+    if name == "DeltaKVLessMemoryCacheManager":
+        from .deltakv_less_memory import DeltaKVLessMemoryCacheManager
 
-        return DeltaKVStandaloneCacheManager
-    if name == "DeltaKVSnapKVCacheManager":
-        from .deltakv_snapkv import DeltaKVSnapKVCacheManager
+        return DeltaKVLessMemoryCacheManager
+    if name == "DeltaKVLessMemoryCudaGraphCacheManager":
+        from .deltakv_less_memory_cuda_graph import DeltaKVLessMemoryCudaGraphCacheManager
 
-        return DeltaKVSnapKVCacheManager
+        return DeltaKVLessMemoryCudaGraphCacheManager
 
     raise AttributeError(name)

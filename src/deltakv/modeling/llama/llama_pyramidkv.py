@@ -2,8 +2,8 @@ import torch
 from typing import Optional, Union
 from torch import nn
 from transformers.models.llama.modeling_llama import (
-    LlamaAttention, Unpack, FlashAttentionKwargs, Callable, eager_attention_forward, ALL_ATTENTION_FUNCTIONS, LlamaDecoderLayer, LlamaModel, LlamaForCausalLM,
-    KwargsForCausalLM, apply_rotary_pos_emb
+    LlamaAttention, Unpack, TransformersKwargs as FlashAttentionKwargs, Callable, eager_attention_forward, ALL_ATTENTION_FUNCTIONS, LlamaDecoderLayer, LlamaModel, LlamaForCausalLM,
+    TransformersKwargs as KwargsForCausalLM, apply_rotary_pos_emb
 )
 from deltakv.modeling.cache_pipeline import SnapKVCache
 from deltakv.configs.model_config_cls import KVLlamaConfig
@@ -156,7 +156,9 @@ class LlamaPyramidKVForCausalLM(LlamaForCausalLM):
             logits_to_keep: Union[int, torch.Tensor] = 0,
             **kwargs: Unpack[KwargsForCausalLM],
     ):
-        assert input_ids is not None and attention_mask is None
+        assert input_ids is not None
+        if attention_mask is not None:
+            assert attention_mask.all(), '目前只支持 bs = 1'
         assert input_ids.shape[0] == 1
         assert position_ids is None and use_cache
 

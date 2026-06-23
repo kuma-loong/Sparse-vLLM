@@ -1,8 +1,17 @@
 from transformers.models.qwen2.modeling_qwen2 import Qwen2Config
-from transformers.models.qwen3.configuration_qwen3 import Qwen3Config
 from transformers.models.llama.modeling_llama import LlamaConfig
 from deltakv.configs.runtime_params import normalize_runtime_params
 from deltakv.utils.log import logger
+
+try:
+    from transformers.models.qwen3.configuration_qwen3 import Qwen3Config
+except ModuleNotFoundError:
+    Qwen3Config = None
+
+try:
+    from transformers.models.qwen3_vl.configuration_qwen3_vl import Qwen3VLTextConfig
+except ModuleNotFoundError:
+    Qwen3VLTextConfig = None
 
 
 def parse_full_attn_layers(full_attn_layers):
@@ -22,11 +31,9 @@ class CustomConfigMixin:
     def __init__(
         self,
         kv_compressed_size=128,
-        compressor_token_group_size=1,
         deltakv_neighbor_count=1,
         layer_chunk_size=1,
         recon_mode='delta_in_latent',
-        ref_mode='last',
         use_nonlinear_compressor=True,
         compressor_intermediate_size=2048,
         compressor_down_type='auto',
@@ -53,8 +60,6 @@ class CustomConfigMixin:
         num_sink_tokens=8,
         omnikv_score_method='last',
         deltakv_use_omnikv_selection=True,
-        deltasnapkv_total_budget=-1.0,
-        deltasnapkv_ref_budget=-1.0,
         snapkv_num_full_layers=0,
         use_compression=False,
         use_cluster=True,
@@ -68,30 +73,32 @@ class CustomConfigMixin:
         pyramidkv_least_layer=None,
         pyramidkv_least_ratio=0.01,
         kv_quant_bits=0,
+        kv_quant_group_size=0,
+        full_layer_kv_quant_bits=0,
+        full_layer_cluster_ratio=0.0,
+        full_layer_stride_alpha=0.0,
+        full_layer_kivi_group_size=32,
+        full_layer_kivi_residual_length=32,
+        enable_full_layer_kivi_quant=True,
+        enable_sparse_ref_fp8=True,
+        hf_sparse_cache_impl=None,
+        kivi_quant_bits=4,
+        group_size=32,
+        residual_length=32,
         visual_token_prune_only=None,
         visual_token_keep_ratio=None,
         **kwargs
     ):
-        # Saved compressor checkpoints may still contain the old config schema.
-        # Migrate those artifact fields internally so historical weights remain
-        # loadable for regression checks; runtime/API parameters are still
-        # rejected by normalize_runtime_params().
-        has_legacy_k_neighbors = "k_neighbors" in kwargs
-        has_explicit_neighbor_count = "deltakv_neighbor_count" in kwargs
-        if "seq_chunk_size" in kwargs:
-            legacy_value = kwargs.pop("seq_chunk_size")
-            if compressor_token_group_size != 1 and compressor_token_group_size != legacy_value:
-                raise ValueError(
-                    "Conflicting checkpoint config fields: `seq_chunk_size` and "
-                    "`compressor_token_group_size` differ."
-                )
-            compressor_token_group_size = legacy_value
-            if (
-                not has_legacy_k_neighbors
-                and not has_explicit_neighbor_count
-                and deltakv_neighbor_count == 1
-            ):
-                deltakv_neighbor_count = legacy_value
+        removed_config_keys = sorted(
+            key for key in ("compressor_token_group_size", "seq_chunk_size", "ref_mode") if key in kwargs
+        )
+        if removed_config_keys:
+            raise ValueError(
+                "Removed DeltaKV config fields are no longer accepted: "
+                f"{', '.join(f'`{key}`' for key in removed_config_keys)}. "
+                "Use `deltakv_neighbor_count` for cluster reference top-k; "
+                "`ref_mode` and compressor token grouping belonged to removed chunk-ref training."
+            )
         if "k_neighbors" in kwargs:
             legacy_value = kwargs.pop("k_neighbors")
             if deltakv_neighbor_count != 1 and deltakv_neighbor_count != legacy_value:
@@ -121,11 +128,9 @@ class CustomConfigMixin:
         # 初始化自定义属性
         # 这个地方好像也只能设置一下默认值了，主要目的是有语法提示。
         self.kv_compressed_size = kv_compressed_size
-        self.compressor_token_group_size = compressor_token_group_size
         self.deltakv_neighbor_count = deltakv_neighbor_count
         self.layer_chunk_size = layer_chunk_size
         self.recon_mode = recon_mode
-        self.ref_mode = ref_mode
         self.use_nonlinear_compressor = use_nonlinear_compressor
         self.compressor_intermediate_size = compressor_intermediate_size
         self.compressor_down_type = compressor_down_type
@@ -150,8 +155,6 @@ class CustomConfigMixin:
         self.num_sink_tokens = num_sink_tokens
         self.omnikv_score_method = omnikv_score_method
         self.deltakv_use_omnikv_selection = deltakv_use_omnikv_selection
-        self.deltasnapkv_total_budget = deltasnapkv_total_budget
-        self.deltasnapkv_ref_budget = deltasnapkv_ref_budget
         self.snapkv_num_full_layers = snapkv_num_full_layers
         self.use_compression = use_compression
         self.use_cluster = use_cluster
@@ -165,6 +168,18 @@ class CustomConfigMixin:
         self.pyramidkv_least_layer = pyramidkv_least_layer
         self.pyramidkv_least_ratio = pyramidkv_least_ratio
         self.kv_quant_bits = kv_quant_bits
+        self.kv_quant_group_size = kv_quant_group_size
+        self.full_layer_kv_quant_bits = full_layer_kv_quant_bits
+        self.full_layer_cluster_ratio = full_layer_cluster_ratio
+        self.full_layer_stride_alpha = full_layer_stride_alpha
+        self.full_layer_kivi_group_size = full_layer_kivi_group_size
+        self.full_layer_kivi_residual_length = full_layer_kivi_residual_length
+        self.enable_full_layer_kivi_quant = enable_full_layer_kivi_quant
+        self.enable_sparse_ref_fp8 = enable_sparse_ref_fp8
+        self.hf_sparse_cache_impl = hf_sparse_cache_impl
+        self.kivi_quant_bits = kivi_quant_bits
+        self.group_size = group_size
+        self.residual_length = residual_length
         self.visual_token_prune_only = visual_token_prune_only
         self.visual_token_keep_ratio = visual_token_keep_ratio
         
@@ -177,8 +192,7 @@ class CustomConfigMixin:
 
         if getattr(self, "deltakv_neighbor_count", None) is None:
             raise ValueError(
-                "`deltakv_neighbor_count` is required when `use_cluster=True`. "
-                "`compressor_token_group_size` no longer doubles as the cluster neighbor count."
+                "`deltakv_neighbor_count` is required when `use_cluster=True`."
             )
 
     def get_cluster_neighbor_count(self) -> int:
@@ -215,9 +229,30 @@ class KVQwen2Config(CustomConfigMixin, Qwen2Config):
         super().__init__(**kwargs)
 
 
-class KVQwen3Config(CustomConfigMixin, Qwen3Config):
-    def __init__(self, **kwargs):
-        super().__init__(**kwargs)
+if Qwen3Config is not None:
+    class KVQwen3Config(CustomConfigMixin, Qwen3Config):
+        def __init__(self, **kwargs):
+            super().__init__(**kwargs)
+else:
+    class KVQwen3Config(CustomConfigMixin):
+        def __init__(self, **kwargs):
+            raise ImportError(
+                "Qwen3Config is unavailable in this Transformers installation. "
+                "Use a Transformers version with Qwen3 support for Qwen3 models."
+            )
+
+
+if Qwen3VLTextConfig is not None:
+    class KVQwen3VLTextConfig(CustomConfigMixin, Qwen3VLTextConfig):
+        def __init__(self, **kwargs):
+            super().__init__(**kwargs)
+else:
+    class KVQwen3VLTextConfig(CustomConfigMixin):
+        def __init__(self, **kwargs):
+            raise ImportError(
+                "Qwen3VLTextConfig is unavailable in this Transformers installation. "
+                "Use a Transformers version with Qwen3-VL support for Qwen3-VL compressor training."
+            )
 
 
 class KVLlamaConfig(CustomConfigMixin, LlamaConfig):

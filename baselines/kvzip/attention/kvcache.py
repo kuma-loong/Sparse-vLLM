@@ -9,7 +9,17 @@ from typing import Any, Dict, Optional, Tuple
 import torch
 from attention.score import HybridKVScore, KVScore
 from tiny_api_cuda import update_flatten_view
-from transformers import DynamicCache, HybridCache
+from transformers.cache_utils import DynamicCache
+
+try:
+    from transformers.cache_utils import HybridCache
+except ImportError:
+    class HybridCache:
+        def __init__(self, *args, **kwargs):
+            raise ImportError(
+                "KVzip RetainHybridCache requires transformers.cache_utils.HybridCache, "
+                "which is not available in the current Transformers installation."
+            )
 
 
 class EvictCache(DynamicCache, KVScore):
@@ -38,6 +48,9 @@ class EvictCache(DynamicCache, KVScore):
                                     dtype=bool,
                                     device=self.device)
         self.info = {"flatten": False, "offset": None}
+        self.key_cache = []
+        self.value_cache = []
+        self._seen_tokens = 0
         self._debug_updates = 0
 
     def _debug_enabled(self):
@@ -69,7 +82,7 @@ class EvictCache(DynamicCache, KVScore):
             return
 
         cache_shape = None
-        if len(self.key_cache) > layer_idx:
+        if len(self.key_cache) > layer_idx and self.key_cache[layer_idx] is not None:
             cache_shape = tuple(self.key_cache[layer_idx].shape)
         key_shape = tuple(key_states.shape) if key_states is not None else None
         alloc, reserved, max_alloc = self._cuda_mem_gb()
@@ -96,8 +109,13 @@ class EvictCache(DynamicCache, KVScore):
         try:
             # Update the cache
             if len(self.key_cache) <= layer_idx:
-                self.key_cache.append(key_states)
-                self.value_cache.append(value_states)
+                missing = layer_idx + 1 - len(self.key_cache)
+                self.key_cache.extend([None] * missing)
+                self.value_cache.extend([None] * missing)
+
+            if self.key_cache[layer_idx] is None:
+                self.key_cache[layer_idx] = key_states
+                self.value_cache[layer_idx] = value_states
 
             elif self.info["flatten"]:
                 cu_klen = self.info["cu_len_k"][layer_idx]
@@ -142,6 +160,16 @@ class EvictCache(DynamicCache, KVScore):
     def slice(self, seen_token_prev: int):
         """ Evict KV of qeuries and generated tokens from the cache (for the reuse of the context cache)
         """
+        missing_layers = [
+            layer_idx for layer_idx in range(self.n_layers)
+            if layer_idx >= len(self.key_cache) or self.key_cache[layer_idx] is None
+        ]
+        if missing_layers:
+            raise RuntimeError(
+                f"KVzip EvictCache missing cache layers before slice: {missing_layers}; "
+                f"stored_layers={len(self.key_cache)} expected_layers={self.n_layers}"
+            )
+
         for layer_idx in range(self.n_layers):
             if self.info["flatten"]:
                 cu_klen = self.info["cu_len_k"][layer_idx]
@@ -176,6 +204,8 @@ class EvictCache(DynamicCache, KVScore):
         """
         mem = 0
         for i in range(len(self.key_cache)):
+            if self.key_cache[i] is None:
+                continue
             mem += self.key_cache[i].numel() * self.key_cache[i].element_size()
         mem *= 2  # key + value
         return round(mem / 10**9, 1)
@@ -221,6 +251,11 @@ class EvictCache(DynamicCache, KVScore):
         cu_len_k_layers = []
 
         for layer_idx in range(self.n_layers):
+            if layer_idx >= len(self.key_cache) or self.key_cache[layer_idx] is None:
+                raise RuntimeError(
+                    f"KVzip EvictCache missing cache for layer {layer_idx} before prune; "
+                    f"stored_layers={len(self.key_cache)} expected_layers={self.n_layers}"
+                )
             _, _, klen, dim = self.key_cache[layer_idx].shape
             valid = self._get_valid(layer_idx, klen)
 
@@ -304,6 +339,9 @@ class RetainCache(DynamicCache, KVScore):
         self.valid_pad = torch.ones((1, self.n_heads_kv, self.start_idx),
                                     dtype=bool,
                                     device=self.device)
+        self.key_cache = []
+        self.value_cache = []
+        self._seen_tokens = 0
 
     def update(
             self,
@@ -320,8 +358,13 @@ class RetainCache(DynamicCache, KVScore):
 
         # Update the cache
         if len(self.key_cache) <= layer_idx:
-            self.key_cache.append(key_states)
-            self.value_cache.append(value_states)
+            missing = layer_idx + 1 - len(self.key_cache)
+            self.key_cache.extend([None] * missing)
+            self.value_cache.extend([None] * missing)
+
+        if self.key_cache[layer_idx] is None:
+            self.key_cache[layer_idx] = key_states
+            self.value_cache[layer_idx] = value_states
         else:
             self.key_cache[layer_idx] = torch.cat([self.key_cache[layer_idx], key_states], dim=-2)
             self.value_cache[layer_idx] = torch.cat([self.value_cache[layer_idx], value_states],
@@ -332,6 +375,15 @@ class RetainCache(DynamicCache, KVScore):
     def slice(self, seen_token_prev: int):
         """ Evict KV of qeuries and generated tokens from the cache (for the reuse of the context cache)
         """
+        missing_layers = [
+            layer_idx for layer_idx in range(self.n_layers)
+            if layer_idx >= len(self.key_cache) or self.key_cache[layer_idx] is None
+        ]
+        if missing_layers:
+            raise RuntimeError(
+                f"KVzip RetainCache missing cache layers before slice: {missing_layers}; "
+                f"stored_layers={len(self.key_cache)} expected_layers={self.n_layers}"
+            )
         assert len(self.key_cache[0].shape) == 4, "Cache at each layer should be 4D tensor"
         for i in range(self.n_layers):
             self.key_cache[i] = self.key_cache[i][:, :, :seen_token_prev]

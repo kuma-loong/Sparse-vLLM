@@ -10,7 +10,6 @@ class Context:
         self.seqs = None
         self.decode_mid_o = None
         self.decode_mid_o_logexpsum = None
-        self.decode_cuda_graph_static = False
 
 
 _CONTEXT = Context()

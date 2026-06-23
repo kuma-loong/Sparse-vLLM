@@ -3,18 +3,18 @@ import wandb
 import pandas as pd
 import matplotlib.pyplot as plt
 import os
-from deltakv.analysis.colors import COLOR_PRIMARY, COLOR_SECONDARY, COLOR_TERTIARY, COLOR_GRID
+from deltakv.analysis.colors import COLOR_GRID, TEXT_HIGHLIGHT_1, TEXT_HIGHLIGHT_2, TEXT_HIGHLIGHT_3
 
 def visualize_detach_ablation():
     # --- 配置 ---
-    PROJECT = "DeltaKV"
+    PROJECT = "ReKV"
     # MSE_DETACH: 7dxp04k4 (Created first)
     # NTP_DETACH: c8f7m4zl (Created second)
     # BASELINE: 8ax9x47z (Train Both)
     RUNS_CONFIG = {
-        "7dxp04k4": {"label": "Train NTP Only", "color": COLOR_PRIMARY},
-        "c8f7m4zl": {"label": "Train MSE Only", "color": COLOR_SECONDARY},
-        "8ax9x47z": {"label": "Train Both", "color": COLOR_TERTIARY}
+        "7dxp04k4": {"label": "Train NTP Only", "color": TEXT_HIGHLIGHT_1},
+        "c8f7m4zl": {"label": "Train MSE Only", "color": TEXT_HIGHLIGHT_2},
+        "8ax9x47z": {"label": "Train Both", "color": TEXT_HIGHLIGHT_3}
     }
     METRICS = ["train/loss", "train/ntp_loss", "train/mse_loss"]
     TITLES = ["Total Loss $\\downarrow$", "NTP Loss $\\downarrow$", "MSE Loss $\\downarrow$"]
@@ -65,7 +65,7 @@ def visualize_detach_ablation():
             
             df = plot_data[run_id][metric]
             smooth_col = f"{metric}_smooth"
-            ax.plot(df["_step"], df[smooth_col], label=info["label"], color=info["color"], linewidth=1.5)
+            ax.plot(df["_step"], df[smooth_col], label=info["label"], color=info["color"], linewidth=1.8)
 
         ax.set_xlabel("Steps")
         ax.set_ylabel(TITLES[i])

@@ -17,7 +17,9 @@ from deltakv.modeling.cache_pipeline import (
     DeltaCompressedLatentWoFullCache,
     DeltaOriginWFullCache,
     DeltaOriginWoFullCache,
+    HF_SPARSE_CACHE_KIVI,
     HF_SPARSE_CACHE_OMNIKV,
+    KiviQuantizedRawCache,
     OmniKVRawCache,
 )
 
@@ -75,6 +77,17 @@ class HfDeltaKVCacheFactoryTest(unittest.TestCase):
         cfg.hf_sparse_cache_impl = HF_SPARSE_CACHE_OMNIKV
         cache = create_hf_sparse_cache(cfg)
         self.assertIsInstance(cache, OmniKVRawCache)
+        self.assertTrue(is_hf_sparse_cache_instance(cache, cfg))
+
+    def test_hf_sparse_cache_factory_allows_kivi_raw_cache(self):
+        cfg = self._config()
+        cfg.use_cluster = False
+        cfg.use_compression = False
+        cfg.hf_sparse_cache_impl = HF_SPARSE_CACHE_KIVI
+        cfg.kivi_quant_bits = 2
+        cache = create_hf_sparse_cache(cfg)
+        self.assertIsInstance(cache, KiviQuantizedRawCache)
+        self.assertEqual(cache.quant_bits, 2)
         self.assertTrue(is_hf_sparse_cache_instance(cache, cfg))
 
 

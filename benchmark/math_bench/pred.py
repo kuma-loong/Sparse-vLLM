@@ -20,6 +20,7 @@ BASE_PATH = os.getenv("DELTAKV_OUTPUT_DIR", "/root/autodl-fs/deltakv_outputs")
 DATA_PREFIX_PATH = os.getenv("DELTAKV_DATA_DIR", "/root/autodl-fs/datasets")
 DEFAULT_GSM8K_DATASET = ("openai/gsm8k", "main", "test")
 DEFAULT_AIME2024_DATASET = ("Maxwell-Jia/AIME_2024", None, "train")
+DEFAULT_MATH500_DATASET = ("HuggingFaceH4/MATH-500", None, "test")
 DEFAULT_HMMT_NOV_DATASET = ("MathArena/hmmt_nov_2025", None, "train")
 
 
@@ -122,6 +123,19 @@ def _resolve_default_data_path(data_dir: str, dataset: str, split: str) -> str:
             f"aime2024_{split}.jsonl",
             f"aime2024_{split}.json",
         ]
+    elif dataset == "math500":
+        candidates = [
+            f"math500/{split}.jsonl",
+            f"math500/{split}.json",
+            f"math_500/{split}.jsonl",
+            f"math_500/{split}.json",
+            f"MATH-500/{split}.jsonl",
+            f"MATH-500/{split}.json",
+            f"MATH500/{split}.jsonl",
+            f"MATH500/{split}.json",
+            f"math500_{split}.jsonl",
+            f"math500_{split}.json",
+        ]
     elif dataset == "hmmt_nov":
         candidates = [
             f"hmmt_nov/{split}.jsonl",
@@ -207,6 +221,11 @@ def get_pred(rank: int, data, dataset: str, args, model, tokenizer, out_path: st
         "aime2024": (
             "Please reason step by step, and put your final answer within \\\\boxed{{}}.\n"
             "The final answer is an integer.\n"
+            "Begin your response with \"<think>\\n\" and do not output an empty think block.\n\n"
+            "Problem:\n{problem}\n"
+        ),
+        "math500": (
+            "Please reason step by step, and put your final answer within \\\\boxed{{}}.\n"
             "Begin your response with \"<think>\\n\" and do not output an empty think block.\n\n"
             "Problem:\n{problem}\n"
         ),
@@ -329,6 +348,17 @@ def worker(rank: int, world_size: int, datasets: List[str], args, out_root: str)
                         print(f"[aime2024] HF load failed ({e}); falling back to local files under {args.data_dir}")
                     data_path = _resolve_default_data_path(args.data_dir, "aime2024", args.split)
                     data = _read_json_or_jsonl(data_path)
+        elif dataset == "math500":
+            if args.data_path_math500:
+                data = _read_json_or_jsonl(args.data_path_math500)
+            else:
+                try:
+                    data = _load_hf_dataset(args.hf_dataset_math500, args.hf_config_math500, args.hf_split_math500)
+                except Exception as e:
+                    if os.getenv("DEBUG"):
+                        print(f"[math500] HF load failed ({e}); falling back to local files under {args.data_dir}")
+                    data_path = _resolve_default_data_path(args.data_dir, "math500", args.split)
+                    data = _read_json_or_jsonl(data_path)
         elif dataset == "hmmt_nov":
             if args.data_path_hmmt_nov:
                 data = _read_json_or_jsonl(args.data_path_hmmt_nov)
@@ -358,11 +388,12 @@ def parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument("--model", type=str, default="my_model")
     parser.add_argument("--ws", default=1, type=int, help="world size")
-    parser.add_argument("--task", default="gsm8k,aime2024", type=str, help="Comma-separated: gsm8k,aime2024,hmmt_nov")
+    parser.add_argument("--task", default="gsm8k,aime2024", type=str, help="Comma-separated: gsm8k,aime2024,math500,hmmt_nov")
     parser.add_argument("--split", default="test", type=str, help="Dataset split name (used for default path resolution)")
     parser.add_argument("--data_dir", default=DATA_PREFIX_PATH, type=str, help="Root folder for datasets")
     parser.add_argument("--data_path_gsm8k", default=None, type=str)
     parser.add_argument("--data_path_aime2024", default=None, type=str)
+    parser.add_argument("--data_path_math500", default=None, type=str)
     parser.add_argument("--data_path_hmmt_nov", default=None, type=str)
     parser.add_argument("--hf_dataset_gsm8k", default=DEFAULT_GSM8K_DATASET[0], type=str)
     parser.add_argument("--hf_config_gsm8k", default=DEFAULT_GSM8K_DATASET[1], type=str)
@@ -370,6 +401,9 @@ def parse_args():
     parser.add_argument("--hf_dataset_aime2024", default=DEFAULT_AIME2024_DATASET[0], type=str)
     parser.add_argument("--hf_config_aime2024", default=DEFAULT_AIME2024_DATASET[1], type=str)
     parser.add_argument("--hf_split_aime2024", default=DEFAULT_AIME2024_DATASET[2], type=str)
+    parser.add_argument("--hf_dataset_math500", default=DEFAULT_MATH500_DATASET[0], type=str)
+    parser.add_argument("--hf_config_math500", default=DEFAULT_MATH500_DATASET[1], type=str)
+    parser.add_argument("--hf_split_math500", default=DEFAULT_MATH500_DATASET[2], type=str)
     parser.add_argument("--hf_dataset_hmmt_nov", default=DEFAULT_HMMT_NOV_DATASET[0], type=str)
     parser.add_argument("--hf_config_hmmt_nov", default=DEFAULT_HMMT_NOV_DATASET[1], type=str)
     parser.add_argument("--hf_split_hmmt_nov", default=DEFAULT_HMMT_NOV_DATASET[2], type=str)

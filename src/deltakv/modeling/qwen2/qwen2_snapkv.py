@@ -3,7 +3,7 @@ from typing import Optional, Union
 from torch import nn
 from transformers.models.qwen2.modeling_qwen2 import (
     Qwen2Attention, Unpack, FlashAttentionKwargs, Callable, eager_attention_forward, ALL_ATTENTION_FUNCTIONS, Qwen2DecoderLayer, Qwen2Model, Qwen2ForCausalLM,
-    KwargsForCausalLM, apply_rotary_pos_emb
+    TransformersKwargs as KwargsForCausalLM, apply_rotary_pos_emb
 )
 from deltakv.modeling.cache_pipeline import SnapKVCache
 from deltakv.configs.model_config_cls import KVQwen2Config
@@ -23,9 +23,15 @@ class Qwen2SnapKVAttention(Qwen2Attention):
             position_embeddings: tuple[torch.Tensor, torch.Tensor],
             attention_mask: Optional[torch.Tensor],
             past_key_value: Optional[SnapKVCache] = None,
+            past_key_values: Optional[SnapKVCache] = None,
             cache_position: Optional[torch.LongTensor] = None,
             **kwargs: Unpack[FlashAttentionKwargs],
     ):
+        if past_key_value is None:
+            past_key_value = past_key_values
+        kwargs.pop("position_ids", None)
+        kwargs.pop("use_cache", None)
+
         input_shape = hidden_states.shape[:-1]
         hidden_shape = (*input_shape, -1, self.head_dim)
         bs, q_len, ___ = hidden_states.shape
@@ -127,7 +133,9 @@ class Qwen2SnapKVForCausalLM(Qwen2ForCausalLM):
             logits_to_keep: Union[int, torch.Tensor] = 0,
             **kwargs: Unpack[KwargsForCausalLM],
     ):
-        assert input_ids is not None and attention_mask is None
+        assert input_ids is not None
+        if attention_mask is not None:
+            assert attention_mask.all(), "目前只支持 bs = 1"
         assert input_ids.shape[0] == 1
         assert position_ids is None and use_cache
 
@@ -158,7 +166,12 @@ class Qwen2SnapKVForCausalLM(Qwen2ForCausalLM):
 
         for _ipt_ids in chunk_input_ids:
             # 只有这里需要注意：SnapKV 的逻辑完全依赖 past_key_values 内部状态和 Attention 层的配合
-            outputs = super().forward(_ipt_ids, past_key_values=past_key_values, use_cache=True)
+            outputs = super().forward(
+                _ipt_ids,
+                past_key_values=past_key_values,
+                use_cache=True,
+                logits_to_keep=logits_to_keep,
+            )
             past_key_values = outputs.past_key_values
 
         return outputs

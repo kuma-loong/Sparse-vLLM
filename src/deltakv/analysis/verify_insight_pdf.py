@@ -201,6 +201,19 @@ def _safe_median(values):
     return float(np.median(values)) if len(values) > 0 else float("nan")
 
 
+def _safe_percentiles(values):
+    if len(values) == 0:
+        return {f"p{p}": float("nan") for p in (5, 25, 50, 75, 95)}
+    percentiles = np.percentile(values, [5, 25, 50, 75, 95])
+    return {
+        "p5": float(percentiles[0]),
+        "p25": float(percentiles[1]),
+        "p50": float(percentiles[2]),
+        "p75": float(percentiles[3]),
+        "p95": float(percentiles[4]),
+    }
+
+
 def summarize_cluster_similarity(
     baseline_sims,
     baseline_distances,
@@ -221,11 +234,13 @@ def summarize_cluster_similarity(
             "num_tokens": int(baseline_sims.shape[0]),
             "overall_mean_similarity": _safe_mean(baseline_sims),
             "overall_median_similarity": _safe_median(baseline_sims),
+            "overall_similarity_percentiles": _safe_percentiles(baseline_sims),
             "overall_mean_distance": _safe_mean(baseline_distances),
             "long_range_threshold": int(long_range_threshold),
             "long_range_token_ratio": float(long_range_mask.mean()) if baseline_sims.size else 0.0,
             "long_range_mean_similarity": _safe_mean(baseline_sims[long_range_mask]),
             "long_range_median_similarity": _safe_median(baseline_sims[long_range_mask]),
+            "long_range_similarity_percentiles": _safe_percentiles(baseline_sims[long_range_mask]),
             "long_range_mean_distance": _safe_mean(baseline_distances[long_range_mask]),
         },
         "alphas": [],
@@ -258,20 +273,24 @@ def summarize_cluster_similarity(
                 "num_tokens": int(hist_sims.shape[0]),
                 "history_only": {
                     "overall_mean_similarity": hist_overall,
+                    "overall_similarity_percentiles": _safe_percentiles(hist_sims),
                     "overall_abs_drop": float(baseline_overall - hist_overall),
                     "overall_rel_drop_pct": float((baseline_overall - hist_overall) / baseline_overall * 100.0) if baseline_overall else 0.0,
                     "overall_mean_distance": _safe_mean(hist_distances),
                     "long_range_mean_similarity": hist_long,
+                    "long_range_similarity_percentiles": _safe_percentiles(hist_sims[long_range_mask]),
                     "long_range_abs_drop": float(baseline_long - hist_long),
                     "long_range_rel_drop_pct": float((baseline_long - hist_long) / baseline_long * 100.0) if baseline_long else 0.0,
                     "long_range_mean_distance": _safe_mean(hist_distances[long_range_mask]),
                 },
                 "runtime_visible": {
                     "overall_mean_similarity": runtime_overall,
+                    "overall_similarity_percentiles": _safe_percentiles(runtime_sims),
                     "overall_abs_drop": float(baseline_overall - runtime_overall),
                     "overall_rel_drop_pct": float((baseline_overall - runtime_overall) / baseline_overall * 100.0) if baseline_overall else 0.0,
                     "overall_mean_distance": _safe_mean(runtime_distances),
                     "long_range_mean_similarity": runtime_long,
+                    "long_range_similarity_percentiles": _safe_percentiles(runtime_sims[long_range_mask]),
                     "long_range_abs_drop": float(baseline_long - runtime_long),
                     "long_range_rel_drop_pct": float((baseline_long - runtime_long) / baseline_long * 100.0) if baseline_long else 0.0,
                     "long_range_mean_distance": _safe_mean(runtime_distances[long_range_mask]),
@@ -311,6 +330,62 @@ def plot_cluster_similarity(summary, output_dir):
     plt.savefig(os.path.join(output_dir, "exp2_cluster_similarity_vs_alpha.pdf"), bbox_inches="tight", pad_inches=0.07)
     print(f"Saved exp2_cluster_similarity_vs_alpha.pdf to {output_dir}")
     plt.close()
+
+
+def alpha_to_filename(alpha):
+    return f"{alpha:g}".replace("-", "m").replace(".", "p")
+
+
+def plot_cluster_similarity_distribution(
+    baseline_sims,
+    cluster_history_sims,
+    cluster_runtime_sims,
+    alpha_values,
+    output_dir,
+):
+    baseline_sims = np.asarray(baseline_sims, dtype=np.float32)
+    for alpha in alpha_values:
+        hist_sims = np.asarray(cluster_history_sims[alpha], dtype=np.float32)
+        runtime_sims = np.asarray(cluster_runtime_sims[alpha], dtype=np.float32)
+
+        plt.figure(figsize=(3.4, 2.3))
+        sns.histplot(
+            baseline_sims,
+            label="Full History",
+            stat="percent",
+            bins=50,
+            color=COLOR_NEUTRAL,
+            alpha=0.18,
+            kde=True,
+        )
+        sns.histplot(
+            hist_sims,
+            label="Stride Centers",
+            stat="percent",
+            bins=50,
+            color=COLOR_PRIMARY,
+            alpha=0.28,
+            kde=True,
+        )
+        sns.histplot(
+            runtime_sims,
+            label="Runtime Visible",
+            stat="percent",
+            bins=50,
+            color=COLOR_SECONDARY,
+            alpha=0.18,
+            kde=True,
+        )
+        plt.xlabel("Max Cosine Similarity")
+        plt.ylabel("Tokens Percentage (%)")
+        plt.xlim(0.0, 1.0)
+        plt.grid(True, linestyle="--", alpha=0.6, color=COLOR_GRID)
+        plt.legend(fontsize=7)
+        plt.tight_layout()
+        filename = f"exp2_cluster_similarity_dist_alpha_{alpha_to_filename(alpha)}.pdf"
+        plt.savefig(os.path.join(output_dir, filename), bbox_inches="tight", pad_inches=0.07)
+        print(f"Saved {filename} to {output_dir}")
+        plt.close()
 
 
 def build_model_load_kwargs(device):
@@ -364,6 +439,7 @@ def run_experiment(
     alpha_values="0.0,0.0001,0.001,0.01,0.05,0.1",
     long_range_threshold=16,
     query_block_size=1024,
+    run_vector_analysis=True,
 ):
     seq_len = int(seq_len)
     sample_num = int(sample_num)
@@ -406,6 +482,7 @@ def run_experiment(
     cluster_runtime_sims = {alpha: [] for alpha in alpha_values}
     cluster_runtime_distances = {alpha: [] for alpha in alpha_values}
     center_fractions = {alpha: [] for alpha in alpha_values}
+    run_vector_analysis = bool(run_vector_analysis)
     
     # For Exp 5 & 6 (Reservoir sampling to save memory)
     # We will collect a fixed number of vectors from each sample
@@ -491,6 +568,9 @@ def run_experiment(
                     (valid_indices.to(cluster_runtime_idx.device) - cluster_runtime_idx).cpu().tolist()
                 )
             
+            if not run_vector_analysis:
+                continue
+
             # --- Collect Vectors for Exp 5 & 6 ---
             # Randomly sample indices to keep memory check
             num_valid = len(valid_indices)
@@ -554,6 +634,7 @@ def run_experiment(
         "alpha_values": [float(x) for x in alpha_values],
         "query_block_size": int(query_block_size),
         "device": model_device,
+        "run_vector_analysis": bool(run_vector_analysis),
     }
 
     summary_path = os.path.join(output_dir, "exp2_cluster_similarity_summary.json")
@@ -578,6 +659,13 @@ def run_experiment(
         )
 
     plot_cluster_similarity(summary, output_dir)
+    plot_cluster_similarity_distribution(
+        baseline_sims=all_max_sims,
+        cluster_history_sims=cluster_history_sims,
+        cluster_runtime_sims=cluster_runtime_sims,
+        alpha_values=alpha_values,
+        output_dir=output_dir,
+    )
 
     # --- Plotting Experiment 1: Max Similarity Distribution ---
     print("Plotting Experiment 1...")

@@ -7,6 +7,7 @@ from sparsevllm.engine.cache_manager import CacheManager
 from sparsevllm.method_registry import (
     PREFILL_POLICY_ALL_CHUNKED,
     PREFILL_POLICY_LONG_BS1FULL_SHORT_BATCH,
+    is_deltakv_method,
 )
 from sparsevllm.utils.log import logger
 
@@ -33,7 +34,7 @@ class Scheduler:
 
         self.num_sink_tokens = config.num_sink_tokens
         self.num_recent_tokens = config.num_recent_tokens
-        self.num_top_tokens = config.num_top_tokens
+        self.decode_keep_tokens = config.decode_keep_tokens
         
         # memory_oracle 引用 Rank 0 的 CacheManager，作为全局显存余量参考。
         # 对多层异构预算，采用更保守的可用空间估计。
@@ -42,6 +43,7 @@ class Scheduler:
         self.waiting: deque[Sequence] = deque()
         self.decoding: deque[Sequence] = deque()
         self._admission_defer_warned_seq_ids: set[int] = set()
+        self.total_preemptions = 0
 
     def _long_text_threshold(self, is_prefill: bool) -> int:
         """Long-text boundary for batch partitioning.
@@ -49,21 +51,17 @@ class Scheduler:
         Prefill: based on prompt length + chunk prefill size.
         Decode: based on current total tokens (prompt + generated), without chunk size.
         """
-        if self.config.vllm_sparse_method == "deltakv-snapkv":
-            base = (
-                self.num_sink_tokens
-                + self.num_recent_tokens
-                + self.config.snapkv_window_size
-            )
-        elif self.config.vllm_sparse_method == "deltakv-standalone":
-            base = self.num_sink_tokens + self.num_recent_tokens
-        elif self.config.vllm_sparse_method in ("streamingllm", "attention-sink", "attention_sink"):
+        if is_prefill and is_deltakv_method(self.config.vllm_sparse_method):
+            return int(self.chunk_prefill_size)
+        if self.config.vllm_sparse_method in ("streamingllm", "attention-sink", "attention_sink"):
             base = self.num_sink_tokens + self.num_recent_tokens
         else:
-            base = self.num_sink_tokens + self.num_top_tokens + self.num_recent_tokens
+            base = self.num_sink_tokens + self.decode_keep_tokens + self.num_recent_tokens
         return base + (self.chunk_prefill_size if is_prefill else 0)
 
     def _is_long_text(self, seq: Sequence, is_prefill: bool) -> bool:
+        if is_prefill and self.memory_oracle.should_schedule_full_prefill(seq):
+            return True
         threshold = self._long_text_threshold(is_prefill)
         seq_len = seq.num_prompt_tokens if is_prefill else seq.num_tokens
         return int(seq_len) > int(threshold)
@@ -135,6 +133,13 @@ class Scheduler:
             and num_batched_seqs < self.max_num_seqs_in_batch
         )
 
+    def _requires_whole_short_prefill_step(self, target_is_long: bool) -> bool:
+        return (
+            self.prefill_schedule_policy == PREFILL_POLICY_LONG_BS1FULL_SHORT_BATCH
+            and is_deltakv_method(self.config.vllm_sparse_method)
+            and not target_is_long
+        )
+
     def _prefill_step_tokens(
         self,
         *,
@@ -153,6 +158,14 @@ class Scheduler:
         if self.prefill_schedule_policy == PREFILL_POLICY_LONG_BS1FULL_SHORT_BATCH:
             if target_is_long:
                 return int(remaining_prefill_tokens)
+            if self._requires_whole_short_prefill_step(target_is_long):
+                available = min(
+                    self.max_num_batched_tokens - num_batched_tokens,
+                    step_free_count,
+                )
+                if remaining_prefill_tokens <= self.chunk_prefill_size and remaining_prefill_tokens <= available:
+                    return int(remaining_prefill_tokens)
+                return 0
             return min(
                 remaining_prefill_tokens,
                 self.chunk_prefill_size,
@@ -203,6 +216,7 @@ class Scheduler:
         )
         margin_batched_tokens = self.memory_oracle.prefill_batched_tokens_margin()
         deferred_prompt_failure: tuple[Sequence, str, int, int] | None = None
+        deferred_prefill_step_failure: tuple[Sequence, int, int] | None = None
 
         # --- 阶段 1: Prefill 调度 ---
         # 只要 waiting 队列有活，就优先处理 Prefill，因为它是计算密集型的。
@@ -246,6 +260,12 @@ class Scheduler:
                 )
 
                 if can_prefill_tokens <= 0:
+                    if self._requires_whole_short_prefill_step(target_is_long):
+                        available = min(
+                            self.max_num_batched_tokens - num_batched_tokens,
+                            step_free_count,
+                        )
+                        deferred_prefill_step_failure = (seq, int(remaining_prefill_tokens), int(available))
                     logger.debug(f'{can_prefill_tokens=} 结束 schedule prefill 请求')
                     self.waiting.appendleft(seq)
                     break
@@ -405,6 +425,7 @@ class Scheduler:
                     self.decoding.extendleft(reversed(scheduled_seqs))
                     scheduled_seqs.clear()
                 preempted_seqs.append(victim)
+                self.total_preemptions += 1
                 logger.warning(f'驱逐请求 id = {victim.seq_id} | slots={self.memory_oracle.free_slot_stats()}')
                 return [], False, preempted_seqs
             else:
@@ -415,6 +436,16 @@ class Scheduler:
                 # logger.debug('Add a decode req.')
         
         if not scheduled_seqs:
+            if deferred_prefill_step_failure is not None and not self.decoding:
+                seq, need, free = deferred_prefill_step_failure
+                raise RuntimeError(
+                    "DeltaKV short prefill cannot be split across multiple steps. "
+                    f"seq_id={seq.seq_id} prompt_len={seq.num_prompt_tokens} "
+                    f"remaining_prefill_tokens={need} available_step_tokens={free} "
+                    f"chunk_prefill_size={self.chunk_prefill_size} "
+                    f"max_num_batched_tokens={self.max_num_batched_tokens}. "
+                    "Increase the raw KV budget / max_num_batched_tokens or reduce short-batch size."
+                )
             if deferred_prompt_failure is not None and not self.decoding:
                 seq, name, need, free = deferred_prompt_failure
                 if os.getenv("SPARSEVLLM_DEBUG_SLOTS", "0") == "1":

@@ -1,0 +1,12 @@
+[submodule "baselines/DivPrune"]
+	path = baselines/DivPrune
+	url = https://github.com/vbdi/divprune.git
+[submodule "baselines/FastVID"]
+	path = baselines/FastVID
+	url = https://github.com/LunarShen/FastVID.git
+[submodule "baselines/PACT"]
+	path = baselines/PACT
+	url = https://github.com/orailix/PACT.git
+[submodule "baselines/VisionZip"]
+	path = baselines/VisionZip
+	url = https://github.com/dvlab-research/VisionZip.git

@@ -10,7 +10,7 @@ from sparsevllm.engine.sequence import Sequence
 from sparsevllm.utils.context import get_context
 from sparsevllm.utils.profiler import profiler
 
-from .base import CacheManager, LayerBatchStates
+from .base import CacheManager, LayerBatchStates, SparseSelection
 
 
 class QuestCacheManager(CacheManager):
@@ -82,7 +82,8 @@ class QuestCacheManager(CacheManager):
     def get_layer_store_view(self, layer_idx: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         return self.kv_cache[0, layer_idx], self.kv_cache[1, layer_idx], self.layer_batch_state.slot_mapping
 
-    def get_layer_compute_tensors(self, layer_idx: int, sparse_controller):
+    def get_layer_compute_tensors(self, layer_idx: int, selection: SparseSelection | None = None):
+        del selection
         raise NotImplementedError
 
     def get_layer_buffer_req_to_token_slots(self, layer_idx: int) -> torch.Tensor:
@@ -314,11 +315,19 @@ class QuestCacheManager(CacheManager):
             return input_ids, positions, None
 
     @torch.no_grad()
-    def on_kv_stored(self, layer_idx: int, k: torch.Tensor, slot_mapping: torch.Tensor):
+    def on_kv_stored(
+        self,
+        layer_idx: int,
+        k: torch.Tensor,
+        slot_mapping: torch.Tensor,
+    ):
         if slot_mapping is None or slot_mapping.numel() == 0:
             return
-        if getattr(get_context(), "decode_cuda_graph_static", False) and not get_context().is_prefill:
+        if not get_context().is_prefill:
             self._on_kv_stored_decode_static(layer_idx, slot_mapping)
+            return
+        if torch.cuda.is_current_stream_capturing():
+            self._on_kv_stored_prefill_capture(layer_idx, k, slot_mapping)
             return
 
         with profiler.record("quest_update_metadata"):
@@ -358,6 +367,35 @@ class QuestCacheManager(CacheManager):
                 )
                 page_max_cache.index_copy_(0, completed_page_slots, full_page_k.amax(dim=1))
                 page_min_cache.index_copy_(0, completed_page_slots, full_page_k.amin(dim=1))
+
+    @torch.no_grad()
+    def _on_kv_stored_prefill_capture(self, layer_idx: int, k: torch.Tensor, slot_mapping: torch.Tensor):
+        """Update QuEST full-page metadata without dynamic shape ops during capture.
+
+        Prefill graph capture is currently exercised for first-prefill chunks, so
+        touched pages begin at page offset 0. The trailing partial page is left
+        without metadata, matching the eager path until that page is completed.
+        """
+        with profiler.record("quest_update_metadata_capture"):
+            full_token_count = (int(slot_mapping.numel()) // self.page_size) * self.page_size
+            if full_token_count <= 0:
+                return
+
+            page_max_cache = self.metadata_cache[0, layer_idx]
+            page_min_cache = self.metadata_cache[1, layer_idx]
+            full_page_slots = torch.div(
+                slot_mapping[:full_token_count:self.page_size],
+                self.page_size,
+                rounding_mode="floor",
+            ).to(torch.long)
+            full_page_k = k[:full_token_count].view(
+                -1,
+                self.page_size,
+                self.num_kv_heads,
+                self.head_dim,
+            )
+            page_max_cache.index_copy_(0, full_page_slots, full_page_k.amax(dim=1))
+            page_min_cache.index_copy_(0, full_page_slots, full_page_k.amin(dim=1))
 
     @torch.no_grad()
     def _on_kv_stored_decode_static(self, layer_idx: int, slot_mapping: torch.Tensor):
@@ -445,81 +483,15 @@ class QuestCacheManager(CacheManager):
         token_budget = int(self.config.quest_token_budget)
         if token_budget <= 0:
             return active_slots, req_indices, context_lens
-        if getattr(get_context(), "decode_cuda_graph_static", False):
-            return self._build_decode_view_static(
-                layer_idx,
-                q,
-                active_slots,
-                req_indices,
-                context_lens,
-                token_budget=token_budget,
-                num_kv_heads=num_kv_heads,
-            )
-
-        with profiler.record("quest_build_decode_view"):
-            page_budget_base = max(3, token_budget // self.page_size)
-            max_keep = max(token_budget, page_budget_base * self.page_size, self.page_size)
-            batch_size = q.shape[0]
-            packed_slots = torch.empty((batch_size, max_keep), dtype=torch.int32, device=q.device)
-            local_context_lens = torch.empty((batch_size,), dtype=torch.int32, device=q.device)
-
-            num_pages = torch.div(context_lens + self.page_size - 1, self.page_size, rounding_mode="floor")
-            dense_mask = (context_lens <= token_budget) | (num_pages <= page_budget_base)
-
-            dense_idx = dense_mask.nonzero(as_tuple=False).squeeze(-1)
-            if dense_idx.numel() > 0:
-                dense_req = req_indices.index_select(0, dense_idx).to(torch.long)
-                dense_lens = context_lens.index_select(0, dense_idx)
-                dense_keep = int(dense_lens.max().item())
-                packed_slots[dense_idx, :dense_keep] = self.buffer_req_to_token_slots.index_select(0, dense_req)[:, :dense_keep]
-                local_context_lens[dense_idx] = dense_lens
-
-            sparse_idx = (~dense_mask).nonzero(as_tuple=False).squeeze(-1)
-            if sparse_idx.numel() > 0:
-                sparse_num_pages = num_pages.index_select(0, sparse_idx)
-                for num_pages_i32 in torch.unique(sparse_num_pages, sorted=True):
-                    num_pages_i = int(num_pages_i32.item())
-                    group_mask = sparse_num_pages == num_pages_i32
-                    group_idx = sparse_idx[group_mask]
-                    group_req = req_indices.index_select(0, group_idx).to(torch.long)
-                    group_q = q.index_select(0, group_idx)
-                    row_page_slots = self.buffer_req_to_page_slots.index_select(0, group_req)[:, :num_pages_i].to(torch.long)
-                    prev_page_slots = row_page_slots[:, : num_pages_i - 1]
-
-                    with profiler.record("quest_score_pages"):
-                        flat_prev_slots = prev_page_slots.reshape(-1)
-                        prev_page_max = self.metadata_cache[0, layer_idx].index_select(0, flat_prev_slots).view(
-                            group_idx.numel(),
-                            num_pages_i - 1,
-                            num_kv_heads,
-                            self.head_dim,
-                        ).permute(0, 2, 1, 3)
-                        prev_page_min = self.metadata_cache[1, layer_idx].index_select(0, flat_prev_slots).view(
-                            group_idx.numel(),
-                            num_pages_i - 1,
-                            num_kv_heads,
-                            self.head_dim,
-                        ).permute(0, 2, 1, 3)
-                        page_scores = self._score_pages_batched(group_q, prev_page_max, prev_page_min, num_kv_heads)
-
-                    prev_budget = min(page_budget_base - 1, num_pages_i - 1)
-                    top_prev = page_scores.topk(prev_budget, dim=-1, sorted=False).indices
-                    last_page = torch.full((group_idx.numel(), 1), num_pages_i - 1, dtype=torch.long, device=q.device)
-                    selected_pages = torch.cat((top_prev, last_page), dim=1)
-
-                    with profiler.record("quest_pack_slots"):
-                        selected_page_slots = row_page_slots.gather(1, selected_pages).to(torch.int32)
-                        group_slots = (
-                            selected_page_slots[:, :, None] * self.page_size + self.page_offsets_i32[None, None, :]
-                        ).reshape(group_idx.numel(), -1)
-                        keep_len = prev_budget * self.page_size + (
-                            context_lens.index_select(0, group_idx) - (num_pages_i - 1) * self.page_size
-                        )
-                        packed_slots[group_idx, : group_slots.shape[1]] = group_slots
-                        local_context_lens[group_idx] = keep_len
-
-            local_req_indices = torch.arange(q.shape[0], dtype=torch.int32, device=q.device)
-            return packed_slots, local_req_indices, local_context_lens
+        return self._build_decode_view_static(
+            layer_idx,
+            q,
+            active_slots,
+            req_indices,
+            context_lens,
+            token_budget=token_budget,
+            num_kv_heads=num_kv_heads,
+        )
 
     @torch.no_grad()
     def _build_decode_view_static(

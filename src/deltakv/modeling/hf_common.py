@@ -22,6 +22,21 @@ def assert_hf_bs1(input_shape: tuple[int, int], attention_mask: Optional[torch.T
         raise NotImplementedError("HF DeltaKV does not support padded inputs; use Sparse-vLLM for batched/padded inference.")
 
 
+def _causal_mask_from_positions(
+    query_positions: torch.Tensor,
+    key_positions: torch.Tensor,
+    *,
+    dtype: torch.dtype,
+) -> torch.Tensor:
+    if query_positions.dim() == 1:
+        query_positions = query_positions.unsqueeze(0)
+    if key_positions.dim() == 1:
+        key_positions = key_positions.unsqueeze(0)
+    blocked = key_positions[:, None, None, :] > query_positions[:, None, :, None]
+    mask = torch.zeros(blocked.shape, device=key_positions.device, dtype=dtype)
+    return mask.masked_fill(blocked, torch.finfo(dtype).min)
+
+
 def apply_single_rope(states: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor, rotate_half) -> torch.Tensor:
     cos = cos.unsqueeze(1)
     sin = sin.unsqueeze(1)
@@ -48,6 +63,12 @@ def _variant_class(name: str, base_cls: type, cache_impl: str):
     return Variant
 
 
+def _decoder_hidden_states(layer_outputs):
+    if isinstance(layer_outputs, tuple):
+        return layer_outputs[0]
+    return layer_outputs
+
+
 def build_inference_classes(
     *,
     prefix: str,
@@ -69,6 +90,7 @@ def build_inference_classes(
             super().__init__(config, layer_idx)
             full_layers = parse_full_attn_layers(config.full_attn_layers)
             config.full_attn_layers = full_layers
+            self.is_full_layer = layer_idx in full_layers
             self.is_obs_layer = bool(full_layers) and layer_idx in full_layers and (layer_idx + 1) not in full_layers
             self.obs_index = (
                 sorted(idx for idx in full_layers if (idx + 1) not in full_layers).index(layer_idx)
@@ -99,6 +121,57 @@ def build_inference_classes(
             value_states = self.v_proj(hidden_states)
             if not self.config.collect_kv_before_rope:
                 raise NotImplementedError("DeltaKV HF inference expects collect_kv_before_rope=True.")
+
+            hidden_shape = (bs, q_len, -1, self.head_dim)
+            cur_cos, cur_sin = position_embeddings
+            use_full_layer_kivi_postrope_cache = bool(
+                self.is_full_layer
+                and past_key_value is not None
+                and hasattr(past_key_value, "_full_layer_kivi_enabled")
+                and past_key_value._full_layer_kivi_enabled()
+            )
+            debug_qk_layers = os.getenv("DELTAKV_DEBUG_QK_LAYERS")
+            debug_qk_capture = False
+            if debug_qk_layers:
+                wanted = {int(part) for part in debug_qk_layers.split(",") if part.strip()}
+                debug_qk_capture = int(self.layer_idx) in wanted
+            if use_full_layer_kivi_postrope_cache:
+                if debug_qk_capture:
+                    self.debug_last_k_raw = (
+                        key_states.view(bs, q_len, self.config.num_key_value_heads, self.head_dim)
+                        .transpose(1, 2)
+                        .detach()
+                        .clone()
+                    )
+                if use_qk_norm:
+                    query_states, key_states = reshape_and_apply_qk_norm(
+                        self,
+                        query_states,
+                        key_states,
+                        hidden_shape,
+                        (bs, q_len, self.config.num_key_value_heads, self.head_dim),
+                    )
+                else:
+                    query_states = query_states.view(
+                        bs,
+                        q_len,
+                        self.config.num_attention_heads,
+                        self.head_dim,
+                    ).transpose(1, 2)
+                    key_states = key_states.view(
+                        bs,
+                        q_len,
+                        self.config.num_key_value_heads,
+                        self.head_dim,
+                    ).transpose(1, 2)
+                if debug_qk_capture:
+                    self.debug_last_k_norm = key_states.detach().clone()
+                query_states = apply_single_rope(query_states, cur_cos, cur_sin, rotate_half)
+                key_states = apply_single_rope(key_states, cur_cos, cur_sin, rotate_half)
+                if debug_qk_capture:
+                    self.debug_last_k_full_kivi_postrope_input = key_states.detach().clone()
+                key_states = key_states.transpose(1, 2).reshape(bs, q_len, -1).contiguous()
+
             key_states, value_states, full_idx = past_key_value.update(
                 key_states,
                 value_states,
@@ -108,26 +181,51 @@ def build_inference_classes(
                 compressor_up=self.compress_up,
             )
 
-            hidden_shape = (bs, q_len, -1, self.head_dim)
-            if use_qk_norm:
-                query_states, key_states = reshape_and_apply_qk_norm(
-                    self,
-                    query_states,
-                    key_states,
-                    hidden_shape,
-                    (bs, -1, self.config.num_key_value_heads, self.head_dim),
+            if debug_qk_capture and not use_full_layer_kivi_postrope_cache:
+                self.debug_last_k_raw = (
+                    key_states.view(bs, -1, self.config.num_key_value_heads, self.head_dim)
+                    .transpose(1, 2)
+                    .detach()
+                    .clone()
                 )
-            else:
-                query_states = query_states.view(bs, q_len, self.config.num_attention_heads, self.head_dim).transpose(1, 2)
-                key_states = key_states.view(bs, -1, self.config.num_key_value_heads, self.head_dim).transpose(1, 2)
-            value_states = value_states.view(bs, -1, self.config.num_key_value_heads, self.head_dim).transpose(1, 2)
 
-            cur_cos, cur_sin = position_embeddings
-            query_states = apply_single_rope(query_states, cur_cos, cur_sin, rotate_half)
-            safe_full_idx = full_idx.clamp(min=0, max=past_key_value.cos.shape[1] - 1)
-            k_cos = past_key_value.cos.gather(1, safe_full_idx.unsqueeze(-1).expand(-1, -1, self.head_dim))
-            k_sin = past_key_value.sin.gather(1, safe_full_idx.unsqueeze(-1).expand(-1, -1, self.head_dim))
-            key_states = apply_single_rope(key_states, k_cos, k_sin, rotate_half)
+            if use_full_layer_kivi_postrope_cache:
+                key_states = key_states.view(bs, -1, self.config.num_key_value_heads, self.head_dim).transpose(1, 2)
+            else:
+                if use_qk_norm:
+                    query_states, key_states = reshape_and_apply_qk_norm(
+                        self,
+                        query_states,
+                        key_states,
+                        hidden_shape,
+                        (bs, -1, self.config.num_key_value_heads, self.head_dim),
+                    )
+                else:
+                    query_states = query_states.view(bs, q_len, self.config.num_attention_heads, self.head_dim).transpose(1, 2)
+                    key_states = key_states.view(bs, -1, self.config.num_key_value_heads, self.head_dim).transpose(1, 2)
+            value_states = value_states.view(bs, -1, self.config.num_key_value_heads, self.head_dim).transpose(1, 2)
+            if debug_qk_capture and not use_full_layer_kivi_postrope_cache:
+                self.debug_last_k_norm = key_states.detach().clone()
+
+            if not use_full_layer_kivi_postrope_cache:
+                query_states = apply_single_rope(query_states, cur_cos, cur_sin, rotate_half)
+                safe_full_idx = full_idx.clamp(min=0, max=past_key_value.cos.shape[1] - 1)
+                k_cos = past_key_value.cos.gather(1, safe_full_idx.unsqueeze(-1).expand(-1, -1, self.head_dim))
+                k_sin = past_key_value.sin.gather(1, safe_full_idx.unsqueeze(-1).expand(-1, -1, self.head_dim))
+                key_states = apply_single_rope(key_states, k_cos, k_sin, rotate_half)
+
+            if debug_qk_capture:
+                self.debug_last_q_postrope = query_states.detach().clone()
+                self.debug_last_k_postrope = key_states.detach().clone()
+                self.debug_last_v = value_states.detach().clone()
+                self.debug_last_qk_positions = full_idx.detach().clone()
+
+            if attention_mask is not None:
+                attention_mask = _causal_mask_from_positions(
+                    cache_position,
+                    full_idx,
+                    dtype=query_states.dtype,
+                )
 
             attention_interface = eager_attention_forward
             if self.config._attn_implementation != "eager":
@@ -172,7 +270,11 @@ def build_inference_classes(
                 past_key_value.top_token_idx[self.layer_idx] = top_token_idx
             if os.getenv("DEBUG") and self.layer_idx == 0:
                 print(f"[DeltaKV HF] key_states={tuple(key_states.shape)} do_obs={do_obs} q_len={q_len}", flush=True)
-            return self.o_proj(attn_output.reshape(*input_shape, -1).contiguous()), attn_weights
+            projected = self.o_proj(attn_output.reshape(*input_shape, -1).contiguous())
+            if debug_qk_capture:
+                self.debug_last_attn_output = attn_output.detach().clone()
+                self.debug_last_o_proj_output = projected.detach().clone()
+            return projected, attn_weights
 
     class LayerKVCompress(layer_cls):
         def __init__(self, config, layer_idx: int):
@@ -257,8 +359,10 @@ def build_inference_classes(
                     deltakv_visual_token_mask=deltakv_visual_token_mask,
                     **flash_attn_kwargs,
                 )
-                hidden_states = layer_outputs[0]
+                hidden_states = _decoder_hidden_states(layer_outputs)
                 if output_attentions:
+                    if not isinstance(layer_outputs, tuple):
+                        raise ValueError("output_attentions=True requires decoder layers to return attention weights.")
                     all_self_attns += (layer_outputs[1],)
             hidden_states = self.norm(hidden_states)
             if output_hidden_states:
@@ -638,6 +742,8 @@ def build_cluster_training_classes(
             loss = None
             if labels is not None:
                 loss = self.loss_function(logits=logits, labels=labels, vocab_size=self.config.vocab_size, **kwargs)
+            self._last_ntp_loss = loss.detach() if loss is not None else None
+            self._last_mse_loss = mse_loss.detach()
             total_loss = (loss + mse_loss) if loss is not None else mse_loss
             if loss is not None and os.getenv("MSE_DETACH"):
                 total_loss = loss + mse_loss.detach()
@@ -659,5 +765,9 @@ def build_cluster_training_classes(
     ]:
         cls.__name__ = f"{prefix}{suffix}"
         cls.__qualname__ = f"{prefix}{suffix}"
+
+    AttnKVClusterCompress._deltakv_run_mode = run_mode
+    ModelKVClusterCompress._deltakv_run_mode = run_mode
+    KVClusterCompress._deltakv_run_mode = run_mode
 
     return AttnKVClusterCompress, LayerKVClusterCompress, ModelKVClusterCompress, KVClusterCompress

@@ -24,6 +24,8 @@ benchmark/multimodal/
 | StreamingBench frame cache | `benchmark/multimodal/video_qa/frame_cache.py` |
 | LiveVLM Table 4 audit | `benchmark/multimodal/video_qa/audit_livevlm_table4.py` |
 | AI2D | `benchmark/multimodal/image_qa/ai2d.py` |
+| VQAv2 | `benchmark/multimodal/image_qa/vqav2.py` |
+| ScienceQA-IMG / POPE / MMBench_EN / MME / MMMU | `benchmark/multimodal/image_qa/small_image_bench.py` |
 | Visual-cache ablations | `benchmark/multimodal/visual_cache/run_visual_cache.py` |
 
 ## Adapter Boundary

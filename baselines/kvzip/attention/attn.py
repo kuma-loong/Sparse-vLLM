@@ -26,6 +26,9 @@ def llama_qwen_attn_forward(
     **kwargs: Unpack[FlashAttentionKwargs],
 ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
 
+    if past_key_value is None and "past_key_values" in kwargs:
+        past_key_value = kwargs.pop("past_key_values")
+
     bsz, q_len, _ = hidden_states.size()
     input_shape = hidden_states.shape[:-1]
     hidden_shape = (*input_shape, -1, self.head_dim)
@@ -105,6 +108,9 @@ def gemma3_attn_forward(
     cache_position: Optional[torch.LongTensor] = None,
     **kwargs,
 ) -> tuple[torch.Tensor, Optional[torch.Tensor], Optional[tuple[torch.Tensor]]]:
+    if past_key_value is None and "past_key_values" in kwargs:
+        past_key_value = kwargs.pop("past_key_values")
+
     input_shape = hidden_states.shape[:-1]
     hidden_shape = (*input_shape, -1, self.head_dim)
 

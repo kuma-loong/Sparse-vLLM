@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import gc
+import inspect
 import json
 import os
 import re
@@ -18,7 +19,25 @@ import torch
 import torch.profiler
 from rouge import Rouge
 from tqdm import tqdm
-from transformers import GenerationConfig, SinkCache
+from transformers import GenerationConfig
+
+try:
+    from transformers.cache_utils import SinkCache
+except ImportError:
+    SinkCache = None
+
+
+def _prepare_generation_cache(model, model_inputs):
+    prepare_cache = getattr(model, "_prepare_cache_for_generation")
+    num_params = len(inspect.signature(prepare_cache).parameters)
+    if num_params == 5:
+        return prepare_cache(GenerationConfig(), model_inputs, None, None, None)
+    if num_params == 6:
+        return prepare_cache(GenerationConfig(), model_inputs, None, None, None, None)
+    raise TypeError(
+        "Unsupported _prepare_cache_for_generation signature with "
+        f"{num_params} parameters: {inspect.signature(prepare_cache)}"
+    )
 
 DATA_NAME_TO_PATH = {
     "scbench_choice_eng": "scbench_choice_eng.jsonl",
@@ -1339,14 +1358,7 @@ class GreedySearch:
             past_key_values = prepared_inputs.get("past_key_values")
             if past_key_values is None:
                 model_inputs = {}
-                self.model._prepare_cache_for_generation(
-                    GenerationConfig(),
-                    model_inputs,
-                    None,
-                    None,
-                    None,
-                    None,
-                )
+                _prepare_generation_cache(self.model, model_inputs)
                 past_key_values = model_inputs["past_key_values"]
         else:
             past_key_values = self.past_kv
@@ -1385,9 +1397,7 @@ class GreedySearch:
         logits = None
         if self.past_kv is None:
             model_inputs = {}
-            self.model._prepare_cache_for_generation(
-                GenerationConfig(), model_inputs, None, None, None, None
-            )
+            _prepare_generation_cache(self.model, model_inputs)
             past_key_values = model_inputs["past_key_values"]
         else:
             past_key_values = self.past_kv
@@ -1471,9 +1481,7 @@ class GreedySearch_RetrAttn(GreedySearch):
         logits = None
         if self.past_kv is None:
             model_inputs = {}
-            self.model._prepare_cache_for_generation(
-                GenerationConfig(), model_inputs, None, None, None, None
-            )
+            _prepare_generation_cache(self.model, model_inputs)
             past_key_values = model_inputs["past_key_values"]
         else:
             past_key_values = self.past_kv
@@ -1570,6 +1578,12 @@ class GreedySearch_InfLLM(GreedySearch):
         logits = None
         if self.past_kv is None:
             if self.use_sinkcache:
+                if SinkCache is None:
+                    raise ImportError(
+                        "transformers.cache_utils.SinkCache is required for "
+                        "GreedySearch_InfLLM(use_sinkcache=True), but this "
+                        "transformers version does not provide it."
+                    )
                 past_key_values = SinkCache(window_length=3968, num_sink_tokens=128)
             else:
                 past_key_values = self.model.prepare_inputs_for_generation(input_ids)[
@@ -1995,7 +2009,7 @@ class DeltaKVGreedySearch(GreedySearch):
 
         if self.past_kv is None:
             model_inputs = {}
-            self.model._prepare_cache_for_generation(GenerationConfig(), model_inputs, None, None, None, None)
+            _prepare_generation_cache(self.model, model_inputs)
             self.past_kv = model_inputs["past_key_values"]
 
         for i in range(max_length):

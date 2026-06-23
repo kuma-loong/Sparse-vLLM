@@ -11,7 +11,7 @@ from sparsevllm.method_registry import PREFILL_POLICY_LONG_BS1FULL_SHORT_BATCH
 from sparsevllm.utils.log import logger, log_level
 from sparsevllm.utils.profiler import profiler
 
-from .base import CacheManager, LayerBatchStates
+from .base import CacheManager, LayerBatchStates, SparseSelection
 
 
 class SnapKVCacheManager(CacheManager):
@@ -182,8 +182,8 @@ class SnapKVCacheManager(CacheManager):
         k_cache, v_cache = self.get_layer_kv_cache(layer_idx)
         return k_cache, v_cache, self.layer_batch_states[layer_idx].slot_mapping
 
-    def get_layer_compute_tensors(self, layer_idx: int, sparse_controller):
-        del sparse_controller
+    def get_layer_compute_tensors(self, layer_idx: int, selection: SparseSelection | None = None):
+        del selection
         if self.has_prefill_staging_view(layer_idx):
             return self.pyramidkv_prefill_staging_kv_cache[0], self.pyramidkv_prefill_staging_kv_cache[1]
         raise NotImplementedError
@@ -218,11 +218,11 @@ class SnapKVCacheManager(CacheManager):
     def num_free_slots(self) -> int:
         return min(self._num_free_slots)
 
-    def _pyramidkv_layer_budget(self, layer_idx: int, is_prefill: bool) -> int:
-        num_top = int(self.config.num_top_tokens_in_prefill if is_prefill else self.config.num_top_tokens)
+    def _pyramidkv_layer_budget(self, layer_idx: int) -> int:
+        decode_keep = int(self.config.decode_keep_tokens)
         ratio = float(self.config.pyramid_layer_ratios[layer_idx])
         base_ratio = float(self.config.pyramid_layer_ratios[0])
-        scaled_top_tokens = int(num_top * ratio / base_ratio)
+        scaled_top_tokens = int(decode_keep * ratio / base_ratio)
         return int(self.config.num_sink_tokens) + scaled_top_tokens + int(self.config.num_recent_tokens)
 
     def _pyramidkv_prompt_admission_cost(self, seq: Sequence) -> int:
@@ -230,7 +230,7 @@ class SnapKVCacheManager(CacheManager):
         if prompt_len <= 0:
             return 0
         return max(
-            min(prompt_len, self._pyramidkv_layer_budget(layer_idx, is_prefill=True))
+            min(prompt_len, self._pyramidkv_layer_budget(layer_idx))
             for layer_idx in range(self.num_layers)
         )
 
@@ -288,6 +288,12 @@ class SnapKVCacheManager(CacheManager):
 
             row_idx = self._get_free_row(layer_idx, seq_id)
             cur_len = self.row_seq_lens[layer_idx][row_idx]
+            if int(cur_len) + int(size) > int(self.max_model_len):
+                raise RuntimeError(
+                    "KV row length exceeds max_model_len in _allocate: "
+                    f"layer={layer_idx} seq_id={seq_id} row={row_idx} "
+                    f"cur_len={int(cur_len)} size={int(size)} max_model_len={int(self.max_model_len)}"
+                )
 
             ptr = self._num_free_slots[layer_idx]
             select_index = self.free_slots_stack[layer_idx][ptr - size: ptr]
@@ -308,6 +314,12 @@ class SnapKVCacheManager(CacheManager):
 
         row_indices = [self._get_free_row(layer_idx, sid) for sid in seq_ids]
         cur_lens = self.row_seq_lens[layer_idx][row_indices]
+        if len(cur_lens) > 0 and int(max(cur_lens)) + int(size) > int(self.max_model_len):
+            raise RuntimeError(
+                "KV row length exceeds max_model_len in _allocate_batch: "
+                f"layer={layer_idx} max_cur_len={int(max(cur_lens))} "
+                f"size={int(size)} max_model_len={int(self.max_model_len)}"
+            )
 
         ptr = self._num_free_slots[layer_idx]
         select_indices = self.free_slots_stack[layer_idx][ptr - batch_size: ptr]
@@ -357,6 +369,19 @@ class SnapKVCacheManager(CacheManager):
             )
         old_slots = self.buffer_req_to_token_slots[layer_idx][row_idx, :cur_len].clone()
 
+        keep_indices = keep_indices.to(device="cuda", dtype=torch.long).contiguous()
+        if keep_indices.numel() <= 0:
+            raise RuntimeError(
+                f"free_part_slots got empty keep_indices: layer={layer_idx} seq_id={seq.seq_id}"
+            )
+        if bool((keep_indices < 0).any().item()) or bool((keep_indices >= int(cur_len)).any().item()):
+            raise RuntimeError(
+                "free_part_slots keep_indices out of bounds: "
+                f"layer={layer_idx} seq_id={seq.seq_id} cur_len={int(cur_len)} "
+                f"keep_min={int(keep_indices.min().item())} "
+                f"keep_max={int(keep_indices.max().item())}"
+            )
+        keep_indices = torch.sort(keep_indices).values
         new_slots = old_slots[keep_indices]
 
         mask = torch.ones_like(old_slots, dtype=torch.bool)
@@ -556,6 +581,13 @@ class SnapKVCacheManager(CacheManager):
                 state = self.layer_batch_states[layer_id]
                 state.slot_mapping = layers_slot_mapping_cuda[layer_id]
                 state.context_lens = layers_context_lens_cuda[layer_id]
+                # row_seq_lens is layer-wise after prefill/decode eviction; attention
+                # uses this to size flash decode stage1/stage2 workspaces.
+                state.max_context_len = (
+                    int(max(layers_context_lens[layer_id]))
+                    if len(layers_context_lens[layer_id]) > 0
+                    else 0
+                )
                 req_ids = [self.seq_id_to_row[layer_id][seq.seq_id] for seq in seqs]
                 state.req_indices = torch.tensor(req_ids, dtype=torch.int32, device="cuda")
 
@@ -626,6 +658,15 @@ class SnapKVCacheManager(CacheManager):
                 new_slots_batch = self._allocate_batch(layer_id, seq_ids, 1)
                 row_indices = [self.seq_id_to_row[layer_id][sid] for sid in seq_ids]
                 real_context_lens = self.row_seq_lens[layer_id][row_indices]
+                static_cap = getattr(self, "_decode_static_max_context_len", None)
+                real_max_context_len = int(max(real_context_lens)) if row_indices else 0
+                if static_cap is not None and real_max_context_len > int(static_cap):
+                    raise RuntimeError(
+                        "static decode context length exceeds captured graph max_context_len: "
+                        f"layer={layer_id} real_max_context_len={real_max_context_len} "
+                        f"static_cap={int(static_cap)} graph_batch_size={graph_batch_size} "
+                        f"real_batch_size={real_batch_size}"
+                    )
 
                 layer_slot_mapping = layers_slot_mapping[layer_id]
                 layer_context_lens = layers_context_lens[layer_id]
@@ -646,7 +687,7 @@ class SnapKVCacheManager(CacheManager):
                 state = self.layer_batch_states[layer_id]
                 state.slot_mapping = layer_slot_mapping
                 state.context_lens = layer_context_lens
-                state.max_context_len = int(max(real_context_lens)) if row_indices else 0
+                state.max_context_len = real_max_context_len
                 state.req_indices = layer_req_indices
 
             slot_mapping.copy_(layers_slot_mapping[0])

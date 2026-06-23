@@ -10,6 +10,7 @@ from typing import Any
 from time import perf_counter
 
 from deltakv.configs.runtime_params import normalize_runtime_params
+from sparsevllm.method_registry import is_decode_cuda_graph_supported, normalize_sparse_method
 
 
 def get_peak_memory():
@@ -43,7 +44,8 @@ def _load_json_arg(value: str) -> dict[str, Any]:
 def _build_engine_hyper_params(args) -> dict[str, Any]:
     # Keep benchmark defaults stable (do not rely on sparsevllm.Config defaults).
     hyper_params: dict[str, Any] = {
-        "enforce_eager": True,
+        "enforce_eager": False,
+        "decode_cuda_graph": True,
         "gpu_memory_utilization": 0.8,
         "engine_prefill_chunk_size": 4096,
         "tensor_parallel_size": 1,
@@ -56,6 +58,36 @@ def _build_engine_hyper_params(args) -> dict[str, Any]:
         print(f"[param-normalize] {warning}")
 
     return hyper_params
+
+
+def _write_jsonl(path: str | None, rows: list[dict[str, Any]]) -> None:
+    if not path:
+        return
+    out_path = Path(path)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    with out_path.open("w", encoding="utf-8") as handle:
+        for row in rows:
+            json.dump(row, handle, ensure_ascii=False, sort_keys=True)
+            handle.write("\n")
+
+
+def _decode_cuda_graph_status(llm) -> dict[str, Any]:
+    runner = getattr(getattr(llm, "model_runner", None), "decode_cuda_graph_runner", None)
+    states = getattr(runner, "_graphs", {}) if runner is not None else {}
+    graph_count = sum(
+        1
+        for state in states.values()
+        if getattr(state, "graph", None) is not None
+    )
+    configured = bool(getattr(getattr(llm, "config", None), "decode_cuda_graph", False))
+    return {
+        "decode_cuda_graph_configured": configured,
+        "decode_cuda_graph_runner_initialized": runner is not None,
+        "decode_cuda_graph_state_count": int(len(states)),
+        "decode_cuda_graph_graph_count": int(graph_count),
+        "decode_cuda_graph_last_state_key": str(getattr(runner, "last_state_key", None)) if runner is not None else None,
+        "decode_cuda_graph_active": bool(configured and graph_count > 0),
+    }
 
 
 def benchmark_task(method, length, bs, args, results_dict):
@@ -73,6 +105,24 @@ def benchmark_task(method, length, bs, args, results_dict):
         sparse_kwargs["sparse_method"] = method
     elif "deltakv" in method:
         sparse_kwargs["sparse_method"] = method
+
+    normalized_method = normalize_sparse_method(sparse_kwargs["sparse_method"])
+    if bool(base_hyper_params.get("decode_cuda_graph")) and not is_decode_cuda_graph_supported(normalized_method):
+        results_dict[(method, length, bs)] = {
+            "method": method,
+            "sparse_method": normalized_method,
+            "length": int(length),
+            "batch_size": int(bs),
+            "status": "SKIPPED_BY_POLICY",
+            "reason": f"decode_cuda_graph is not supported for sparse_method={normalized_method!r}.",
+            "decode_cuda_graph_expected": True,
+            "decode_cuda_graph_active": False,
+        }
+        print(
+            f"[{method.upper()}] SKIPPED_BY_POLICY: decode_cuda_graph is not supported "
+            f"for sparse_method={normalized_method!r}."
+        )
+        return
     
     llm = None
     try:
@@ -208,6 +258,12 @@ def benchmark_task(method, length, bs, args, results_dict):
         
         duration = t_end - t_start
         peak_mem = get_peak_memory()
+        graph_status = _decode_cuda_graph_status(llm)
+        preemptions = int(getattr(getattr(llm, "scheduler", None), "total_preemptions", 0) or 0)
+        cache_manager = getattr(getattr(llm, "model_runner", None), "cache_manager", None)
+        if cache_manager is None or not hasattr(cache_manager, "memory_accounting"):
+            raise RuntimeError("Sparse-VLLM cache manager does not expose memory_accounting().")
+        memory_accounting = cache_manager.memory_accounting()
 
         ttft = float(ttft or 0.0)
         prefill_s = sum(prefill_times)
@@ -238,6 +294,10 @@ def benchmark_task(method, length, bs, args, results_dict):
         print(f"[{method.upper()}] TTFT: {ttft:.2f}s | Prefill: {prefill_tp:.2f} tok/s | Decode: {decode_tp:.2f} tok/s | ITL: {avg_itl:.2f}ms | AvgBS: {avg_active_bs:.1f} | Mem: {peak_mem:.2f} GB{stage_mode}")
         
         results_dict[(method, length, bs)] = {
+            "method": method,
+            "sparse_method": normalized_method,
+            "length": int(length),
+            "batch_size": int(bs),
             "prefill_tp": prefill_tp,
             "decode_tp": decode_tp,
             "ttft": ttft,
@@ -250,13 +310,29 @@ def benchmark_task(method, length, bs, args, results_dict):
             "decode_scope": "full" if used_full_admission_window else "fallback",
             "staged_admission": staged_admission,
             "admission_wave_size": admission_wave_size if staged_admission else None,
+            "wave_decode_gap_steps": wave_decode_gap_steps if staged_admission else None,
+            "max_decode_steps_after_full": int(getattr(args, "max_decode_steps_after_full", 0) or 0),
+            "decode_steps_after_full": int(decode_steps_after_full),
+            "scheduler_preemptions": preemptions,
+            "decode_cuda_graph_expected": bool(base_hyper_params.get("decode_cuda_graph")),
+            **graph_status,
+            "memory_accounting": memory_accounting,
+            "engine_hyper_params": engine_kwargs,
             "status": "SUCCESS"
         }
 
     except Exception as e:
         print(f"Error at {method}/{length}/{bs}: {e}")
         traceback.print_exc()
-        results_dict[(method, length, bs)] = {"status": "FAILED"}
+        results_dict[(method, length, bs)] = {
+            "method": method,
+            "sparse_method": normalized_method,
+            "length": int(length),
+            "batch_size": int(bs),
+            "status": "FAILED",
+            "error": repr(e),
+            "traceback": traceback.format_exc(),
+        }
     finally:
         if llm is not None and hasattr(llm, "exit"):
             llm.exit()
@@ -271,7 +347,10 @@ def main():
         "--methods",
         type=str,
         default="vanilla,snapkv,omnikv",
-        help="Methods to test (vanilla, streamingllm, attention-sink, snapkv, pyramidkv, omnikv, quest, deltakv, deltakv-triton, deltakv-triton-v2, deltakv-triton-v3, deltakv-triton-v4)",
+        help=(
+            "Methods to test (vanilla, streamingllm, attention-sink, snapkv, pyramidkv, "
+            "omnikv, quest, deltakv; deltakv-less-memory* are legacy aliases)"
+        ),
     )
     parser.add_argument("--output_len", type=int, default=512, help="Output tokens per request")
     parser.add_argument(
@@ -313,6 +392,12 @@ def main():
             'Example: \'{"gpu_memory_utilization":0.9,"engine_prefill_chunk_size":4096,"tensor_parallel_size":1,"decode_keep_tokens":2048}\''
         ),
     )
+    parser.add_argument(
+        "--output_jsonl",
+        type=str,
+        default=None,
+        help="Optional machine-readable JSONL output path with one row per method/length/batch.",
+    )
     
     args = parser.parse_args()
     try:
@@ -347,13 +432,20 @@ def main():
             if v_res and v_res["status"] == "SUCCESS":
                 vanilla_stats[(length, bs)] = v_res["decode_tp"]
 
+    jsonl_rows: list[dict[str, Any]] = []
     for method in test_methods:
         for length in test_lengths:
             for bs in test_batch_sizes:
                 res = results_dict.get((method, length, bs))
-                if not res or res["status"] in ["FAILED", "OOM"]:
+                if not res or res["status"] in ["FAILED", "OOM", "SKIPPED_BY_POLICY"]:
                     status_str = res["status"] if res else "UNKNOWN"
                     print(f"{method:<12} {length:<8} {bs:<4} {status_str:<10} {'-':<12} {'-':<12} {'-':<10} {'-':<8} {'-':<10} {'-'}")
+                    row = dict(res or {})
+                    row.setdefault("method", method)
+                    row.setdefault("length", int(length))
+                    row.setdefault("batch_size", int(bs))
+                    row.setdefault("status", status_str)
+                    jsonl_rows.append(row)
                     continue
                 
                 ttft = res["ttft"]
@@ -372,7 +464,11 @@ def main():
                 
                 speedup_str = f"{speedup:.2f}x"
                 print(f"{method:<12} {length:<8} {bs_str:<4} {ttft:<10.2f} {pre_tp:<12.1f} {dec_tp:<12.1f} {itl:<10.2f} {avg_bs:<8.1f} {mem:<10.2f} {speedup_str}")
+                row = dict(res)
+                row["speedup_vs_vanilla_decode"] = float(speedup)
+                jsonl_rows.append(row)
     print(f"{ '='*140}\n")
+    _write_jsonl(args.output_jsonl, jsonl_rows)
 
 
 if __name__ == "__main__":

@@ -3,13 +3,15 @@ from __future__ import annotations
 from collections import deque
 from dataclasses import dataclass
 from abc import ABC, abstractmethod
+from typing import Any
 
 import torch
 
 from sparsevllm.config import Config
 from sparsevllm.engine.sequence import Sequence
 from sparsevllm.constant import REDUNDANCY_BATCH_SIZE_FACTOR
-from sparsevllm.method_registry import SUPPORTED_SPARSE_METHODS
+from sparsevllm.method_registry import SUPPORTED_SPARSE_METHODS, normalize_sparse_method
+from sparsevllm.triton_kernel.store_kvcache import store_kvcache
 from sparsevllm.utils.log import logger, log_level
 
 
@@ -24,6 +26,53 @@ class LayerBatchStates:
     context_lens: torch.Tensor | None = None
     max_context_len: int | None = None
     req_indices: torch.Tensor | None = None
+
+
+@dataclass
+class SparseSelection:
+    """Logical token selection produced by SparseController for one layer."""
+
+    kind: str
+    req_indices: torch.Tensor
+    context_lens: torch.Tensor
+    max_context_len: int | None = None
+    attn_score: torch.Tensor | None = None
+    active_indices: torch.Tensor | None = None
+    active_slots: torch.Tensor | None = None
+    active_compressed_indices: torch.Tensor | None = None
+    global_req_indices: torch.Tensor | None = None
+    chunk_lens: torch.Tensor | None = None
+    release_temp_slots: bool = False
+
+
+@dataclass
+class DecodeComputeView:
+    """Physical KV/view tensors consumed by decode attention kernels."""
+
+    k_cache: torch.Tensor
+    v_cache: torch.Tensor
+    active_slots: torch.Tensor
+    req_indices: torch.Tensor
+    context_lens: torch.Tensor
+    attn_score: torch.Tensor | None = None
+    max_context_len: int | None = None
+    temp_slots: torch.Tensor | None = None
+    backend: str = "dense"
+    metadata: dict[str, Any] | None = None
+
+
+@dataclass
+class PrefillComputeView:
+    """Physical KV/view tensors consumed by prefill attention kernels."""
+
+    k_cache: torch.Tensor
+    v_cache: torch.Tensor
+    active_slots: torch.Tensor
+    req_indices: torch.Tensor
+    context_lens: torch.Tensor
+    attn_score: torch.Tensor | None = None
+    max_context_len: int | None = None
+    temp_slots: torch.Tensor | None = None
 
 
 class CacheManager(ABC):
@@ -47,66 +96,21 @@ class CacheManager(ABC):
         self.max_buffer_rows = config.max_num_seqs_in_batch * REDUNDANCY_BATCH_SIZE_FACTOR
 
         self.kv_cache = None
+        self._decode_static_max_context_len: int | None = None
 
     @staticmethod
     def create(config: Config, rank: int, world_size: int) -> "CacheManager":
-        sparse_method = config.vllm_sparse_method
+        sparse_method = normalize_sparse_method(config.vllm_sparse_method)
         model_type = getattr(getattr(config, "hf_config", None), "model_type", "") or ""
 
         if model_type in {"deepseek_v2", "deepseek_v32"}:
             raise NotImplementedError(f"Unsupported Sparse-vLLM model_type={model_type!r}.")
         if sparse_method not in SUPPORTED_SPARSE_METHODS:
             raise ValueError(f"Unsupported vllm_sparse_method={sparse_method!r}.")
-        if model_type == "qwen3" and isinstance(sparse_method, str) and sparse_method.startswith("deltakv"):
-            raise NotImplementedError(
-                "sparsevllm qwen3 + deltakv is disabled for now due to qk-norm/runtime mismatch. "
-                "Use the HF backend for qwen3 DeltaKV inference."
-            )
-
         if sparse_method == "deltakv":
-            from .deltakv import DeltaKVCacheManager
+            from .deltakv_runtime import DeltaKVCacheManager
 
             return DeltaKVCacheManager(config, rank, world_size)
-        if sparse_method in ("deltakv-delta-quant", "deltakv_delta_quant"):
-            # Reuse the standard DeltaKV controller semantics while swapping the
-            # cache manager to a no-checkpoint direct residual quantization path.
-            config.vllm_sparse_method = "deltakv"
-            from .deltakv_delta_quant import DeltaKVDeltaQuantCacheManager
-
-            return DeltaKVDeltaQuantCacheManager(config, rank, world_size)
-        if sparse_method == "deltakv-triton":
-            # Run DeltaKV logic, but use Triton for reconstruction.
-            config.vllm_sparse_method = "deltakv"
-            from .deltakv import DeltaKVCacheTritonManager
-
-            return DeltaKVCacheTritonManager(config, rank, world_size)
-        if sparse_method == "deltakv-triton-v2":
-            # Run DeltaKV logic, but use Triton for reconstruction + eviction.
-            config.vllm_sparse_method = "deltakv"
-            from .deltakv import DeltaKVCacheTritonManagerV2
-
-            return DeltaKVCacheTritonManagerV2(config, rank, world_size)
-        if sparse_method == "deltakv-triton-v3":
-            # Run DeltaKV logic, with Triton for reconstruction + eviction + blockwise L2-topk.
-            config.vllm_sparse_method = "deltakv"
-            from .deltakv import DeltaKVCacheTritonManagerV3
-
-            return DeltaKVCacheTritonManagerV3(config, rank, world_size)
-        if sparse_method == "deltakv-triton-v4":
-            # Run DeltaKV logic, with Triton for reconstruction + eviction + blockwise L2-topk,
-            # and extra kernel fusions (grouped-head reconstruction, fused gather+mean for clustering).
-            config.vllm_sparse_method = "deltakv"
-            from .deltakv import DeltaKVCacheTritonManagerV4
-
-            return DeltaKVCacheTritonManagerV4(config, rank, world_size)
-        if sparse_method == "deltakv-standalone":
-            from .deltakv_standalone import DeltaKVStandaloneCacheManager
-
-            return DeltaKVStandaloneCacheManager(config, rank, world_size)
-        if sparse_method == "deltakv-snapkv":
-            from .deltakv_snapkv import DeltaKVSnapKVCacheManager
-
-            return DeltaKVSnapKVCacheManager(config, rank, world_size)
         if sparse_method in ("streamingllm", "attention-sink", "attention_sink"):
             from .streamingllm import StreamingLLMCacheManager
 
@@ -193,20 +197,223 @@ class CacheManager(ABC):
         raise NotImplementedError
 
     @abstractmethod
-    def get_layer_compute_tensors(self, layer_idx: int, sparse_controller):
+    def get_layer_compute_tensors(self, layer_idx: int, selection: SparseSelection | None = None):
         raise NotImplementedError
+
+    def get_layer_store_tensors(
+        self,
+        layer_idx: int,
+        *,
+        k_post_rope: torch.Tensor,
+        v: torch.Tensor,
+        pre_rope_k: torch.Tensor | None = None,
+        pre_rope_v: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Return the tensors that should be written to the layer's physical KV cache."""
+        del layer_idx, pre_rope_k, pre_rope_v
+        return k_post_rope, v
+
+    def _store_layer_kv(
+        self,
+        layer_idx: int,
+        k: torch.Tensor,
+        v: torch.Tensor,
+    ) -> torch.Tensor:
+        k_cache, v_cache, slot_mapping = self.get_layer_store_view(layer_idx)
+        if slot_mapping is None:
+            raise RuntimeError(f"KV store requires slot_mapping at layer={layer_idx}.")
+        if int(slot_mapping.numel()) != int(k.shape[0]):
+            raise RuntimeError(
+                "KV store shape mismatch: "
+                f"layer={layer_idx} k={tuple(k.shape)} v={tuple(v.shape)} "
+                f"slot_mapping={tuple(slot_mapping.shape)}."
+            )
+        store_kvcache(k, v, k_cache, v_cache, slot_mapping)
+        return slot_mapping
+
+    def save_raw_kv_if_needed(
+        self,
+        layer_idx: int,
+        k: torch.Tensor,
+        v: torch.Tensor,
+    ):
+        """Optional pre-norm/pre-RoPE KV storage point."""
+        del layer_idx, k, v
+        return None
+
+    def save_rope_kv_if_needed(
+        self,
+        layer_idx: int,
+        k_post_rope: torch.Tensor,
+        v: torch.Tensor,
+    ):
+        """Store the post-RoPE KV representation used by ordinary cache layouts."""
+        store_k, store_v = self.get_layer_store_tensors(
+            layer_idx,
+            k_post_rope=k_post_rope,
+            v=v,
+        )
+        slot_mapping = self._store_layer_kv(layer_idx, store_k, store_v)
+        self.on_kv_stored(
+            layer_idx,
+            store_k,
+            slot_mapping,
+        )
+
+    def get_layer_compute_view(
+        self,
+        layer_idx: int,
+        active_slots: torch.Tensor,
+        req_indices: torch.Tensor,
+        context_lens: torch.Tensor,
+        selection: SparseSelection | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Return KV tensors and logical view used by attention kernels."""
+        try:
+            k_cache, v_cache = self.get_layer_compute_tensors(layer_idx, selection)
+        except NotImplementedError:
+            k_cache, v_cache = self.get_layer_kv_cache(layer_idx)
+        return k_cache, v_cache, active_slots, req_indices, context_lens
+
+    def get_prefill_compute_view(
+        self,
+        layer_idx: int,
+        k_current: torch.Tensor,
+        v_current: torch.Tensor,
+        selection: SparseSelection,
+        active_slots: torch.Tensor,
+        req_indices: torch.Tensor,
+        context_lens: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Return KV tensors and logical view used by prefill attention kernels."""
+        del k_current, v_current
+        return self.get_layer_compute_view(
+            layer_idx,
+            active_slots,
+            req_indices,
+            context_lens,
+            selection,
+        )
+
+    def _default_active_slots_for_selection(self, layer_idx: int, selection: SparseSelection) -> torch.Tensor:
+        if selection.active_slots is not None:
+            return selection.active_slots
+        return self.get_layer_buffer_req_to_token_slots(layer_idx)
+
+    def build_prefill_compute_view(
+        self,
+        layer_idx: int,
+        k_current: torch.Tensor,
+        v_current: torch.Tensor,
+        selection: SparseSelection,
+    ) -> PrefillComputeView:
+        temp_slots = None
+        if self.has_prefill_staging_view(layer_idx):
+            active_slots, req_indices, context_lens, temp_slots = self.get_prefill_staging_view(layer_idx)
+        elif self.has_full_layer_quantized_view(layer_idx):
+            active_slots, req_indices, context_lens = self.build_full_layer_quantized_view(
+                layer_idx,
+                selection.req_indices,
+                selection.context_lens,
+            )
+        else:
+            active_slots = self._default_active_slots_for_selection(layer_idx, selection)
+            req_indices = selection.req_indices
+            context_lens = selection.context_lens
+        k_cache, v_cache, active_slots, req_indices, context_lens = self.get_prefill_compute_view(
+            layer_idx,
+            k_current,
+            v_current,
+            selection,
+            active_slots,
+            req_indices,
+            context_lens,
+        )
+        return PrefillComputeView(
+            k_cache=k_cache,
+            v_cache=v_cache,
+            active_slots=active_slots,
+            req_indices=req_indices,
+            context_lens=context_lens,
+            attn_score=selection.attn_score,
+            max_context_len=selection.max_context_len,
+            temp_slots=temp_slots,
+        )
 
     @abstractmethod
     def get_layer_buffer_req_to_token_slots(self, layer_idx: int) -> torch.Tensor:
         raise NotImplementedError
 
-    def on_kv_stored(self, layer_idx: int, k: torch.Tensor, slot_mapping: torch.Tensor):
+    def on_kv_stored(
+        self,
+        layer_idx: int,
+        k: torch.Tensor,
+        slot_mapping: torch.Tensor,
+    ):
         """Optional method-specific hook after KV has been written into cache."""
+        return None
+
+    def on_pre_rope_kv_stored(
+        self,
+        layer_idx: int,
+        k: torch.Tensor | None,
+        v: torch.Tensor | None,
+        slot_mapping: torch.Tensor,
+    ):
+        """Optional hook for methods that need RoPE-independent KV metadata."""
         return None
 
     def on_layer_attention_end(self, layer_idx: int):
         """Optional method-specific hook after a layer's attention has consumed KV."""
         return None
+
+    def release_layer_temp_slots(self, layer_idx: int, temp_slots: torch.Tensor | None):
+        """Release temporary physical slots returned with a layer read/compute view."""
+        del layer_idx, temp_slots
+        return None
+
+    def decode_cuda_graph_keepalive_tensors(self) -> list[torch.Tensor]:
+        """Cache-manager-owned tensors captured by decode CUDA graphs."""
+        return []
+
+    def decode_cuda_graph_max_cached_graphs(self) -> int | None:
+        """Optional bound for captured decode graph states.
+
+        Applies to every sparse method; individual managers may still override it.
+        """
+        value = getattr(self.config, "decode_cuda_graph_max_cached_graphs", None)
+        return None if value is None else int(value)
+
+    def select_decode_cuda_graph_batch_size(
+        self,
+        real_batch_size: int,
+        capture_sizes: list[int],
+    ) -> int | None:
+        """Optional method-specific graph batch-size selection.
+
+        Return None to use the runner's standard capture-size buckets.
+        """
+        del real_batch_size, capture_sizes
+        return None
+
+    def decode_cuda_graph_context_capacity(
+        self,
+        seqs: list[Sequence],
+        *,
+        requested_context_capacity: int,
+        current_context_capacity: int,
+    ) -> tuple[int, bool] | None:
+        """Optional method-specific graph context-capacity policy.
+
+        Returns (context_capacity, allow_larger_cached_capacity), or None to use
+        the runner's default requested-capacity graph policy.
+        """
+        del seqs, requested_context_capacity, current_context_capacity
+        return None
+
+    def decode_cuda_graph_force_eager(self) -> bool:
+        """Whether this method should bypass graph replay for diagnostics."""
+        return False
 
     def has_prefill_staging_view(self, layer_idx: int) -> bool:
         """Whether the current prefill layer should read from a temporary staging KV view."""
@@ -217,6 +424,19 @@ class CacheManager(ABC):
         layer_idx: int,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None]:
         """Return (active_slots, req_indices, context_lens, temp_slots) for prefill staging."""
+        raise NotImplementedError
+
+    def has_full_layer_quantized_view(self, layer_idx: int) -> bool:
+        """Whether a full-attention layer should read a reconstructed quantized KV view."""
+        return False
+
+    def build_full_layer_quantized_view(
+        self,
+        layer_idx: int,
+        req_indices: torch.Tensor,
+        context_lens: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Return (active_slots, local_req_indices, context_lens) for quantized full layers."""
         raise NotImplementedError
 
     def build_decode_view(
@@ -233,15 +453,67 @@ class CacheManager(ABC):
         """Optional method-specific decode-time logical view builder."""
         return active_slots, req_indices, context_lens
 
+    def build_decode_compute_view(
+        self,
+        layer_idx: int,
+        q: torch.Tensor,
+        selection: SparseSelection,
+        *,
+        num_heads: int,
+        num_kv_heads: int,
+    ) -> DecodeComputeView:
+        if self.has_full_layer_quantized_view(layer_idx):
+            active_slots, req_indices, context_lens = self.build_full_layer_quantized_view(
+                layer_idx,
+                selection.req_indices,
+                selection.context_lens,
+            )
+        else:
+            active_slots = self._default_active_slots_for_selection(layer_idx, selection)
+            active_slots, req_indices, context_lens = self.build_decode_view(
+                layer_idx,
+                q,
+                active_slots,
+                selection.req_indices,
+                selection.context_lens,
+                num_heads=num_heads,
+                num_kv_heads=num_kv_heads,
+            )
+        k_cache, v_cache, active_slots, req_indices, context_lens = self.get_layer_compute_view(
+            layer_idx,
+            active_slots,
+            req_indices,
+            context_lens,
+            selection,
+        )
+        return DecodeComputeView(
+            k_cache=k_cache,
+            v_cache=v_cache,
+            active_slots=active_slots,
+            req_indices=req_indices,
+            context_lens=context_lens,
+            attn_score=selection.attn_score,
+            max_context_len=selection.max_context_len,
+        )
+
+    def get_decode_block_seq(self, layer_idx: int, default: int) -> int:
+        """Optional per-layer decode stage block size override."""
+        return int(default)
+
     def set_decode_static_max_context_len(self, max_context_len: int):
         """Pin graph-captured decode kernels to a fixed max context length."""
         max_context_len = int(max_context_len)
+        self._decode_static_max_context_len = max_context_len
         layer_batch_state = getattr(self, "layer_batch_state", None)
         if layer_batch_state is not None:
             layer_batch_state.max_context_len = max_context_len
         layer_batch_states = getattr(self, "layer_batch_states", None)
         if layer_batch_states is not None:
             for state in layer_batch_states:
+                state.max_context_len = max_context_len
+        for attr_name in ("full_layer_batch_states", "deltakv_layer_batch_states"):
+            state = getattr(self, attr_name, None)
+            if state is not None:
                 state.max_context_len = max_context_len
 
     @property
@@ -286,6 +558,14 @@ class CacheManager(ABC):
         """
         return int(self.num_free_slots)
 
+    def should_schedule_full_prefill(self, seq: Sequence) -> bool:
+        """Whether scheduler should route this first prefill as a full bs1 step."""
+        return False
+
+    def is_full_prefill_step(self, seqs: list[Sequence]) -> bool:
+        """Whether the current prepared prefill step is backed by a full-prefill staging view."""
+        return False
+
     def prompt_admission_free_slots(self) -> int:
         """Slots pool used to decide whether a new prompt can be admitted."""
         return int(self.num_free_slots)
@@ -328,6 +608,175 @@ class CacheManager(ABC):
     def free_slot_stats(self) -> dict[str, int]:
         """Return a small set of free-slot stats for logging/debugging."""
         return {"free_slots": int(self.num_free_slots)}
+
+    def _cache_slot_dtype_size(self) -> int:
+        dtype = getattr(self.hf_config, "torch_dtype", torch.float16)
+        if not isinstance(dtype, torch.dtype):
+            dtype = torch.float16
+        return int(torch.tensor([], dtype=dtype).element_size())
+
+    def _dense_baseline_slots(self) -> int:
+        slot_candidates = [
+            getattr(self.config, "num_kvcache_slots", None),
+            getattr(self, "num_slots", None),
+            getattr(self, "full_num_slots", None),
+            getattr(self, "deltakv_latent_num_slots", None),
+            getattr(self, "deltakv_full_num_slots", None),
+        ]
+        slots = [int(value) for value in slot_candidates if isinstance(value, (int, float)) and int(value) > 0]
+        if slots:
+            return max(slots)
+        return int(getattr(self.config, "max_num_seqs_in_batch", 1)) * int(self.max_model_len)
+
+    def _dense_baseline_bytes(self) -> int:
+        dtype_size = self._cache_slot_dtype_size()
+        slots = self._dense_baseline_slots()
+        return int(slots * self.num_layers * 2 * self.num_kv_heads * self.head_dim * dtype_size)
+
+    @staticmethod
+    def _tensor_storage_key(tensor: torch.Tensor) -> tuple[Any, ...]:
+        storage = tensor.untyped_storage()
+        return (
+            str(tensor.device),
+            int(storage.data_ptr()),
+            int(storage.nbytes()),
+        )
+
+    @staticmethod
+    def _tensor_storage_nbytes(tensor: torch.Tensor) -> int:
+        return int(tensor.untyped_storage().nbytes())
+
+    def _iter_accounting_tensors(self):
+        seen_containers: set[int] = set()
+
+        def visit(path: str, value):
+            if torch.is_tensor(value):
+                yield path, value
+                return
+            if value is None or isinstance(value, (str, bytes, int, float, bool)):
+                return
+            obj_id = id(value)
+            if obj_id in seen_containers:
+                return
+            seen_containers.add(obj_id)
+            if isinstance(value, dict):
+                for key, item in value.items():
+                    if isinstance(key, (str, int)):
+                        child_path = f"{path}.{key}"
+                    else:
+                        child_path = f"{path}.{type(key).__name__}"
+                    yield from visit(child_path, item)
+                return
+            if isinstance(value, (list, tuple)):
+                for idx, item in enumerate(value):
+                    yield from visit(f"{path}.{idx}", item)
+                return
+            if isinstance(value, LayerBatchStates):
+                for field_name, item in value.__dict__.items():
+                    yield from visit(f"{path}.{field_name}", item)
+
+        for name, value in self.__dict__.items():
+            if name in {"config", "hf_config"}:
+                continue
+            yield from visit(name, value)
+
+    @staticmethod
+    def _memory_accounting_category(path: str) -> str:
+        lower = path.lower()
+        if any(token in lower for token in ("slot", "mapping", "req_to_token", "_map", "map_")):
+            return "slot_map"
+        if any(token in lower for token in ("scale", "scales", "min", "mins", "zero")):
+            return "scale_min_metadata"
+        if any(token in lower for token in ("pos", "lens", "length", "score", "indices", "idx")):
+            return "metadata"
+        if "cache" in lower:
+            return "kv_or_latent"
+        return "other"
+
+    def _logical_live_kv_bytes(self) -> int:
+        row_seq_lens = getattr(self, "row_seq_lens", None)
+        if row_seq_lens is None:
+            return 0
+        try:
+            live_tokens = int(row_seq_lens.sum())
+        except Exception:
+            return 0
+        dtype_size = self._cache_slot_dtype_size()
+        return int(live_tokens * self.num_layers * 2 * self.num_kv_heads * self.head_dim * dtype_size)
+
+    def memory_accounting(self) -> dict[str, Any]:
+        """Return read-only tensor memory accounting for regression gates.
+
+        The accounting is intentionally generic: cache-manager-specific tensors are
+        grouped by stable attribute-name patterns, and unique tensor storages are
+        counted once so views do not inflate the result.
+        """
+        seen_storages: set[tuple[Any, ...]] = set()
+        categories = {
+            "kv_or_latent": 0,
+            "slot_map": 0,
+            "scale_min_metadata": 0,
+            "metadata": 0,
+            "other": 0,
+        }
+        tensors: list[dict[str, Any]] = []
+        for path, tensor in self._iter_accounting_tensors():
+            key = self._tensor_storage_key(tensor)
+            if key in seen_storages:
+                continue
+            seen_storages.add(key)
+            nbytes = self._tensor_storage_nbytes(tensor)
+            category = self._memory_accounting_category(path)
+            categories[category] += nbytes
+            tensors.append(
+                {
+                    "path": path,
+                    "shape": list(tensor.shape),
+                    "dtype": str(tensor.dtype),
+                    "device": str(tensor.device),
+                    "nbytes": nbytes,
+                    "category": category,
+                }
+            )
+
+        dense_baseline_bytes = self._dense_baseline_bytes()
+        allocated_tensor_bytes = int(sum(categories.values()))
+        metadata_bytes = int(
+            categories["slot_map"] + categories["scale_min_metadata"] + categories["metadata"]
+        )
+        observed_savings = None
+        if dense_baseline_bytes > 0:
+            observed_savings = 1.0 - (allocated_tensor_bytes / dense_baseline_bytes)
+
+        theoretical = getattr(self.config, "memory_expected_savings", None)
+        if theoretical is not None:
+            theoretical = float(theoretical)
+
+        return {
+            "status": "success",
+            "cache_manager_class": type(self).__name__,
+            "dense_baseline_bytes": int(dense_baseline_bytes),
+            "allocated_tensor_bytes": allocated_tensor_bytes,
+            "logical_live_kv_bytes": int(self._logical_live_kv_bytes()),
+            "slot_map_bytes": int(categories["slot_map"]),
+            "scale_min_metadata_bytes": int(categories["scale_min_metadata"]),
+            "metadata_bytes": metadata_bytes,
+            "kv_or_latent_tensor_bytes": int(categories["kv_or_latent"]),
+            "other_tensor_bytes": int(categories["other"]),
+            "theoretical_savings": theoretical,
+            "observed_savings": observed_savings,
+            "tensor_count": len(tensors),
+            "unique_storage_count": len(seen_storages),
+            "dense_baseline": {
+                "slots": int(self._dense_baseline_slots()),
+                "layers": int(self.num_layers),
+                "num_kv_heads": int(self.num_kv_heads),
+                "head_dim": int(self.head_dim),
+                "dtype_size": int(self._cache_slot_dtype_size()),
+            },
+            "by_category": categories,
+            "tensors": tensors,
+        }
 
     def debug_live_seq_slots(self) -> dict[int, int]:
         """Return live seq_id -> occupied slot count for debugging."""

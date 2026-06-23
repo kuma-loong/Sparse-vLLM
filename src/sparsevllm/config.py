@@ -1,17 +1,21 @@
 import os
 from dataclasses import dataclass
-from transformers import AutoConfig, Qwen3Config
+from transformers import AutoConfig
 from typing import Union
 from sparsevllm.method_registry import (
     DECODE_CUDA_GRAPH_SUPPORTED_METHODS,
     PREFILL_POLICY_AUTO,
     SUPPORTED_SPARSE_METHODS,
     is_decode_cuda_graph_supported,
-    is_deltakv_method,
     normalize_sparse_method,
     resolve_prefill_schedule_policy,
 )
 from sparsevllm.utils.log import logger
+
+try:
+    from transformers import Qwen3Config
+except ImportError:
+    Qwen3Config = AutoConfig
 
 
 def _default_decode_cuda_graph_capture_sizes(max_decoding_seqs: int) -> list[int]:
@@ -67,6 +71,69 @@ def _resolve_decode_cuda_graph_capture_sizes(
     return sizes
 
 
+def _default_decode_cuda_graph_context_sizes(max_model_len: int) -> list[int]:
+    """Default decode graph context buckets: 1k, 2k, 4k, ... up to max_model_len."""
+    max_model_len = int(max_model_len)
+    if max_model_len <= 0:
+        raise ValueError(f"max_model_len must be > 0, got {max_model_len}.")
+
+    size = min(1024, max_model_len)
+    sizes: list[int] = []
+    while size < max_model_len:
+        sizes.append(size)
+        size *= 2
+    sizes.append(size)
+    return sorted(set(sizes))
+
+
+def _resolve_decode_cuda_graph_context_sizes(
+    value: str | int | list[int] | tuple[int, ...] | None,
+    max_model_len: int,
+) -> list[int]:
+    if value is None:
+        sizes = _default_decode_cuda_graph_context_sizes(max_model_len)
+    elif isinstance(value, str):
+        raw = value.strip().lower()
+        if raw in {"", "auto"}:
+            sizes = _default_decode_cuda_graph_context_sizes(max_model_len)
+        else:
+            try:
+                sizes = [int(part.strip()) for part in value.split(",") if part.strip()]
+            except ValueError as exc:
+                raise ValueError(
+                    "decode_cuda_graph_context_sizes must be 'auto' or a comma-separated "
+                    f"integer list, got {value!r}."
+                ) from exc
+    elif isinstance(value, int):
+        sizes = [int(value)]
+    elif isinstance(value, (list, tuple)):
+        sizes = [int(item) for item in value]
+    else:
+        raise ValueError(
+            "decode_cuda_graph_context_sizes must be 'auto', an int, a list/tuple of ints, "
+            f"or None, got {type(value).__name__}."
+        )
+
+    sizes = sorted(set(sizes))
+    if not sizes or any(size <= 0 for size in sizes):
+        raise ValueError(f"decode_cuda_graph_context_sizes must contain positive integers, got {sizes}.")
+    return sizes
+
+
+def _normalize_decode_cuda_graph_context_policy(value: str | None) -> str:
+    policy = str(value or "current").strip().lower()
+    if policy in {"cur", "now"}:
+        return "current"
+    if policy in {"request", "final"}:
+        return "requested"
+    if policy not in {"current", "requested"}:
+        raise ValueError(
+            "decode_cuda_graph_context_policy must be 'current' or 'requested', "
+            f"got {policy!r}."
+        )
+    return policy
+
+
 @dataclass
 class Config:
     model: str
@@ -86,22 +153,30 @@ class Config:
     num_kvcache_slots: int | list = -1
 
     # Sparse Attention Config
-    vllm_sparse_method: str = ""  # "", "streamingllm", "attention-sink", "attention_sink", "snapkv", "omnikv", "quest", "deltakv", "deltakv-triton", "deltakv-triton-v2", "deltakv-triton-v3", "deltakv-triton-v4", "deltakv-delta-quant", "deltakv_delta_quant", "deltakv-standalone", "deltakv-snapkv", "pyramidkv"
+    vllm_sparse_method: str = ""  # "", "streamingllm", "snapkv", "pyramidkv", "omnikv", "quest", "deltakv"; legacy deltakv-less-memory aliases normalize to deltakv.
 
     # General Sparse Config
     num_sink_tokens: int = 64
     num_recent_tokens: int = 512
-    num_top_tokens: int = 4096
+    decode_keep_tokens: int = 4096
 
     # OmniKV Config
     obs_layer_ids: list[int] = None  # None means auto-calculate based on full_attn_layers (useful for omnikv)
     full_attn_layers: str | list[int] = "0" # useful for omnikv
-    chunk_prefill_accel_omnikv: bool = False
-    num_top_tokens_in_prefill: int | None = 8192
     decode_cuda_graph: bool = False
     decode_cuda_graph_capture_sampling: bool = False
     decode_cuda_graph_capture_sizes: str | int | list[int] | tuple[int, ...] | None = "auto"
+    # Static decode/CUDA graph context buckets.  The default produces
+    # 1024, 2048, 4096, ... up to max_model_len so a short request never
+    # inherits a previously captured 128k graph.
+    decode_cuda_graph_context_sizes: str | int | list[int] | tuple[int, ...] | None = "auto"
+    # "current" buckets by the real current decode length; "requested" keeps
+    # the old final-length capacity behavior for compatibility/debugging.
+    decode_cuda_graph_context_policy: str = "current"
+    # Optional LRU cap for captured graphs.  None keeps all bucketed graphs.
+    decode_cuda_graph_max_cached_graphs: int | None = None
     omnikv_decode_cuda_graph: bool = False
+    sparse_attn_score_dtype: str = "float32"
 
     # QuEST Config
     quest_chunk_size: int = 16
@@ -124,8 +199,30 @@ class Config:
     deltakv_k_neighbors: int = 4
     cluster_ratio: float = 0.1
     cluster_metric: str = 'l2'  # 'l2', 'dot', 'cosine', 'fastdot' (approx; fastest)
+    cluster_on_kv: bool = True
+    use_compression: bool = True
     kv_compressed_size: int = 128
     kv_quant_bits: int = 4
+    kv_quant_group_size: int = 0
+    enable_sparse_ref_fp8: bool = False
+    # Optional residual quantization for layers listed in full_attn_layers.
+    # 0 keeps the previous BF16/FP16 full-layer KV behavior. 2/4 store old
+    # full-layer tokens as DeltaKV-style residuals and reconstruct a dense view
+    # before full attention.
+    full_layer_kv_quant_bits: int = 0
+    full_layer_cluster_ratio: float = 0.0  # <=0 reuses cluster_ratio
+    full_layer_kivi_group_size: int = 32
+    full_layer_kivi_residual_length: int = 32
+    full_layer_kivi_decode_block_seq: int = 256
+    full_layer_kivi_decode_block_n: int = 16
+    full_layer_kivi_decode_num_warps: int = 2
+    full_layer_kivi_decode_num_stages: int = 3
+    enable_full_layer_kivi_quant: bool = True
+    enable_full_layer_kivi_fused_decode: bool = False
+    enable_full_layer_kivi_grouped_decode: bool = False
+    # Legacy config compatibility only. Full-layer KIVI decode uses the direct
+    # packed backend whenever KIVI quantization is enabled.
+    enable_full_layer_kivi_dense_decode: bool = False
     pool_kernel_size: int = 1
     # Legacy symmetric compressor controls (for backward compatibility).
     use_nonlinear_compressor: bool = True
@@ -141,6 +238,13 @@ class Config:
     # (centers + buffer + temp reconstruction slots). Larger values reduce full/latent capacity
     # but improve robustness at large batch sizes / long contexts.
     deltakv_full_pool_reserve_ratio: float = 0.1
+    # Cap DeltaKV packed-cache capacity to the configured resident
+    # token budget instead of consuming all available memory. This keeps long
+    # context experiments reproducible and leaves workspace memory for kernels.
+    deltakv_cache_capacity_margin: float = 1.05
+    # Extra center slots above the exact fixed-stride center-policy estimate.
+    # This avoids allocating cluster_ratio * max_tokens plus no scheduling margin.
+    deltakv_center_capacity_margin: float = 1.5
     # Triton kernels: group multiple KV heads per program to reduce redundant loads.
     deltakv_triton_gather_heads_per_program: int = 4
     deltakv_triton_reconstruct_heads_per_program: int = 4
@@ -155,7 +259,14 @@ class Config:
     def __post_init__(self):
         if os.getenv("PROFILER_SVLLM"):
             self.enable_profiler = True
-            
+
+        raw_sparse_method = self.vllm_sparse_method
+        raw_sparse_method_normalized = "" if raw_sparse_method is None else str(raw_sparse_method).strip().lower()
+        legacy_deltakv_graph_method = raw_sparse_method_normalized in {
+            "deltakv-less-memory-cudagraph",
+            "deltakv_less_memory_cudagraph",
+        }
+
         self.vllm_sparse_method = normalize_sparse_method(self.vllm_sparse_method)
         if self.vllm_sparse_method not in SUPPORTED_SPARSE_METHODS:
             supported = ", ".join(repr(method) for method in sorted(SUPPORTED_SPARSE_METHODS) if method)
@@ -168,8 +279,6 @@ class Config:
             self.prefill_schedule_policy,
         )
         
-        if self.num_top_tokens_in_prefill is None:
-            self.num_top_tokens_in_prefill = self.num_top_tokens
         if int(self.mlp_chunk_size) <= 0:
             raise ValueError(f"mlp_chunk_size must be > 0, got {self.mlp_chunk_size}.")
         self.mlp_chunk_size = int(self.mlp_chunk_size)
@@ -179,6 +288,96 @@ class Config:
                 f"got {self.deltakv_cluster_gather_chunk_size}."
             )
         self.deltakv_cluster_gather_chunk_size = int(self.deltakv_cluster_gather_chunk_size)
+        self.sparse_attn_score_dtype = str(self.sparse_attn_score_dtype or "float32").strip().lower()
+        if self.sparse_attn_score_dtype not in {"float32", "bfloat16", "float16"}:
+            raise ValueError(
+                "sparse_attn_score_dtype must be 'float32', 'bfloat16', or 'float16', "
+                f"got {self.sparse_attn_score_dtype!r}."
+            )
+        self.full_layer_kv_quant_bits = int(self.full_layer_kv_quant_bits or 0)
+        if self.full_layer_kv_quant_bits not in (0, 2, 4):
+            raise ValueError(
+                "full_layer_kv_quant_bits must be 0, 2, or 4, "
+                f"got {self.full_layer_kv_quant_bits}."
+            )
+        self.full_layer_cluster_ratio = float(self.full_layer_cluster_ratio or 0.0)
+        if self.full_layer_cluster_ratio < 0.0:
+            raise ValueError(f"full_layer_cluster_ratio must be >= 0, got {self.full_layer_cluster_ratio}.")
+        self.kv_quant_bits = int(self.kv_quant_bits or 0)
+        if self.kv_quant_bits not in (0, 2, 4):
+            raise ValueError(f"kv_quant_bits must be 0, 2, or 4, got {self.kv_quant_bits}.")
+        self.kv_quant_group_size = int(self.kv_quant_group_size or 0)
+        if self.kv_quant_group_size < 0:
+            raise ValueError(f"kv_quant_group_size must be >= 0, got {self.kv_quant_group_size}.")
+        self.full_layer_kivi_group_size = int(self.full_layer_kivi_group_size or 32)
+        if self.full_layer_kivi_group_size <= 0:
+            raise ValueError(
+                "full_layer_kivi_group_size must be > 0, "
+                f"got {self.full_layer_kivi_group_size}."
+            )
+        self.full_layer_kivi_residual_length = int(
+            self.full_layer_kivi_residual_length or self.full_layer_kivi_group_size
+        )
+        if self.full_layer_kivi_residual_length <= 0:
+            raise ValueError(
+                "full_layer_kivi_residual_length must be > 0, "
+                f"got {self.full_layer_kivi_residual_length}."
+            )
+        self.full_layer_kivi_decode_block_seq = int(self.full_layer_kivi_decode_block_seq or 256)
+        if self.full_layer_kivi_decode_block_seq <= 0 or self.full_layer_kivi_decode_block_seq % 16 != 0:
+            raise ValueError(
+                "full_layer_kivi_decode_block_seq must be a positive multiple of 16, "
+                f"got {self.full_layer_kivi_decode_block_seq}."
+            )
+        self.full_layer_kivi_decode_block_n = int(self.full_layer_kivi_decode_block_n or 16)
+        if self.full_layer_kivi_decode_block_n <= 0 or self.full_layer_kivi_decode_block_n % 16 != 0:
+            raise ValueError(
+                "full_layer_kivi_decode_block_n must be a positive multiple of 16, "
+                f"got {self.full_layer_kivi_decode_block_n}."
+            )
+        self.full_layer_kivi_decode_num_warps = int(self.full_layer_kivi_decode_num_warps or 2)
+        if self.full_layer_kivi_decode_num_warps not in {1, 2, 4, 8}:
+            raise ValueError(
+                "full_layer_kivi_decode_num_warps must be one of 1, 2, 4, or 8, "
+                f"got {self.full_layer_kivi_decode_num_warps}."
+            )
+        self.full_layer_kivi_decode_num_stages = int(self.full_layer_kivi_decode_num_stages or 3)
+        if self.full_layer_kivi_decode_num_stages <= 0:
+            raise ValueError(
+                "full_layer_kivi_decode_num_stages must be > 0, "
+                f"got {self.full_layer_kivi_decode_num_stages}."
+            )
+        self.enable_full_layer_kivi_fused_decode = bool(self.enable_full_layer_kivi_fused_decode)
+        self.enable_full_layer_kivi_grouped_decode = bool(self.enable_full_layer_kivi_grouped_decode)
+        self.enable_full_layer_kivi_dense_decode = bool(self.enable_full_layer_kivi_dense_decode)
+        if self.enable_full_layer_kivi_fused_decode:
+            raise ValueError(
+                "enable_full_layer_kivi_fused_decode was removed; full-layer KIVI decode now "
+                "uses the direct packed backend."
+            )
+        if self.enable_full_layer_kivi_grouped_decode:
+            raise ValueError(
+                "enable_full_layer_kivi_grouped_decode was removed; full-layer KIVI decode now "
+                "uses the direct packed backend."
+            )
+        self.deltakv_full_pool_reserve_ratio = float(self.deltakv_full_pool_reserve_ratio or 0.0)
+        if self.deltakv_full_pool_reserve_ratio < 0.0 or self.deltakv_full_pool_reserve_ratio >= 1.0:
+            raise ValueError(
+                "deltakv_full_pool_reserve_ratio must be in [0, 1), "
+                f"got {self.deltakv_full_pool_reserve_ratio}."
+            )
+        self.deltakv_cache_capacity_margin = float(self.deltakv_cache_capacity_margin or 1.0)
+        if self.deltakv_cache_capacity_margin < 1.0:
+            raise ValueError(
+                "deltakv_cache_capacity_margin must be >= 1.0, "
+                f"got {self.deltakv_cache_capacity_margin}."
+            )
+        self.deltakv_center_capacity_margin = float(self.deltakv_center_capacity_margin or 1.0)
+        if self.deltakv_center_capacity_margin < 1.0:
+            raise ValueError(
+                "deltakv_center_capacity_margin must be >= 1.0, "
+                f"got {self.deltakv_center_capacity_margin}."
+            )
 
         if not os.path.isdir(self.model):
             raise FileNotFoundError(f"Model directory does not exist: {self.model}")
@@ -188,8 +387,17 @@ class Config:
         if not 1 <= self.tensor_parallel_size <= 8:
             raise ValueError(f"tensor_parallel_size must be in [1, 8], got {self.tensor_parallel_size}.")
         self.decode_cuda_graph = bool(self.decode_cuda_graph)
+        if legacy_deltakv_graph_method:
+            self.decode_cuda_graph = True
         self.decode_cuda_graph_capture_sampling = bool(self.decode_cuda_graph_capture_sampling)
         self.omnikv_decode_cuda_graph = bool(self.omnikv_decode_cuda_graph)
+        if self.decode_cuda_graph_max_cached_graphs is not None:
+            self.decode_cuda_graph_max_cached_graphs = int(self.decode_cuda_graph_max_cached_graphs)
+            if self.decode_cuda_graph_max_cached_graphs <= 0:
+                raise ValueError(
+                    "decode_cuda_graph_max_cached_graphs must be a positive integer or None, "
+                    f"got {self.decode_cuda_graph_max_cached_graphs}."
+                )
         if self.omnikv_decode_cuda_graph:
             if self.vllm_sparse_method != "omnikv":
                 raise ValueError(
@@ -198,22 +406,24 @@ class Config:
             self.decode_cuda_graph = True
         if self.decode_cuda_graph_capture_sampling and not self.decode_cuda_graph:
             raise ValueError("decode_cuda_graph_capture_sampling requires decode_cuda_graph=True.")
+        self.decode_cuda_graph_context_policy = _normalize_decode_cuda_graph_context_policy(
+            self.decode_cuda_graph_context_policy
+        )
         if self.decode_cuda_graph:
             if not is_decode_cuda_graph_supported(self.vllm_sparse_method):
-                if is_deltakv_method(self.vllm_sparse_method):
-                    raise ValueError("decode_cuda_graph does not support DeltaKV methods yet.")
                 supported = ", ".join(
                     repr(method) for method in sorted(DECODE_CUDA_GRAPH_SUPPORTED_METHODS) if method
                 )
-                raise ValueError(
-                    "decode_cuda_graph supports non-DeltaKV methods only. "
-                    f"Supported methods: '', {supported}."
-                )
+                raise ValueError(f"decode_cuda_graph supports these methods only: '', {supported}.")
             if self.tensor_parallel_size != 1:
                 raise ValueError("decode_cuda_graph currently supports tensor_parallel_size=1 only.")
             self.decode_cuda_graph_capture_sizes = _resolve_decode_cuda_graph_capture_sizes(
                 self.decode_cuda_graph_capture_sizes,
                 self.max_decoding_seqs,
+            )
+            self.decode_cuda_graph_context_sizes = _resolve_decode_cuda_graph_context_sizes(
+                self.decode_cuda_graph_context_sizes,
+                self.max_model_len,
             )
         if isinstance(self.deltakv_path, str):
             deltakv_path = self.deltakv_path.strip()
@@ -228,7 +438,7 @@ class Config:
         if getattr(self.hf_config, "model_type", "") in {"deepseek_v2", "deepseek_v32"}:
             raise NotImplementedError(
                 f"Unsupported Sparse-vLLM model_type={self.hf_config.model_type!r}. "
-                "Supported model types: qwen2, qwen3."
+                "Supported model types: qwen2, qwen3, llama."
             )
         if self.max_model_len > self.hf_config.max_position_embeddings:
             logger.warning('max_model_len > model.max_position_embeddings 输出可能不正常')
@@ -256,31 +466,44 @@ class Config:
             v = str(v).strip().lower()
             setattr(self, attr, v if v else "auto")
 
-        if (
-            isinstance(self.vllm_sparse_method, str)
-            and self.vllm_sparse_method.startswith("deltakv")
-            and self.vllm_sparse_method not in {
-                "deltakv-standalone",
-                "deltakv-snapkv",
-                "deltakv-delta-quant",
-                "deltakv_delta_quant",
-            }
-            and self.deltakv_path is None
-            and not self.allow_missing_deltakv_path
-        ):
-            raise ValueError(
-                "DeltaKV compressor mode requires deltakv_path. Pass deltakv_path explicitly, "
-                "use a no-checkpoint method such as deltakv-standalone/deltakv-snapkv/"
-                "deltakv-delta-quant, or set allow_missing_deltakv_path=True only for an "
-                "explicitly validated ablation."
+        if self.vllm_sparse_method == "deltakv":
+            if not bool(getattr(self, "use_compression", True)):
+                raise ValueError("DeltaKV runtime is compressor-only; set use_compression=True.")
+            if bool(getattr(self, "enable_sparse_ref_fp8", False)):
+                raise ValueError("enable_sparse_ref_fp8 was removed from the slim DeltaKV runtime.")
+            if self.deltakv_path is None and not self.allow_missing_deltakv_path:
+                raise ValueError(
+                    "DeltaKV requires deltakv_path for compressor sparse layers. "
+                    "Set allow_missing_deltakv_path=True only for construction-only tests."
+                )
+            if self.kv_quant_bits not in (0, 4):
+                raise ValueError(
+                    "DeltaKV slim runtime supports sparse compressor residual bits 0 or 4 only, "
+                    f"got kv_quant_bits={self.kv_quant_bits}."
+                )
+            if self.full_layer_kv_quant_bits not in (0, 4):
+                raise ValueError(
+                    "DeltaKV slim runtime supports full-layer storage bits 0 or 4 only, "
+                    f"got full_layer_kv_quant_bits={self.full_layer_kv_quant_bits}."
+                )
+            if self.kv_quant_bits == 4 and self.kv_quant_group_size == 0:
+                self.kv_quant_group_size = 32
+            is_bf16_full_compressor_sparse = (
+                self.full_layer_kv_quant_bits == 0 and self.kv_quant_bits == 0
             )
+            is_kivi4_full_int4_compressor_sparse = (
+                self.full_layer_kv_quant_bits == 4
+                and self.kv_quant_bits == 4
+                and bool(getattr(self, "enable_full_layer_kivi_quant", True))
+            )
+            if not (is_bf16_full_compressor_sparse or is_kivi4_full_int4_compressor_sparse):
+                raise ValueError(
+                    "DeltaKV slim runtime supports exactly two paths: "
+                    "(full_layer_kv_quant_bits=0, kv_quant_bits=0) and "
+                    "(full_layer_kv_quant_bits=4, kv_quant_bits=4, enable_full_layer_kivi_quant=True)."
+                )
 
-        if self.vllm_sparse_method in ("deltakv-standalone", "deltakv-snapkv"):
-            # Standalone DeltaKV uses all layers uniformly and does not rely on
-            # OmniKV-style observation/full-layer routing.
-            self.full_attn_layers = []
-            self.obs_layer_ids = []
-        elif self.obs_layer_ids is None:
+        if self.obs_layer_ids is None:
             self.obs_layer_ids = []
             for l in self.full_attn_layers:
                 if (l + 1) not in self.full_attn_layers:

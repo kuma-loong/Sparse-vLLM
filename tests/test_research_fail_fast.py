@@ -10,6 +10,7 @@ import torch
 
 from benchmark.multimodal.video_qa import audit_livevlm_table4 as livevlm_audit
 from benchmark.multimodal.video_qa import streamingbench
+from benchmark.multimodal.image_qa import vqav2
 from benchmark.multimodal.visual_cache import run_visual_cache as visual_bench
 from sparsevllm.config import Config
 
@@ -443,6 +444,31 @@ class ResearchFailFastTest(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "no annotator answers"):
                 visual_bench.validate_vqa_row(bad, source="unit")
 
+    def test_vqav2_soft_score_and_validation(self):
+        answers = ["cat", "cat", "cat", "dog", "dog", "dog", "dog", "dog", "dog", "dog"]
+        self.assertAlmostEqual(vqav2.vqa_score("cat", answers), 0.9)
+        self.assertEqual(vqav2.normalize_vqa_answer("The TWO, cats."), "2 cats")
+
+        row = {
+            "question_id": 1,
+            "image_id": 2,
+            "question": "What is shown?",
+            "image": {"bytes": b"not-empty", "path": None},
+            "answers": [{"answer": "cat", "answer_confidence": "yes", "answer_id": 1}],
+            "multiple_choice_answer": "cat",
+            "question_type": "what",
+            "answer_type": "other",
+        }
+        parsed = vqav2.validate_vqav2_row(row, split="validation", source="unit")
+        self.assertEqual(parsed["answers"], ["cat"])
+
+        no_gt = dict(row)
+        no_gt["answers"] = None
+        no_gt["multiple_choice_answer"] = None
+        self.assertFalse(vqav2.validate_vqav2_row(no_gt, split="testdev", source="unit")["has_ground_truth"])
+        with self.assertRaisesRegex(ValueError, "no annotator answers"):
+            vqav2.validate_vqav2_row(no_gt, split="validation", source="unit")
+
     def test_sparsevllm_raw_config_fallback_is_not_allowed(self):
         with tempfile.TemporaryDirectory() as tmp:
             model_dir = Path(tmp)
@@ -481,7 +507,15 @@ class ResearchFailFastTest(unittest.TestCase):
                     Config(model=tmp, vllm_sparse_method="deltakv")
                 with self.assertRaisesRegex(ValueError, "requires deltakv_path"):
                     Config(model=tmp, vllm_sparse_method="deltakv", deltakv_path="none")
-                Config(model=tmp, vllm_sparse_method="deltakv-delta-quant")
+                with self.assertRaisesRegex(ValueError, "requires deltakv_path"):
+                    Config(model=tmp, vllm_sparse_method="deltakv-less-memory")
+                cfg = Config(
+                    model=tmp,
+                    vllm_sparse_method="deltakv-less-memory",
+                    allow_missing_deltakv_path=True,
+                    kv_quant_bits=0,
+                )
+                self.assertEqual(cfg.vllm_sparse_method, "deltakv")
 
     def test_sparsevllm_missing_model_dir_has_clear_error(self):
         missing = "/tmp/sparsevllm-definitely-missing-model-dir"

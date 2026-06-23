@@ -9,7 +9,7 @@ from sparsevllm.utils.loader import sync_deltakv_config_from_checkpoint
 def _base_config(tmp_path):
     return SimpleNamespace(
         deltakv_path=str(tmp_path),
-        vllm_sparse_method="deltakv-standalone",
+        vllm_sparse_method="deltakv",
         kv_compressed_size=128,
         use_nonlinear_compressor=True,
         compressor_intermediate_size=2048,

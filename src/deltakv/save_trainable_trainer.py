@@ -1,6 +1,27 @@
+from typing import Optional
+
 from transformers.trainer import *
 
 class SaveTrainableParamsTrainer(Trainer):
+    def _maybe_add_loss_components(self, logs):
+        model = self.model
+        if hasattr(self, "accelerator"):
+            model = self.accelerator.unwrap_model(model)
+        for attr, key in (("_last_ntp_loss", "ntp_loss"), ("_last_mse_loss", "mse_loss")):
+            value = getattr(model, attr, None)
+            if value is None or key in logs:
+                continue
+            if torch.is_tensor(value):
+                value = value.detach().float().item()
+            logs[key] = value
+
+    def log(self, logs, start_time=None):
+        self._maybe_add_loss_components(logs)
+        try:
+            return super().log(logs, start_time)
+        except TypeError:
+            return super().log(logs)
+
     def _collect_trainable_state_dict(self, state_dict=None):
         trainable_names = {name for name, param in self.model.named_parameters() if param.requires_grad}
         if state_dict is None:
@@ -30,8 +51,9 @@ class SaveTrainableParamsTrainer(Trainer):
             raise NotImplementedError
         else:
             trainable_state_dict = self._collect_trainable_state_dict(state_dict)
+            safe_serialization = getattr(self.args, "save_safetensors", True)
             unwrapped_model.save_pretrained(
-                output_dir, state_dict=trainable_state_dict, safe_serialization=self.args.save_safetensors
+                output_dir, state_dict=trainable_state_dict, safe_serialization=safe_serialization
             )
 
         if self.processing_class is not None:

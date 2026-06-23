@@ -1,8 +1,10 @@
+import os
 import torch
 from torch import nn
 import torch.distributed as dist
 from transformers import Qwen2Config
 from sparsevllm.utils.log import logger
+from sparsevllm.utils.context import get_context
 
 from sparsevllm.layers.activation import SiluAndMul
 from sparsevllm.layers.attention import Attention
@@ -114,9 +116,37 @@ class Qwen2Attention(nn.Module):
         q = q.view(-1, self.num_heads, self.head_dim)
         k = k.view(-1, self.num_kv_heads, self.head_dim)
         v = v.view(-1, self.num_kv_heads, self.head_dim)
+        context = get_context()
+        cache_manager = context.cache_manager
+        layer_idx = context.now_layer_idx
+        pre_rope_k = k
+        cache_manager.save_raw_kv_if_needed(layer_idx, pre_rope_k, v)
+        debug_layers = os.getenv("SPARSEVLLM_DEBUG_CAPTURE_PRE_ROPE_LAYERS")
+        if debug_layers:
+            wanted = {int(part) for part in debug_layers.split(",") if part.strip()}
+            if int(layer_idx) in wanted:
+                self.debug_last_pre_rope_positions = positions.detach().clone()
+                self.debug_last_pre_rope_k = pre_rope_k.detach().clone()
+                self.debug_last_pre_rope_v = v.detach().clone()
         q, k = self.rotary_emb(positions, q, k)
+        cache_manager.save_rope_kv_if_needed(layer_idx, k, v)
+        debug_qk_layers = os.getenv("SPARSEVLLM_DEBUG_QK_LAYERS")
+        debug_qk_capture = False
+        if debug_qk_layers:
+            wanted = {int(part) for part in debug_qk_layers.split(",") if part.strip()}
+            debug_qk_capture = int(context.now_layer_idx) in wanted
+            if debug_qk_capture:
+                self.debug_last_k_raw = pre_rope_k.detach().clone()
+                self.debug_last_q_postrope = q.detach().clone()
+                self.debug_last_k_postrope = k.detach().clone()
+                self.debug_last_v = v.detach().clone()
+                self.debug_last_qk_positions = positions.detach().clone()
         o = self.attn(q, k, v)
-        return self._o_proj_chunked(o.flatten(1, -1), hidden_states)
+        projected = self._o_proj_chunked(o.flatten(1, -1), hidden_states)
+        if debug_qk_capture:
+            self.debug_last_attn_output = o.detach().clone()
+            self.debug_last_o_proj_output = projected.detach().clone()
+        return projected
 
 
 class Qwen2MLP(nn.Module):
@@ -208,8 +238,6 @@ class Qwen2DecoderLayer(nn.Module):
         return hidden_states, residual
 
 
-from sparsevllm.utils.context import get_context
-
 class Qwen2Model(nn.Module):
 
     def __init__(
@@ -233,16 +261,28 @@ class Qwen2Model(nn.Module):
         hidden_states = self.embed_tokens(input_ids)
         residual = None
         context = get_context()
+        debug_layers_env = os.getenv("SPARSEVLLM_DEBUG_HIDDEN_LAYERS")
+        debug_layers = None
+        if debug_layers_env:
+            debug_layers = {int(part) for part in debug_layers_env.split(",") if part.strip()}
+            self.debug_last_hidden_states = {
+                -1: hidden_states[-1:].detach().clone(),
+            }
         
         for i, layer in enumerate(self.layers):
             context.now_layer_idx = i
             hidden_states, residual = layer(positions, hidden_states, residual)
+            if debug_layers is not None and i in debug_layers:
+                layer_output = hidden_states if residual is None else hidden_states + residual
+                self.debug_last_hidden_states[int(i)] = layer_output[-1:].detach().clone()
             
             # 回调控制器执行稀疏逻辑
             if self.sparse_controller is not None:
                 self.sparse_controller.on_layer_end(i, context)
                 
         hidden_states, _ = self.norm(hidden_states, residual)
+        if debug_layers is not None:
+            self.debug_last_hidden_states[self.config.num_hidden_layers] = hidden_states[-1:].detach().clone()
         return hidden_states
 
 

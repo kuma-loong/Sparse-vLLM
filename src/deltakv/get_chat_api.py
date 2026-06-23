@@ -1,5 +1,6 @@
 import os
 import sys
+import json
 import torch
 from typing import Union, List
 from transformers import AutoTokenizer, AutoModelForCausalLM, AutoConfig
@@ -9,6 +10,7 @@ from deltakv.baseline_adapters import load_omnikv_model, load_kivi_model
 from deltakv.modeling.cache_factory import (
     DELTA_COMPRESSED_LATENT_W_FULL,
     DELTA_COMPRESSED_LATENT_WO_FULL,
+    DELTA_COMPRESSED_QUANT_KIVI_FULL_FP8_REF,
     DELTA_ORIGIN_W_FULL,
     DELTA_ORIGIN_WO_FULL,
 )
@@ -20,6 +22,21 @@ from safetensors.torch import load_file
 def load_compressor(compressor_path, device='cuda:0'):
     state_dict = load_file(os.path.join(compressor_path, 'model.safetensors'), device)
     return state_dict
+
+
+def _load_deltakv_checkpoint_config(config_cls, compressor_path):
+    config_path = os.path.join(compressor_path, "config.json")
+    with open(config_path, "r", encoding="utf-8") as f:
+        config_dict = json.load(f)
+    removed = [key for key in ("compressor_token_group_size", "seq_chunk_size", "ref_mode") if key in config_dict]
+    if removed:
+        logger.info(
+            "Ignoring removed DeltaKV checkpoint-only config fields while loading compressor: {}",
+            ", ".join(removed),
+        )
+        for key in removed:
+            config_dict.pop(key, None)
+    return config_cls.from_dict(config_dict)
 
 
 def _as_bool(value):
@@ -96,6 +113,7 @@ def manual_generate(model, tokenizer, prompt: Union[str, List[str]], past_key_va
     generated_tokens = []
 
     cur_input_ids = input_ids
+    logits_to_keep = kwargs.get('logits_to_keep', 1)
     # 支持分块 Prefill 以降低激活显存占用
     chunk_prefill_size = int(os.environ.get('MANUAL_GEN_CHUNK_PREFILL_SIZE', 0))
     if chunk_prefill_size > 0 and input_ids.shape[1] > chunk_prefill_size:
@@ -108,6 +126,7 @@ def manual_generate(model, tokenizer, prompt: Union[str, List[str]], past_key_va
                 attention_mask=attention_mask[:, :end_idx],
                 past_key_values=past_key_values,
                 use_cache=True,
+                logits_to_keep=logits_to_keep,
             )
             past_key_values = outputs.past_key_values
         cur_input_ids = input_ids[:, -1:]
@@ -123,6 +142,7 @@ def manual_generate(model, tokenizer, prompt: Union[str, List[str]], past_key_va
             attention_mask=attention_mask,
             past_key_values=past_key_values,
             use_cache=True,
+            logits_to_keep=logits_to_keep,
         )
         logits = outputs.logits[:, -1, :]
         past_key_values = outputs.past_key_values
@@ -309,12 +329,28 @@ def get_generate_api(model_path: str, infer_config: dict, deltakv_checkpoint_pat
                 f"and skip_modules={quantization_config.llm_int8_skip_modules}"
             )
         return runtime_infer_config, model_load_kwargs, target_torch_dtype
+    def _hf_attn_implementation() -> str:
+        return os.getenv("DELTAKV_HF_ATTN_IMPLEMENTATION", "flash_attention_2")
+
+
+    def _drop_stale_checkpoint_quantization_config(config, model_load_kwargs):
+        if "quantization_config" in model_load_kwargs:
+            return
+        if "quantization_config" in getattr(config, "__dict__", {}):
+            print(
+                "[Quantization] Dropping checkpoint-side quantization_config before "
+                "base-model loading. To load the base model in 4-bit or 8-bit, set "
+                "`load_in_4bit` or `load_in_8bit` explicitly in --hyper_param."
+            )
+            del config.__dict__["quantization_config"]
 
     assert use_cache, '还要做padding才能用训练代码推理'
     if model_cls in {
         'deltakv',
+        'hf_kivi',
         DELTA_COMPRESSED_LATENT_WO_FULL,
         DELTA_COMPRESSED_LATENT_W_FULL,
+        DELTA_COMPRESSED_QUANT_KIVI_FULL_FP8_REF,
         DELTA_ORIGIN_WO_FULL,
         DELTA_ORIGIN_W_FULL,
     }:
@@ -322,11 +358,17 @@ def get_generate_api(model_path: str, infer_config: dict, deltakv_checkpoint_pat
             'deltakv': DELTA_COMPRESSED_LATENT_WO_FULL,
             DELTA_COMPRESSED_LATENT_WO_FULL: DELTA_COMPRESSED_LATENT_WO_FULL,
             DELTA_COMPRESSED_LATENT_W_FULL: DELTA_COMPRESSED_LATENT_W_FULL,
+            DELTA_COMPRESSED_QUANT_KIVI_FULL_FP8_REF: DELTA_COMPRESSED_QUANT_KIVI_FULL_FP8_REF,
             DELTA_ORIGIN_WO_FULL: DELTA_ORIGIN_WO_FULL,
             DELTA_ORIGIN_W_FULL: DELTA_ORIGIN_W_FULL,
         }
         runtime_infer_config, model_load_kwargs, target_torch_dtype = _prepare_model_load(torch.bfloat16)
-        runtime_infer_config["deltakv_cache_impl"] = cache_impl_by_model_cls[model_cls]
+        if model_cls == "hf_kivi":
+            runtime_infer_config["hf_sparse_cache_impl"] = "kivi"
+            runtime_infer_config["use_cluster"] = False
+            runtime_infer_config["use_compression"] = False
+        else:
+            runtime_infer_config["deltakv_cache_impl"] = cache_impl_by_model_cls[model_cls]
         base_config = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
         if base_config.model_type == 'qwen2':
             from deltakv.modeling.qwen2_inference import Qwen2KVCompress as KVModel
@@ -341,9 +383,10 @@ def get_generate_api(model_path: str, infer_config: dict, deltakv_checkpoint_pat
             raise ValueError(f"Unsupported model type: {base_config.model_type}")
 
         if compressor_path is not None:
-            config = config_cls.from_pretrained(compressor_path)
+            config = _load_deltakv_checkpoint_config(config_cls, compressor_path)
         else:
             config = config_cls.from_pretrained(model_path)
+        _drop_stale_checkpoint_quantization_config(config, model_load_kwargs)
         config.set_native_args(**runtime_infer_config)
         config.finalize_cluster_args()
         model = KVModel.from_pretrained(
@@ -351,7 +394,7 @@ def get_generate_api(model_path: str, infer_config: dict, deltakv_checkpoint_pat
             config=config,
             torch_dtype=target_torch_dtype,
             device_map=cuda_device,
-            attn_implementation="flash_attention_2",
+            attn_implementation=_hf_attn_implementation(),
             **model_load_kwargs,
         )
         if compressor_path is not None:
@@ -369,6 +412,9 @@ def get_generate_api(model_path: str, infer_config: dict, deltakv_checkpoint_pat
         if base_config.model_type == 'qwen2':
             from deltakv.modeling.qwen2.qwen2_snapkv import Qwen2SnapKVForCausalLM as KVModel
             config_cls = KVQwen2Config
+        elif base_config.model_type == 'qwen3':
+            from deltakv.modeling.qwen3.qwen3_snapkv import Qwen3SnapKVForCausalLM as KVModel
+            config_cls = KVQwen3Config
         elif base_config.model_type == 'llama':
             from deltakv.modeling.llama.llama_snapkv import LlamaSnapKVForCausalLM as KVModel
             config_cls = KVLlamaConfig
@@ -385,47 +431,9 @@ def get_generate_api(model_path: str, infer_config: dict, deltakv_checkpoint_pat
             config=config,
             torch_dtype=target_torch_dtype,
             device_map=cuda_device,
-            attn_implementation="flash_attention_2",
+            attn_implementation=_hf_attn_implementation(),
             **model_load_kwargs,
         )
-        if model_load_kwargs:
-            restore_modules_to_dtype(model, target_torch_dtype)
-
-    elif model_cls == 'deltasnapkv':
-        runtime_infer_config, model_load_kwargs, target_torch_dtype = _prepare_model_load(torch.bfloat16)
-        base_config = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
-        if base_config.model_type == 'qwen2':
-            from deltakv.modeling.qwen2.qwen2_deltasnapkv import Qwen2DeltaSnapKVForCausalLM as KVModel
-            config_cls = KVQwen2Config
-        elif base_config.model_type == 'llama':
-            from deltakv.modeling.llama.llama_deltasnapkv import LlamaDeltaSnapKVForCausalLM as KVModel
-            config_cls = KVLlamaConfig
-        else:
-            raise ValueError(f"deltasnapkv only supports qwen2/llama models, got {base_config.model_type}")
-
-        if compressor_path is None:
-            raise ValueError("deltasnapkv requires deltakv_checkpoint_path")
-
-        config = config_cls.from_pretrained(compressor_path)
-        config.set_native_args(**runtime_infer_config)
-        config.finalize_cluster_args()
-        assert len(parse_full_attn_layers(config.full_attn_layers)) == 0, (
-            "deltasnapkv requires full_attention_layers to be empty; "
-            "this method does not support mixed full-attention layers."
-        )
-        model = KVModel.from_pretrained(
-            model_path,
-            config=config,
-            torch_dtype=target_torch_dtype,
-            device_map=cuda_device,
-            attn_implementation="flash_attention_2",
-            **model_load_kwargs,
-        )
-        load_device = f'cuda:{cuda_device}' if isinstance(cuda_device, int) else 'cpu'
-        comp_state_dict = load_compressor(compressor_path, device=load_device)
-        _, unexpected = model.load_state_dict(comp_state_dict, strict=False)
-        assert len(unexpected) == 0, f'compressor 加载有问题: {unexpected}'
-        del comp_state_dict
         if model_load_kwargs:
             restore_modules_to_dtype(model, target_torch_dtype)
 
@@ -451,7 +459,7 @@ def get_generate_api(model_path: str, infer_config: dict, deltakv_checkpoint_pat
             config=config,
             torch_dtype=target_torch_dtype,
             device_map=cuda_device,
-            attn_implementation="flash_attention_2",
+            attn_implementation=_hf_attn_implementation(),
             **model_load_kwargs,
         )
         if model_load_kwargs:
@@ -469,7 +477,7 @@ def get_generate_api(model_path: str, infer_config: dict, deltakv_checkpoint_pat
             torch_dtype=target_torch_dtype,
             device_map=cuda_device,
             trust_remote_code=True,
-            attn_implementation="flash_attention_2",
+            attn_implementation=_hf_attn_implementation(),
             **model_load_kwargs,
         )
         if model_load_kwargs:
@@ -513,7 +521,7 @@ def get_generate_api(model_path: str, infer_config: dict, deltakv_checkpoint_pat
             torch_dtype=target_torch_dtype,
             device_map=cuda_device,
             trust_remote_code=True,
-            attn_implementation="flash_attention_2",
+            attn_implementation=_hf_attn_implementation(),
             **model_load_kwargs,
         )
         if model_load_kwargs:
@@ -552,7 +560,7 @@ def get_generate_api(model_path: str, infer_config: dict, deltakv_checkpoint_pat
             torch_dtype=target_torch_dtype,
             device_map=cuda_device,
             trust_remote_code=True,
-            attn_implementation="flash_attention_2",
+            attn_implementation=_hf_attn_implementation(),
             **model_load_kwargs,
         )
         if model_load_kwargs:
@@ -608,7 +616,7 @@ def get_generate_api(model_path: str, infer_config: dict, deltakv_checkpoint_pat
             model_path,
             torch_dtype=target_torch_dtype,
             device_map=cuda_device,
-            attn_implementation="flash_attention_2",
+            attn_implementation=_hf_attn_implementation(),
             trust_remote_code=True,
             **model_load_kwargs,
         )

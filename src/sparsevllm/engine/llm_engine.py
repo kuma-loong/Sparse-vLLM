@@ -1,4 +1,5 @@
 import atexit
+import os
 from dataclasses import fields
 from time import perf_counter
 import threading
@@ -15,7 +16,35 @@ from sparsevllm.sampling_params import SamplingParams
 from sparsevllm.engine.sequence import Sequence
 from sparsevllm.engine.scheduler import Scheduler
 from sparsevllm.engine.model_runner import ModelRunner
+from sparsevllm.method_registry import normalize_sparse_method
 from sparsevllm.utils.profiler import profiler
+
+def _deltakv_graph_warmup_profile(config: Config) -> str:
+    graph_warmup = bool(getattr(config, "decode_cuda_graph", False))
+    method = normalize_sparse_method(getattr(config, "vllm_sparse_method", "") or "")
+    if not graph_warmup:
+        return "prefill_only"
+    if method == "deltakv":
+        warmup_policy = os.getenv("SPARSEVLLM_DELTAKV_GRAPH_WARMUP", "prefill_only").strip().lower()
+        if warmup_policy in ("eager", "minimal", "current", "prefill", "prefill_only"):
+            return "prefill_only"
+        if warmup_policy in ("decode_1seq", "decode-1seq", "decode"):
+            return "decode_1seq"
+        if warmup_policy in ("big_prefill_only", "big-prefill-only", "prefill_graph_batch"):
+            return "big_prefill_only"
+        if warmup_policy in ("graph", "full"):
+            return "graph"
+        raise ValueError(
+            "SPARSEVLLM_DELTAKV_GRAPH_WARMUP must be one of "
+            "'prefill_only', 'decode_1seq', 'big_prefill_only', or 'graph', "
+            f"got {warmup_policy!r}."
+        )
+    return "graph"
+
+
+def _use_graph_scaled_warmup(config: Config) -> bool:
+    return _deltakv_graph_warmup_profile(config) == "graph"
+
 
 class _ThroughputIntervalLogger:
     def __init__(self, interval_s: float):
@@ -189,6 +218,8 @@ class LLMEngine:
 
         # 5. 预热模型
         self._warmup()
+        if os.getenv("SPARSEVLLM_PROFILER_RESET_AFTER_WARMUP", "0") == "1":
+            profiler.reset()
         self._throughput_logger.start()
 
     def _warmup(self):
@@ -196,32 +227,18 @@ class LLMEngine:
         logger.info("Warming up the engine...")
         
         # 预热只需触发算子编译，使用固定短长度即可
-        if self.config.vllm_sparse_method == "deltakv-snapkv":
-            warmup_len = (
-                self.config.num_sink_tokens
-                + self.config.num_recent_tokens
-                + self.config.snapkv_window_size
-                + self.config.chunk_prefill_size
-                + 1024
-            )
-        elif self.config.vllm_sparse_method == "deltakv-standalone":
-            warmup_len = (
-                self.config.num_sink_tokens
-                + self.config.num_recent_tokens
-                + self.config.chunk_prefill_size
-                + 1024
-            )
-        else:
-            warmup_len = self.config.num_sink_tokens + self.config.num_top_tokens_in_prefill\
-                         + self.config.num_recent_tokens + self.config.chunk_prefill_size + 1024
-        graph_warmup = bool(getattr(self.config, "decode_cuda_graph", False))
-        num_seqs = int(self.config.max_decoding_seqs) if graph_warmup else 1
+        warmup_len = self.config.num_sink_tokens + self.config.decode_keep_tokens\
+                     + self.config.num_recent_tokens + self.config.chunk_prefill_size + 1024
+        warmup_profile = _deltakv_graph_warmup_profile(self.config)
+        graph_sized_batch = warmup_profile in ("graph", "big_prefill_only")
+        decode_warmup = warmup_profile in ("graph", "decode_1seq")
+        num_seqs = int(self.config.max_decoding_seqs) if graph_sized_batch else 1
         
         # 预热 1 个 Token 的生成（包含 Prefill 和 Decode）
         sampling_params = SamplingParams(
-            max_tokens=2 if graph_warmup else 1,
+            max_tokens=2 if decode_warmup else 1,
             temperature=0.0,
-            ignore_eos=graph_warmup,
+            ignore_eos=decode_warmup,
         )
         max_prompt_len = max(1, int(self.config.max_model_len) - int(sampling_params.max_tokens))
         if warmup_len > max_prompt_len:
@@ -231,20 +248,34 @@ class LLMEngine:
             )
             warmup_len = max_prompt_len
         dummy_prompt = [0] * warmup_len
+        logger.info(
+            f"Warmup profile: {warmup_profile} "
+            f"(num_seqs={num_seqs}, max_tokens={sampling_params.max_tokens}, "
+            f"ignore_eos={sampling_params.ignore_eos})."
+        )
         
-        if graph_warmup:
-            self.model_runner.set_decode_cuda_graph_max_context_len_override(self.config.max_model_len)
+        for _ in range(num_seqs):
+            self.add_request(dummy_prompt, sampling_params)
 
-        try:
-            for _ in range(num_seqs):
-                self.add_request(dummy_prompt, sampling_params)
-
-            while not self.is_finished():
-                self.step()
-        finally:
-            if graph_warmup:
-                self.model_runner.set_decode_cuda_graph_max_context_len_override(None)
+        while not self.is_finished():
+            self.step()
+        self._after_warmup_debug_cleanup()
         logger.info("Warmup finished.")
+
+    def _after_warmup_debug_cleanup(self):
+        model_runner = getattr(self, "model_runner", None)
+        runner = getattr(model_runner, "decode_cuda_graph_runner", None)
+        if runner is not None and os.getenv("SPARSEVLLM_DELTAKV_CLEAR_GRAPHS_AFTER_WARMUP", "0") == "1":
+            runner.clear_captured_graphs()
+            logger.info("Cleared decode CUDA graphs after warmup.")
+
+        sparse_controller = getattr(model_runner, "sparse_controller", None)
+        if (
+            sparse_controller is not None
+            and os.getenv("SPARSEVLLM_DELTAKV_CLEAR_ATTN_SCORE_BUFFERS_AFTER_WARMUP", "0") == "1"
+        ):
+            sparse_controller.clear_decode_attn_score_buffers()
+            logger.info("Cleared decode attention score buffers after warmup.")
 
     def exit(self):
         """优雅地退出所有子进程并清理共享内存"""
@@ -267,7 +298,12 @@ class LLMEngine:
     def add_request(self, prompt: str | list[int], sampling_params: SamplingParams):
         """将一个新的推理请求加入系统"""
         if isinstance(prompt, str):
-            prompt = self.tokenizer.encode(prompt)
+            # Match HF manual_generate: add BOS for raw prompts, but do not
+            # duplicate it when a chat template already starts with BOS.
+            add_special_tokens = True
+            if self.tokenizer.bos_token is None or prompt.startswith(self.tokenizer.bos_token):
+                add_special_tokens = False
+            prompt = self.tokenizer.encode(prompt, add_special_tokens=add_special_tokens)
         prompt_len = len(prompt)
         max_tokens = sampling_params.max_tokens
         if prompt_len + max_tokens > self.config.max_model_len:
@@ -293,8 +329,9 @@ class LLMEngine:
             # 2. 显式处理抢占 (Eviction)：
             # 如果有序列被调度器踢出，立即广播指令让所有 Rank 释放其占用的物理槽位
             with profiler.record("preempt_free"):
-                for seq in preempted_seqs:
-                    self.model_runner.call("free_slots", seq.seq_id)
+                preempted_seq_ids = [int(seq.seq_id) for seq in preempted_seqs]
+                if preempted_seq_ids:
+                    self.model_runner.call("free_slots_batch", preempted_seq_ids)
                 
             if not seqs:
                 # No progress can be made; avoid infinite busy-looping in callers.
@@ -342,10 +379,13 @@ class LLMEngine:
             # 遍历序列，如果已达到 EOS 或最大长度，则通知所有进程释放物理槽位
             with profiler.record("finished_free"):
                 finished_outputs = []
+                finished_seq_ids = []
                 for seq in seqs:
                     if seq.is_finished:
-                        self.model_runner.call("free_slots", seq.seq_id)
+                        finished_seq_ids.append(int(seq.seq_id))
                         finished_outputs.append((seq.seq_id, seq.completion_token_ids))
+                if finished_seq_ids:
+                    self.model_runner.call("free_slots_batch", finished_seq_ids)
         
         # 计算吞吐量统计数据 (正数表示 Prefill，负数表示 Decode)
         num_tokens = sum(seq.current_chunk_size for seq in seqs) if is_prefill else -len(seqs)
@@ -424,7 +464,7 @@ class LLMEngine:
                 outputs[seq_id] = token_ids
                 if use_tqdm:
                     pbar.update(1)
-                    
+
         # 按照请求提交顺序排序并解码
         results = [outputs[seq_id] for seq_id in sorted(outputs.keys())]
         results = [{"text": self.tokenizer.decode(tids, skip_special_tokens=True), "token_ids": tids} for tids in results]

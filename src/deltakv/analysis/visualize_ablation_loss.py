@@ -8,10 +8,16 @@ import argparse
 import subprocess
 import sys
 from tqdm import tqdm
-from deltakv.analysis.colors import COLOR_PRIMARY, COLOR_SECONDARY, COLOR_GRID, COLOR_BLACK, COLOR_TERTIARY
+from deltakv.analysis.colors import (
+    COLOR_BLACK,
+    COLOR_GRID,
+    COLOR_NEUTRAL,
+    TEXT_HIGHLIGHT_1,
+    TEXT_HIGHLIGHT_2,
+)
 
 # --- 配置 ---
-PROJECT = "DeltaKV"
+PROJECT = "ReKV"
 GROUP = "llama_hyperparams_ablation_v1"
 OUTPUT_JSON = "/root/autodl-fs/deltakv_outputs/ablation_results.json"
 VISUALS_DIR = "/root/autodl-fs/visuals/"
@@ -70,7 +76,7 @@ def export_data():
             'kv_size': config.get("kv_compressed_size"),
             'neighbor_count': config.get(
                 "deltakv_neighbor_count",
-                config.get("k_neighbors", config.get("seq_chunk_size")),
+                config.get("k_neighbors"),
             ),
             'inter_size': config.get("compressor_intermediate_size"),
             'center_ratio': config.get("deltakv_center_ratio", config.get("cluster_ratio")),
@@ -153,7 +159,7 @@ def run_benchmarks():
             "--model_path", DEFAULT_MODEL,
             "--lengths", str(DEFAULT_LENGTH),
             "--batch_sizes", str(DEFAULT_BS),
-            "--methods", "deltakv-triton-v4",
+            "--methods", "deltakv",
             "--output_len", "768",
             "--hyper_params", json.dumps(hp)
         ]
@@ -226,9 +232,9 @@ def plot_data():
             continue
 
         # --- 绘制左轴 (NTP Loss) ---
-        lns1 = ax1.plot(plot_df[col], plot_df['final_loss'], marker='o', markersize=4, 
-                        linewidth=1.2, color=COLOR_PRIMARY, label='NTP Loss', alpha=0.8)
-        lns_base = ax1.axhline(y=ORIGINAL_BASELINE, color=COLOR_BLACK, linestyle='--', linewidth=1.0, label='Baseline')
+        lns1 = ax1.plot(plot_df[col], plot_df['final_loss'], marker='o', markersize=4.4,
+                        linewidth=1.55, color=TEXT_HIGHLIGHT_1, label='NTP Loss', alpha=0.95)
+        lns_base = ax1.axhline(y=ORIGINAL_BASELINE, color=COLOR_BLACK, linestyle='--', linewidth=1.15, label='Baseline')
         
         # 标记默认值点
         def_val = DEFAULTS[col]
@@ -236,7 +242,16 @@ def plot_data():
             def_val = 1.0 / def_val
         def_row = plot_df[plot_df[col] == def_val]
         if not def_row.empty:
-            lns_def = ax1.plot(def_val, def_row['final_loss'].iloc[0], 'ro', markersize=6, label='Default', zorder=5)
+            lns_def = ax1.plot(
+                def_val,
+                def_row['final_loss'].iloc[0],
+                marker='o',
+                linestyle='',
+                color=TEXT_HIGHLIGHT_2,
+                markersize=6.5,
+                label='Default',
+                zorder=5,
+            )
             if 'Default' not in all_labels:
                 all_handles.extend(lns_def)
                 all_labels.append('Default')
@@ -251,10 +266,10 @@ def plot_data():
 
         ax1.set_xlabel(title)
         if i == 0:
-            ax1.set_ylabel(r"NTP Loss $\downarrow$", color=COLOR_PRIMARY)
+            ax1.set_ylabel(r"NTP Loss $\downarrow$", color=TEXT_HIGHLIGHT_1)
         
         # 只有最左边的图显示左轴刻度标签
-        ax1.tick_params(axis='y', labelleft=(i == 0), labelcolor=COLOR_PRIMARY)
+        ax1.tick_params(axis='y', labelleft=(i == 0), labelcolor=TEXT_HIGHLIGHT_1)
         ax1.grid(True, linestyle='--', alpha=0.5, color=COLOR_GRID)
 
         # --- 绘制右轴 (Decode Throughput) ---
@@ -276,22 +291,22 @@ def plot_data():
                 p1 = plot_df.iloc[j]
                 p2 = plot_df.iloc[j+1]
                 is_oom_seg = p1['is_oom'] or p2['is_oom']
-                seg_color = 'gray' if is_oom_seg else COLOR_SECONDARY
-                seg_alpha = 0.3 if is_oom_seg else 0.6
+                seg_color = COLOR_NEUTRAL if is_oom_seg else TEXT_HIGHLIGHT_2
+                seg_alpha = 0.45 if is_oom_seg else 0.8
                 ax2.plot([p1[col], p2[col]], [p1['rel_tp'], p2['rel_tp']], 
-                         color=seg_color, linestyle='-', linewidth=1.0, alpha=seg_alpha, zorder=1)
+                         color=seg_color, linestyle='-', linewidth=1.25, alpha=seg_alpha, zorder=1)
 
             valid_df = plot_df[~plot_df['is_oom']]
             oom_df = plot_df[plot_df['is_oom']]
 
             # 绘制有效数据点 (红色方块)
-            lns_tp_pts = ax2.plot(valid_df[col], valid_df['rel_tp'], marker='s', markersize=4,
-                                 linestyle='', color=COLOR_SECONDARY, label='Throughput', zorder=2)
+            lns_tp_pts = ax2.plot(valid_df[col], valid_df['rel_tp'], marker='s', markersize=4.5,
+                                 linestyle='', color=TEXT_HIGHLIGHT_2, label='Throughput', zorder=2)
             
             # 标记 OOM (100% 处的灰色叉号)
             if not oom_df.empty:
-                lns_oom = ax2.plot(oom_df[col], oom_df['rel_tp'], marker='x', color='gray', 
-                                  linestyle='', markersize=6, label='OOM', zorder=3)
+                lns_oom = ax2.plot(oom_df[col], oom_df['rel_tp'], marker='x', color=COLOR_NEUTRAL,
+                                  linestyle='', markersize=6.5, markeredgewidth=1.2, label='OOM', zorder=3)
                 if 'OOM' not in all_labels:
                     all_handles.extend(lns_oom)
                     all_labels.append('OOM')
@@ -302,8 +317,8 @@ def plot_data():
 
             # 只有最右边的图显示右轴标签和刻度
             if i == 3:
-                ax2.set_ylabel(r"Rel. Throughput (%) $\uparrow$", color=COLOR_SECONDARY)
-                ax2.tick_params(axis='y', labelright=True, labelcolor=COLOR_SECONDARY)
+                ax2.set_ylabel(r"Rel. Throughput (%) $\uparrow$", color=TEXT_HIGHLIGHT_2)
+                ax2.tick_params(axis='y', labelright=True, labelcolor=TEXT_HIGHLIGHT_2)
             else:
                 ax2.tick_params(axis='y', labelright=False)
             

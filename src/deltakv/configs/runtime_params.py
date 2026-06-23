@@ -16,8 +16,6 @@ class NormalizedRuntimeParams:
 
 _COMMON_ALIASES: dict[str, str] = {
     # Accuracy-affecting sparse token budgets.
-    "decode_keep_tokens": "num_top_tokens",
-    "prefill_keep_tokens": "num_top_tokens_in_prefill",
     "sink_keep_tokens": "num_sink_tokens",
     "recent_keep_tokens": "num_recent_tokens",
     # Layer routing.
@@ -26,10 +24,13 @@ _COMMON_ALIASES: dict[str, str] = {
     "deltakv_center_ratio": "cluster_ratio",
     "deltakv_latent_dim": "kv_compressed_size",
     "deltakv_latent_quant_bits": "kv_quant_bits",
+    "deltakv_latent_quant_group_size": "kv_quant_group_size",
 }
 
 _BACKEND_ALIASES: dict[str, dict[str, str]] = {
     "hf": {
+        "decode_keep_tokens": "num_top_tokens",
+        "prefill_keep_tokens": "num_top_tokens_in_prefill",
         "hf_prefill_chunk_size": "chunk_prefill_size",
     },
     "sparsevllm": {
@@ -57,10 +58,13 @@ _LEGACY_RUNTIME_KEYS: dict[str, str] = {
     # DeltaKV naming.
     "k_neighbors": "deltakv_neighbor_count",
     "deltakv_k_neighbors": "deltakv_neighbor_count",
-    "seq_chunk_size": "compressor_token_group_size",
+    "seq_chunk_size": "removed; use deltakv_neighbor_count for cluster reference top-k",
+    "compressor_token_group_size": "removed; use deltakv_neighbor_count for cluster reference top-k",
+    "ref_mode": "removed; cluster_e2e_big always uses cluster-derived references",
     "cluster_ratio": "deltakv_center_ratio",
     "kv_compressed_size": "deltakv_latent_dim",
     "kv_quant_bits": "deltakv_latent_quant_bits",
+    "kv_quant_group_size": "deltakv_latent_quant_group_size",
     # Prefill chunking must be backend-specific.
     "chunk_prefill_size": "hf_prefill_chunk_size or engine_prefill_chunk_size",
     "model_prefill_chunk_size": "hf_prefill_chunk_size",
@@ -74,12 +78,11 @@ _SPARSE_METHOD_TO_HF_MODEL_CLS: dict[str, str] = {
     "": "auto",
     "vanilla": "auto",
     "deltakv": "deltakv",
-    "deltakv-triton": "deltakv",
-    "deltakv-triton-v2": "deltakv",
-    "deltakv-triton-v3": "deltakv",
-    "deltakv-triton-v4": "deltakv",
-    "deltakv-standalone": "deltakv",
-    "deltakv-snapkv": "deltasnapkv",
+    "deltakv-less-memory": "deltakv",
+    "deltakv-less-memory-cudagraph": "deltakv",
+    "delta_compressed_quant_kivi_full_fp8_ref": "delta_compressed_quant_kivi_full_fp8_ref",
+    "hf_kivi": "hf_kivi",
+    "kivi_hf": "hf_kivi",
     "snapkv": "snapkv",
     "pyramidkv": "pyramidkv",
     "omnikv": "omnikv",
@@ -88,7 +91,6 @@ _SPARSE_METHOD_TO_HF_MODEL_CLS: dict[str, str] = {
     "attention-sink": "streamingllm",
     "attention_sink": "streamingllm",
 }
-
 
 def _canonical_backend(backend: str | None) -> str | None:
     if backend is None:
@@ -148,7 +150,7 @@ def _reject_legacy_runtime_keys(params: dict[str, Any]):
 
 
 def _validate_sparsevllm_token_budgets(params: dict[str, Any]):
-    for key in ("num_top_tokens", "num_top_tokens_in_prefill"):
+    for key in ("decode_keep_tokens",):
         value = params.get(key)
         if isinstance(value, float) and value <= 1.0:
             raise ValueError(
@@ -167,15 +169,13 @@ def normalize_runtime_params(
 
     The canonical aliases are intentionally explicit:
 
-    - `decode_keep_tokens` -> `num_top_tokens`
-    - `prefill_keep_tokens` -> `num_top_tokens_in_prefill`
+    - `decode_keep_tokens` stays native for Sparse-vLLM and maps to HF `num_top_tokens`
     - `engine_prefill_chunk_size` -> Sparse-vLLM `chunk_prefill_size`
     - `hf_prefill_chunk_size` -> HF DeltaKV `chunk_prefill_size`
     - `deltakv_checkpoint_path` -> Sparse-vLLM `deltakv_path` or HF compressor path
 
     Legacy runtime keys are rejected at the API boundary. This function still
-    maps the new semantic names to backend-native internal fields because the
-    underlying HF/Sparse-vLLM implementation has not been renamed end to end.
+    maps the new semantic names to backend-native internal fields where needed.
     """
 
     backend = _canonical_backend(backend)

@@ -21,7 +21,7 @@ if str(PROJECT_ROOT) not in sys.path:
 from benchmark.multimodal.model_adapters.llava_onevision import (
     batch_to_device,
     ensure_left_padding,
-    load_llava_delta_quant_model,
+    load_llava_deltakv_model,
     load_vanilla_model,
 )
 
@@ -43,7 +43,7 @@ def parse_args():
     parser.add_argument("--anno_path", default="")
     parser.add_argument("--video_dir", default="")
     parser.add_argument("--output_dir", default="/data2/haojitai/datasets/llava_onevision_rekv_qaego4d")
-    parser.add_argument("--methods", default="vanilla,deltakv_delta_quant")
+    parser.add_argument("--methods", default="vanilla")
     parser.add_argument("--num_samples", type=int, default=32, help="Number of QA pairs to evaluate. Use -1 for all 500.")
     parser.add_argument("--sample_start", type=int, default=0)
     parser.add_argument("--sample_fps", type=float, default=0.5)
@@ -61,7 +61,6 @@ def parse_args():
     parser.add_argument("--chunk_prefill_accel_omnikv", action="store_true")
     parser.add_argument("--full_attention_layers", default="0,1,2,3,8,16,22")
     parser.add_argument("--visual_keep_ratio", type=float, default=1.0)
-    parser.add_argument("--delta_quant_bits", type=int, default=4, choices=[4])
     parser.add_argument("--deltakv_center_ratio", type=float, default=0.1)
     parser.add_argument("--deltakv_neighbor_count", type=int, default=1)
     parser.add_argument("--frame_cache_dir", default="")
@@ -354,10 +353,10 @@ def iter_methods(methods: str):
         method = raw_method.lower()
         if method == "vanilla":
             yield "vanilla", "vanilla"
-        elif method in {"deltakv_delta_quant", "delta_quant", "llava_deltakv_delta_quant"}:
-            yield raw_method, "deltakv_delta_quant"
+        elif method in {"deltakv", "llava_deltakv"}:
+            yield raw_method, "deltakv"
         else:
-            raise ValueError("QAEGO4D ReKV protocol script supports methods: vanilla, deltakv_delta_quant.")
+            raise ValueError("QAEGO4D ReKV protocol script supports methods: vanilla, deltakv.")
 
 
 def write_official_style_csv(result: dict, output_dir: Path):
@@ -421,7 +420,7 @@ def main():
             method_label = "vanilla"
             policy = None
         else:
-            model, policy = load_llava_delta_quant_model(args, dtype, device)
+            model, policy = load_llava_deltakv_model(args, dtype, device)
             method_label = policy["method"]
 
         result = run_method(method_label, model, processor, rows, args, dtype, device, policy=policy)

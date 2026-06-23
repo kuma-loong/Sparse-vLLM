@@ -2,6 +2,8 @@ import os
 import json
 import argparse
 import numpy as np
+import traceback
+from collections import Counter
 
 from metrics import (
     qa_f1_score,
@@ -16,6 +18,14 @@ from metrics import (
 )
 
 BASE_PATH = os.getenv("DELTAKV_OUTPUT_DIR", "/root/autodl-fs/deltakv_outputs")
+SAMPLE_STATUSES = {
+    "success",
+    "invalid_input",
+    "model_failed",
+    "parse_failed",
+    "metric_failed",
+    "skipped_by_policy",
+}
 
 dataset2metric = {
     "narrativeqa": qa_f1_score,
@@ -163,6 +173,8 @@ if __name__ == '__main__':
             path = os.path.join(BASE_PATH, f"benchmark/long_bench/pred/{args.model}/{compressor_name}")
     
     task_scores = dict()
+    task_statuses = dict()
+    failed_tasks = []
     if not os.path.exists(path):
         
         print(f"Path {path} does not exist.")
@@ -175,32 +187,143 @@ if __name__ == '__main__':
             continue
         predictions, answers, lengths = [], [], []
         dataset = filename.split('.')[0]
+        if dataset not in dataset2metric:
+            continue
+        status_counts: Counter[str] = Counter()
+        invalid_statuses: Counter[str] = Counter()
+        metric_failure_records = []
+        all_classes = None
         with open(f"{path}/{filename}", "r", encoding="utf-8") as f:
-            for line in f:
+            for line_idx, line in enumerate(f):
                 data = json.loads(line)
-                predictions.append(data["pred"])
-                answers.append(data["answers"])
-                all_classes = data["all_classes"]
-                if "length" in data:
-                    lengths.append(data["length"])
+                status = data.get("status", "success")
+                if status not in SAMPLE_STATUSES:
+                    invalid_statuses[status] += 1
+                    status = "parse_failed"
+                status_counts[status] += 1
+                if status != "success":
+                    continue
+                try:
+                    predictions.append(data["pred"])
+                    answers.append(data["answers"])
+                    all_classes = data["all_classes"]
+                    if "length" in data:
+                        lengths.append(data["length"])
+                except Exception as exc:
+                    status_counts["metric_failed"] += 1
+                    metric_failure_records.append(
+                        {
+                            "dataset": dataset,
+                            "line_idx": line_idx,
+                            "status": "metric_failed",
+                            "error": repr(exc),
+                            "traceback": traceback.format_exc(),
+                        }
+                    )
+
+        non_success = sum(
+            count
+            for status, count in status_counts.items()
+            if status not in {"success", "skipped_by_policy"}
+        )
+        if invalid_statuses:
+            failed_tasks.append(dataset)
+            task_statuses[dataset] = {
+                "status": "metric_failed",
+                "status_counts": dict(status_counts),
+                "invalid_statuses": dict(invalid_statuses),
+                "error": f"Invalid sample statuses encountered: {dict(invalid_statuses)}",
+            }
+            continue
+        if metric_failure_records:
+            failed_tasks.append(dataset)
+            task_statuses[dataset] = {
+                "status": "metric_failed",
+                "status_counts": dict(status_counts),
+                "metric_failure_records": metric_failure_records,
+            }
+            continue
+        if not predictions:
+            only_skipped = status_counts and set(status_counts) <= {"skipped_by_policy"}
+            task_statuses[dataset] = {
+                "status": "skipped_by_policy" if only_skipped else "metric_failed",
+                "status_counts": dict(status_counts),
+                "error": None if only_skipped else "No successful predictions to score.",
+            }
+            if not only_skipped:
+                failed_tasks.append(dataset)
+            continue
+
+        if args.e and len(lengths) != len(predictions):
+            failed_tasks.append(dataset)
+            task_statuses[dataset] = {
+                "status": "metric_failed",
+                "status_counts": dict(status_counts),
+                "error": (
+                    f"LongBench-E requires one length per prediction, got "
+                    f"{len(lengths)} lengths for {len(predictions)} predictions."
+                ),
+            }
+            continue
+
         try:
             if args.e:
                 score = scorer_e(dataset, predictions, answers, lengths, all_classes)
             else:
                 score = scorer(dataset, predictions, answers, all_classes)
-            task_scores[dataset] = score
-        except:
-            print(f"error in {dataset}")
-            pass
+        except Exception as exc:
+            failed_tasks.append(dataset)
+            metric_failed = []
+            for idx in range(len(predictions)):
+                metric_failed.append(
+                    {
+                        "dataset": dataset,
+                        "sample_idx": idx,
+                        "status": "metric_failed",
+                        "error": repr(exc),
+                    }
+                )
+            task_statuses[dataset] = {
+                "status": "metric_failed",
+                "status_counts": dict(status_counts),
+                "error": repr(exc),
+                "traceback": traceback.format_exc(),
+                "metric_failed_samples": metric_failed,
+            }
+            continue
+
+        if non_success:
+            failed_tasks.append(dataset)
+            task_statuses[dataset] = {
+                "status": "partial_failed",
+                "status_counts": dict(status_counts),
+                "score_on_successful_samples": score,
+                "error": "Task contains non-success sample statuses.",
+            }
+            continue
+
+        task_scores[dataset] = score
+        task_statuses[dataset] = {
+            "status": "success",
+            "status_counts": dict(status_counts),
+            "score": score,
+        }
 
     category_scores, overall_category_avg = aggregate_category_scores(task_scores)
     scores = {
         **task_scores,
         "category_scores": category_scores,
         "overall_category_avg": overall_category_avg,
+        "task_statuses": task_statuses,
+        "failed_tasks": failed_tasks,
+        "status": "failed" if failed_tasks else "success",
     }
     
     out_path = os.path.join(path, "result.json")
     print(scores)
     with open(out_path, "w") as f:
         json.dump(scores, f, ensure_ascii=False, indent=4)
+    with open(os.path.join(path, "metrics.json"), "w") as f:
+        json.dump(scores, f, ensure_ascii=False, indent=4)
+    if failed_tasks:
+        raise SystemExit(1)

@@ -5,13 +5,17 @@ from typing import Any
 from deltakv.modeling.cache_pipeline import (
     DELTA_COMPRESSED_LATENT_WO_FULL,
     DELTA_COMPRESSED_LATENT_W_FULL,
+    DELTA_COMPRESSED_QUANT_KIVI_FULL_FP8_REF,
     DELTA_ORIGIN_WO_FULL,
     DELTA_ORIGIN_W_FULL,
+    HF_SPARSE_CACHE_KIVI,
     HF_SPARSE_CACHE_OMNIKV,
     DeltaCompressedLatentWoFullCache,
     DeltaCompressedLatentWFullCache,
+    DeltaCompressedQuantKiviFullFp8RefCache,
     DeltaOriginWoFullCache,
     DeltaOriginWFullCache,
+    KiviQuantizedRawCache,
     OmniKVRawCache,
 )
 
@@ -19,6 +23,7 @@ from deltakv.modeling.cache_pipeline import (
 _VALID_CACHE_IMPLS = {
     DELTA_COMPRESSED_LATENT_WO_FULL,
     DELTA_COMPRESSED_LATENT_W_FULL,
+    DELTA_COMPRESSED_QUANT_KIVI_FULL_FP8_REF,
     DELTA_ORIGIN_WO_FULL,
     DELTA_ORIGIN_W_FULL,
 }
@@ -53,6 +58,8 @@ def _expected_cache_types(config: Any) -> tuple[type, ...]:
         return (DeltaCompressedLatentWoFullCache,)
     if cache_impl == DELTA_COMPRESSED_LATENT_W_FULL:
         return (DeltaCompressedLatentWFullCache,)
+    if cache_impl == DELTA_COMPRESSED_QUANT_KIVI_FULL_FP8_REF:
+        return (DeltaCompressedQuantKiviFullFp8RefCache,)
     if cache_impl == DELTA_ORIGIN_WO_FULL:
         return (DeltaOriginWoFullCache,)
     if cache_impl == DELTA_ORIGIN_W_FULL:
@@ -65,6 +72,8 @@ def is_deltakv_cache_instance(past_key_values: Any, config: Any) -> bool:
 
 
 def is_hf_sparse_cache_instance(past_key_values: Any, config: Any) -> bool:
+    if getattr(config, "hf_sparse_cache_impl", None) == HF_SPARSE_CACHE_KIVI:
+        return isinstance(past_key_values, KiviQuantizedRawCache)
     if getattr(config, "hf_sparse_cache_impl", None) == HF_SPARSE_CACHE_OMNIKV:
         return isinstance(past_key_values, OmniKVRawCache)
     return is_deltakv_cache_instance(past_key_values, config)
@@ -78,6 +87,8 @@ def create_deltakv_cache(config: Any):
         return DeltaCompressedLatentWoFullCache(config=config)
     if cache_impl == DELTA_COMPRESSED_LATENT_W_FULL:
         return DeltaCompressedLatentWFullCache(config=config)
+    if cache_impl == DELTA_COMPRESSED_QUANT_KIVI_FULL_FP8_REF:
+        return DeltaCompressedQuantKiviFullFp8RefCache(config=config)
     if cache_impl == DELTA_ORIGIN_WO_FULL:
         return DeltaOriginWoFullCache(config=config)
     if cache_impl == DELTA_ORIGIN_W_FULL:
@@ -86,6 +97,12 @@ def create_deltakv_cache(config: Any):
 
 
 def create_hf_sparse_cache(config: Any):
+    if getattr(config, "hf_sparse_cache_impl", None) == HF_SPARSE_CACHE_KIVI:
+        if getattr(config, "use_cluster", False):
+            raise ValueError("HF KIVI cache expects use_cluster=False.")
+        if getattr(config, "use_compression", False):
+            raise ValueError("HF KIVI cache expects use_compression=False.")
+        return KiviQuantizedRawCache(config=config)
     if getattr(config, "hf_sparse_cache_impl", None) == HF_SPARSE_CACHE_OMNIKV:
         if getattr(config, "use_cluster", False):
             raise ValueError("HF OmniKV cache expects use_cluster=False.")

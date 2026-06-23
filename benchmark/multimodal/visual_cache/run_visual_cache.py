@@ -62,7 +62,17 @@ CUSTOM_CONFIG_KEYS = {
     "snapkv_window_size",
     "pool_kernel_size",
     "chunk_prefill_accel_omnikv",
+    "deltakv_cache_impl",
+    "hf_sparse_cache_impl",
     "kv_quant_bits",
+    "kv_quant_group_size",
+    "full_layer_kv_quant_bits",
+    "full_layer_cluster_ratio",
+    "full_layer_stride_alpha",
+    "full_layer_kivi_group_size",
+    "full_layer_kivi_residual_length",
+    "enable_full_layer_kivi_quant",
+    "enable_sparse_ref_fp8",
 }
 
 
@@ -77,9 +87,8 @@ VISUAL_PRUNE_METHOD_ALIASES = {
 def parse_args():
     parser = argparse.ArgumentParser(
         description=(
-            "Benchmark HF LLaVA-OneVision vanilla, standard DeltaKV, direct "
-            "Delta residual quantization, and the no-checkpoint visual-token "
-            "uniform-pruning baseline."
+            "Benchmark HF LLaVA-OneVision vanilla, standard DeltaKV, and the "
+            "no-checkpoint visual-token uniform-pruning baseline."
         )
     )
     parser.add_argument("--model_path", default="/data2/haojitai/models/llava-onevision-qwen2-7b-ov-hf")
@@ -87,7 +96,7 @@ def parse_args():
         "--deltakv_checkpoint_path",
         default="none",
         help=(
-            "Use 'none' for vanilla, deltakv_delta_quant, and visual_uniform_keep. "
+            "Use 'none' for vanilla and visual_uniform_keep. "
             "Set a trained DeltaKV compressor checkpoint path only when benchmarking "
             "method deltakv."
         ),
@@ -105,8 +114,8 @@ def parse_args():
         type=int,
         default=1,
         help=(
-            "Generation batch size. Supported by vanilla, deltakv, and "
-            "deltakv_delta_quant. visual_uniform_keep is still single-example."
+            "Generation batch size. Supported by vanilla and deltakv. "
+            "visual_uniform_keep is still single-example."
         ),
     )
     parser.add_argument("--max_new_tokens", type=int, default=16)
@@ -115,8 +124,7 @@ def parse_args():
         "--methods",
         default="vanilla,visual_uniform_keep",
         help=(
-            "Comma-separated methods. Supported: vanilla, deltakv, "
-            "deltakv_delta_quant, visual_uniform_keep."
+            "Comma-separated methods. Supported: vanilla, deltakv, visual_uniform_keep."
         ),
     )
     parser.add_argument("--torch_dtype", default="bfloat16", choices=["bfloat16", "float16"])
@@ -127,9 +135,27 @@ def parse_args():
     parser.add_argument("--prefill_keep_tokens", type=int, default=4096)
     parser.add_argument("--hf_prefill_chunk_size", type=int, default=100000000)
     parser.add_argument("--chunk_prefill_accel_omnikv", action="store_true")
+    parser.add_argument("--snapkv_window_size", type=int, default=32)
     parser.add_argument("--full_attention_layers", default="0,1,2,3,8,16,22")
     parser.add_argument("--visual_keep_ratio", type=float, default=1.0)
-    parser.add_argument("--delta_quant_bits", type=int, default=4, choices=[4])
+    parser.add_argument(
+        "--deltakv_latent_quant_bits",
+        type=int,
+        default=-1,
+        choices=[-1, 0, 2, 4],
+        help="Optional learned DeltaKV latent cache quantization override. -1 preserves checkpoint config.",
+    )
+    parser.add_argument(
+        "--deltakv_latent_quant_group_size",
+        type=int,
+        default=0,
+        help="Optional learned DeltaKV latent quantization group size; 0 uses the full latent dimension.",
+    )
+    parser.add_argument("--deltakv_cache_impl", default="", help="Optional HF DeltaKV cache implementation override.")
+    parser.add_argument("--full_layer_kv_quant_bits", type=int, default=-1, choices=[-1, 0, 2, 4])
+    parser.add_argument("--full_layer_kivi_group_size", type=int, default=32)
+    parser.add_argument("--full_layer_kivi_residual_length", type=int, default=32)
+    parser.add_argument("--enable_sparse_ref_fp8", action="store_true", default=None)
     parser.add_argument("--deltakv_center_ratio", type=float, default=0.1)
     parser.add_argument("--deltakv_neighbor_count", type=int, default=1)
     parser.add_argument("--quantize_visual_kv", action="store_true")
@@ -220,7 +246,13 @@ def build_run_info(args, output_dir: Path, row_count: int) -> dict:
             "hf_prefill_chunk_size": args.hf_prefill_chunk_size,
             "full_attention_layers": args.full_attention_layers,
             "visual_keep_ratio": args.visual_keep_ratio,
-            "delta_quant_bits": args.delta_quant_bits,
+            "deltakv_latent_quant_bits": args.deltakv_latent_quant_bits,
+            "deltakv_latent_quant_group_size": args.deltakv_latent_quant_group_size,
+            "deltakv_cache_impl": args.deltakv_cache_impl,
+            "full_layer_kv_quant_bits": args.full_layer_kv_quant_bits,
+            "full_layer_kivi_group_size": args.full_layer_kivi_group_size,
+            "full_layer_kivi_residual_length": args.full_layer_kivi_residual_length,
+            "enable_sparse_ref_fp8": args.enable_sparse_ref_fp8,
             "deltakv_center_ratio": args.deltakv_center_ratio,
             "deltakv_neighbor_count": args.deltakv_neighbor_count,
             "quantize_visual_kv": bool(args.quantize_visual_kv),
@@ -492,7 +524,7 @@ def build_llava_deltakv_policy(infer_config):
         infer_config.get("deltakv_latent_quant_bits", infer_config.get("kv_quant_bits", 0)) or 0
     )
 
-    return {
+    policy = {
         "method": "llava_deltakv",
         "selection_policy": "standard_deltakv_cache",
         "uses_deltakv_wrapper": True,
@@ -509,28 +541,72 @@ def build_llava_deltakv_policy(infer_config):
             "the checkpoint config."
         ),
     }
+    estimate = estimate_llava_deltakv_budget(infer_config)
+    if estimate is not None:
+        policy["budget_estimate"] = estimate
+    return policy
 
 
-def build_llava_delta_quant_policy(infer_config):
-    kv_quant_bits = int(
-        infer_config.get("deltakv_latent_quant_bits", infer_config.get("kv_quant_bits", 0)) or 0
-    )
-    return {
-        "method": "llava_deltakv_delta_quant",
-        "selection_policy": "cluster_ref_delta_quant",
-        "uses_deltakv_wrapper": True,
-        "uses_learned_compressor": False,
-        "uses_cluster": True,
-        "uses_ref_tokens": True,
-        "uses_visual_uniform_pruning": False,
-        "supports_batch_generation": True,
-        "kv_quant_bits": kv_quant_bits,
-        "note": (
-            "Uses DeltaKV-style cluster/ref reconstruction and stores token-space "
-            "residuals with direct quantization. It does not load or use a learned "
-            "compressor checkpoint."
-        ),
-    }
+def parse_full_layers_for_budget(value) -> list[int]:
+    if value is None:
+        return []
+    if isinstance(value, str):
+        if not value.strip():
+            return []
+        return [int(part.strip()) for part in value.split(",") if part.strip()]
+    return [int(part) for part in value]
+
+
+def estimate_llava_deltakv_budget(infer_config: dict) -> dict | None:
+    """Estimate paper-style KR for LLaVA-OneVision-Qwen2-7B from static cache knobs."""
+    try:
+        num_layers = 28
+        full_layers = parse_full_layers_for_budget(
+            infer_config.get("full_attn_layers", infer_config.get("full_attention_layers", ""))
+        )
+        full_layer_ratio = len(full_layers) / num_layers
+        sparse_layer_ratio = 1.0 - full_layer_ratio
+        center_ratio = float(infer_config.get("cluster_ratio", infer_config.get("deltakv_center_ratio", 0.0)) or 0.0)
+        latent_dim = int(infer_config.get("kv_compressed_size", infer_config.get("deltakv_latent_dim", 0)) or 0)
+        quant_bits = int(infer_config.get("kv_quant_bits", infer_config.get("deltakv_latent_quant_bits", 0)) or 0)
+        if latent_dim <= 0:
+            return None
+        raw_kv_dim = 1024  # 2 * 4 KV heads * 128 head_dim for the local LLaVA-OV 7B Qwen2 text backbone.
+        cache_impl = str(infer_config.get("deltakv_cache_impl", "") or "")
+        full_layer_quant_bits = int(infer_config.get("full_layer_kv_quant_bits", 0) or 0)
+        full_layer_bit_ratio = (
+            (full_layer_quant_bits / 16.0)
+            if cache_impl == "delta_compressed_quant_kivi_full_fp8_ref" and full_layer_quant_bits in (2, 4)
+            else 1.0
+        )
+        ref_bit_ratio = (
+            0.5
+            if cache_impl == "delta_compressed_quant_kivi_full_fp8_ref"
+            and bool(infer_config.get("enable_sparse_ref_fp8", True))
+            else 1.0
+        )
+        bit_ratio = (quant_bits / 16.0) if quant_bits in (2, 4) else 1.0
+        compressed_payload_ratio = (latent_dim / raw_kv_dim) * bit_ratio
+        kr_percent = 100.0 * (
+            full_layer_ratio * full_layer_bit_ratio
+            + sparse_layer_ratio * (center_ratio * ref_bit_ratio + compressed_payload_ratio)
+        )
+        return {
+            "formula": "KR = full_layer_ratio*full_layer_bit_ratio + sparse_layer_ratio*(center_ratio*ref_bit_ratio + latent_dim/raw_kv_dim*quant_bits/16)",
+            "num_layers": num_layers,
+            "full_attention_layers": full_layers,
+            "cache_impl": cache_impl,
+            "center_ratio": center_ratio,
+            "ref_bit_ratio": ref_bit_ratio,
+            "full_layer_bit_ratio": full_layer_bit_ratio,
+            "latent_dim": latent_dim,
+            "raw_kv_dim": raw_kv_dim,
+            "kv_quant_bits": quant_bits,
+            "compressed_payload_ratio": compressed_payload_ratio,
+            "estimated_kr_percent": kr_percent,
+        }
+    except Exception as exc:
+        return {"estimate_error": str(exc)}
 
 
 def build_visual_uniform_policy(args, infer_config):
@@ -561,6 +637,55 @@ def build_visual_uniform_policy(args, infer_config):
         "supports_batch_generation": False,
         "kv_quant_bits": kv_quant_bits,
         "note": note,
+    }
+
+
+def build_llava_omnikv_policy(args, infer_config):
+    return {
+        "method": "llava_omnikv",
+        "selection_policy": "hf_omnikv_raw_cache",
+        "uses_deltakv_wrapper": True,
+        "uses_learned_compressor": False,
+        "uses_cluster": False,
+        "uses_ref_tokens": False,
+        "uses_visual_uniform_pruning": False,
+        "supports_batch_generation": False,
+        "kv_quant_bits": 0,
+        "budget": {
+            "full_attention_layers": infer_config["full_attention_layers"],
+            "sink_keep_tokens": args.sink_keep_tokens,
+            "recent_keep_tokens": args.recent_keep_tokens,
+            "decode_keep_tokens": args.decode_keep_tokens,
+            "prefill_keep_tokens": args.prefill_keep_tokens,
+        },
+        "note": (
+            "Uses the LLaVA-OneVision DeltaKV wrapper with the HF OmniKV raw-cache path. "
+            "No learned compressor, no cluster/ref reconstruction, and no visual-token pruning."
+        ),
+    }
+
+
+def build_llava_snapkv_policy(args, infer_config):
+    return {
+        "method": "llava_snapkv",
+        "selection_policy": "hf_snapkv_prefill_static_prune",
+        "uses_deltakv_wrapper": True,
+        "uses_learned_compressor": False,
+        "uses_cluster": False,
+        "uses_ref_tokens": False,
+        "uses_visual_uniform_pruning": False,
+        "supports_batch_generation": False,
+        "kv_quant_bits": 0,
+        "budget": {
+            "sink_keep_tokens": args.sink_keep_tokens,
+            "recent_keep_tokens": args.recent_keep_tokens,
+            "decode_keep_tokens": args.decode_keep_tokens,
+            "snapkv_window_size": args.snapkv_window_size,
+        },
+        "note": (
+            "Uses the local Qwen2 SnapKV attention path under the LLaVA-OneVision multimodal wrapper. "
+            "The prompt is chunked so the final prefill chunk is the SnapKV observation window."
+        ),
     }
 
 
@@ -617,22 +742,73 @@ def load_llava_deltakv_model(args, dtype, device):
     if compressor_path is None:
         raise ValueError("deltakv requires a real --deltakv_checkpoint_path, not 'none'.")
     compressor_config = json.loads((compressor_path / "config.json").read_text())
-    infer_config = migrate_checkpoint_infer_config(
-        {key: compressor_config[key] for key in CUSTOM_CONFIG_KEYS if key in compressor_config}
-    )
-    infer_config.update(
-        {
+    if isinstance(compressor_config.get("deltakv_infer_config"), dict):
+        infer_config = migrate_checkpoint_infer_config(compressor_config["deltakv_infer_config"])
+        infer_config_is_native = bool(compressor_config.get("deltakv_infer_config_is_native", False))
+    else:
+        infer_config = migrate_checkpoint_infer_config(
+            {key: compressor_config[key] for key in CUSTOM_CONFIG_KEYS if key in compressor_config}
+        )
+        infer_config_is_native = True
+    if infer_config_is_native:
+        runtime_overrides = {
             "visual_token_prune_only": False,
+            "full_attn_layers": args.full_attention_layers,
             "num_recent_tokens": args.recent_keep_tokens,
             "num_sink_tokens": args.sink_keep_tokens,
             "num_top_tokens": args.decode_keep_tokens,
             "num_top_tokens_in_prefill": args.prefill_keep_tokens,
+            "cluster_ratio": args.deltakv_center_ratio,
+            "deltakv_neighbor_count": args.deltakv_neighbor_count,
             "chunk_prefill_size": args.hf_prefill_chunk_size,
             "chunk_prefill_accel_omnikv": bool(args.chunk_prefill_accel_omnikv),
         }
-    )
+        if str(getattr(args, "deltakv_cache_impl", "") or "").strip():
+            runtime_overrides["deltakv_cache_impl"] = str(args.deltakv_cache_impl).strip()
+        latent_quant_bits = int(getattr(args, "deltakv_latent_quant_bits", -1))
+        if latent_quant_bits >= 0:
+            runtime_overrides["kv_quant_bits"] = latent_quant_bits
+            runtime_overrides["kv_quant_group_size"] = int(getattr(args, "deltakv_latent_quant_group_size", 0))
+        full_layer_quant_bits = int(getattr(args, "full_layer_kv_quant_bits", -1))
+        if full_layer_quant_bits >= 0:
+            runtime_overrides["full_layer_kv_quant_bits"] = full_layer_quant_bits
+            runtime_overrides["full_layer_kivi_group_size"] = int(getattr(args, "full_layer_kivi_group_size", 32))
+            runtime_overrides["full_layer_kivi_residual_length"] = int(
+                getattr(args, "full_layer_kivi_residual_length", 32)
+            )
+        if getattr(args, "enable_sparse_ref_fp8", None) is not None:
+            runtime_overrides["enable_sparse_ref_fp8"] = bool(args.enable_sparse_ref_fp8)
+    else:
+        runtime_overrides = {
+            "visual_token_prune_only": False,
+            "full_attention_layers": args.full_attention_layers,
+            "recent_keep_tokens": args.recent_keep_tokens,
+            "sink_keep_tokens": args.sink_keep_tokens,
+            "decode_keep_tokens": args.decode_keep_tokens,
+            "prefill_keep_tokens": args.prefill_keep_tokens,
+            "deltakv_center_ratio": args.deltakv_center_ratio,
+            "deltakv_neighbor_count": args.deltakv_neighbor_count,
+            "hf_prefill_chunk_size": args.hf_prefill_chunk_size,
+            "chunk_prefill_accel_omnikv": bool(args.chunk_prefill_accel_omnikv),
+        }
+        if str(getattr(args, "deltakv_cache_impl", "") or "").strip():
+            runtime_overrides["deltakv_cache_impl"] = str(args.deltakv_cache_impl).strip()
+        latent_quant_bits = int(getattr(args, "deltakv_latent_quant_bits", -1))
+        if latent_quant_bits >= 0:
+            runtime_overrides["deltakv_latent_quant_bits"] = latent_quant_bits
+            runtime_overrides["deltakv_latent_quant_group_size"] = int(getattr(args, "deltakv_latent_quant_group_size", 0))
+        full_layer_quant_bits = int(getattr(args, "full_layer_kv_quant_bits", -1))
+        if full_layer_quant_bits >= 0:
+            runtime_overrides["full_layer_kv_quant_bits"] = full_layer_quant_bits
+            runtime_overrides["full_layer_kivi_group_size"] = int(getattr(args, "full_layer_kivi_group_size", 32))
+            runtime_overrides["full_layer_kivi_residual_length"] = int(
+                getattr(args, "full_layer_kivi_residual_length", 32)
+            )
+        if getattr(args, "enable_sparse_ref_fp8", None) is not None:
+            runtime_overrides["enable_sparse_ref_fp8"] = bool(args.enable_sparse_ref_fp8)
+    infer_config.update(runtime_overrides)
     policy = build_llava_deltakv_policy(infer_config)
-    model, policy = _load_llava_deltakv_wrapper(args, dtype, device, config, infer_config, True, policy)
+    model, policy = _load_llava_deltakv_wrapper(args, dtype, device, config, infer_config, infer_config_is_native, policy)
     incompatible = load_deltakv_compressor_into_llava(model, str(compressor_path), device="cpu")
     compressor_missing = [key for key in incompatible.missing_keys if "compress_" in key]
     if compressor_missing:
@@ -640,19 +816,14 @@ def load_llava_deltakv_model(args, dtype, device):
     return model, policy
 
 
-def load_llava_delta_quant_model(args, dtype, device):
+def load_llava_omnikv_model(args, dtype, device):
     if resolve_compressor_path(args) is not None:
-        raise ValueError(
-            "deltakv_delta_quant does not use a learned compressor checkpoint. "
-            "Set --deltakv_checkpoint_path none."
-        )
+        raise ValueError("omnikv does not use a learned compressor checkpoint. Set --deltakv_checkpoint_path none.")
     config = LlavaOnevisionConfig.from_pretrained(args.model_path, trust_remote_code=True)
     infer_config = {
         "use_compression": False,
-        "use_cluster": True,
-        "deltakv_latent_quant_bits": args.delta_quant_bits,
-        "deltakv_center_ratio": args.deltakv_center_ratio,
-        "deltakv_neighbor_count": args.deltakv_neighbor_count,
+        "use_cluster": False,
+        "hf_sparse_cache_impl": "omnikv",
         "full_attention_layers": args.full_attention_layers,
         "deltakv_use_omnikv_selection": True,
         "omnikv_score_method": "last",
@@ -664,7 +835,36 @@ def load_llava_delta_quant_model(args, dtype, device):
         "hf_prefill_chunk_size": args.hf_prefill_chunk_size,
         "chunk_prefill_accel_omnikv": bool(args.chunk_prefill_accel_omnikv),
     }
-    policy = build_llava_delta_quant_policy(infer_config)
+    policy = build_llava_omnikv_policy(args, infer_config)
+    config.deltakv_text_model_kind = "omnikv"
+    model, policy = _load_llava_deltakv_wrapper(args, dtype, device, config, infer_config, False, policy)
+    return model, policy
+
+
+def load_llava_snapkv_model(args, dtype, device):
+    if resolve_compressor_path(args) is not None:
+        raise ValueError("snapkv does not use a learned compressor checkpoint. Set --deltakv_checkpoint_path none.")
+    if int(args.recent_keep_tokens) < int(args.snapkv_window_size):
+        raise ValueError(
+            "snapkv requires --recent_keep_tokens >= --snapkv_window_size because the observation window "
+            "is protected by the recent tail."
+        )
+    config = LlavaOnevisionConfig.from_pretrained(args.model_path, trust_remote_code=True)
+    infer_config = {
+        "use_compression": False,
+        "use_cluster": False,
+        "full_attention_layers": "",
+        "visual_token_prune_only": False,
+        "recent_keep_tokens": args.recent_keep_tokens,
+        "sink_keep_tokens": args.sink_keep_tokens,
+        "decode_keep_tokens": args.decode_keep_tokens,
+        "prefill_keep_tokens": args.prefill_keep_tokens,
+        "hf_prefill_chunk_size": args.hf_prefill_chunk_size,
+        "snapkv_window_size": args.snapkv_window_size,
+        "pool_kernel_size": 1,
+    }
+    policy = build_llava_snapkv_policy(args, infer_config)
+    config.deltakv_text_model_kind = "snapkv"
     model, policy = _load_llava_deltakv_wrapper(args, dtype, device, config, infer_config, False, policy)
     return model, policy
 
@@ -916,8 +1116,6 @@ def iter_requested_methods(methods: str):
             yield raw_method, "vanilla"
         elif method in VISUAL_PRUNE_METHOD_ALIASES:
             yield raw_method, "visual_cache"
-        elif method in {"deltakv_delta_quant", "delta_quant", "llava_deltakv_delta_quant"}:
-            yield raw_method, "deltakv_delta_quant"
         elif method in {"deltakv", "llava_deltakv"}:
             yield raw_method, "deltakv"
         elif method == "visual_deltakv_compressor":
@@ -925,7 +1123,7 @@ def iter_requested_methods(methods: str):
         else:
             raise ValueError(
                 f"Unknown method: {raw_method}. Supported: vanilla, deltakv, "
-                "deltakv_delta_quant, or visual_uniform_keep."
+                "or visual_uniform_keep."
             )
 
 
@@ -954,9 +1152,6 @@ def main():
             policy = None
         elif method_kind == "deltakv" and resolve_compressor_path(args) is None:
             raise ValueError("deltakv requires a real --deltakv_checkpoint_path, not 'none'.")
-        elif method_kind == "deltakv_delta_quant":
-            model, policy = load_llava_delta_quant_model(args, dtype, device)
-            method_label = policy["method"]
         elif method_kind == "visual_cache" and resolve_compressor_path(args) is not None:
             raise ValueError(
                 "visual_uniform_keep is the no-checkpoint uniform baseline. "

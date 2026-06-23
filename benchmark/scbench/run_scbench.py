@@ -56,15 +56,25 @@ from transformers import (
     MambaForCausalLM,
     Qwen2ForCausalLM,
 )
-from transformers.cache_utils import SinkCache
 from transformers.modeling_outputs import BaseModelOutputWithPast
 from transformers.utils.import_utils import _is_package_available
 
+LLM = None
+SamplingParams = None
 if _is_package_available("vllm"):
-    from vllm import LLM, SamplingParams
+    try:
+        from vllm import LLM, SamplingParams
+    except ImportError:
+        LLM = None
+        SamplingParams = None
+
+LMCacheLLM = None
 if _is_package_available("lmcache_vllm"):
-    from lmcache_vllm.vllm import LLM as LMCacheLLM
-    import lmcache_vllm
+    try:
+        from lmcache_vllm.vllm import LLM as LMCacheLLM
+        import lmcache_vllm
+    except ImportError:
+        LMCacheLLM = None
 
 import random
 
@@ -209,6 +219,27 @@ def _filter_examples(
     return examples.select(selected_indices)
 
 
+def _load_scbench_dataset(data_name: str):
+    local_data_dir = os.environ.get("SCBENCH_LOCAL_DATA_DIR")
+    if local_data_dir:
+        root = Path(local_data_dir)
+        candidates = [
+            (root / data_name / "test-00000-of-00001.parquet", "parquet"),
+            (root / f"{data_name}.parquet", "parquet"),
+            (root / "data" / f"{data_name}.jsonl", "json"),
+            (root / f"{data_name}.jsonl", "json"),
+        ]
+        for path, loader in candidates:
+            if path.exists():
+                return load_dataset(loader, data_files=str(path), split="train")
+        raise FileNotFoundError(
+            f"SCBENCH_LOCAL_DATA_DIR={local_data_dir!r} does not contain "
+            f"a standard SCBench file for task {data_name!r}."
+        )
+
+    return load_dataset("microsoft/SCBench", data_name, split="test")
+
+
 def _select_worker_cuda_device(rank: int, world_size: int) -> int:
     visible_devices = [
         device.strip()
@@ -280,7 +311,7 @@ def _run_scbench_worker(
             max_new_tokens = 500
 
         output_path = result_dir / f"prediction_{data_name}{use_scdq}{use_llmlingua}.rank{rank}.jsonl"
-        examples = load_dataset("microsoft/SCBench", data_name, split="test")
+        examples = _load_scbench_dataset(data_name)
 
         if args.use_llmlingua:
             compression_ratio = hyper_param.get("llmlingua_ratio", 3) if hyper_param else 3
@@ -482,6 +513,8 @@ def load_model(
         return llm, tok
 
     if attn_type == "vllm_blend":
+        if LMCacheLLM is None:
+            raise ImportError("lmcache_vllm is required for attn_type='vllm_blend'.")
         llm = LMCacheLLM(
             model=model_name,
             enable_prefix_caching=True,
@@ -494,6 +527,8 @@ def load_model(
         )
         llm = GreedySearch_vLLM(llm, tok)
     elif attn_type == "vllm_kv":
+        if LLM is None:
+            raise ImportError("vllm is required for attn_type='vllm_kv'.")
         llm = LLM(
             model=model_name,
             max_model_len=max_seq_length,
@@ -519,6 +554,8 @@ def load_model(
             is_kv_compress=True,
         )
     elif "vllm" in attn_type:
+        if LLM is None:
+            raise ImportError(f"vllm is required for attn_type={attn_type!r}.")
         # num_gpus
         llm = LLM(
             model=model_name,
@@ -711,7 +748,7 @@ if __name__ == "__main__":
                 max_new_tokens = 500
 
             output_path = result_dir / f"prediction_{data_name}{use_scdq}{use_llmlingua}.jsonl"
-            examples = load_dataset("microsoft/SCBench", data_name, split="test")
+            examples = _load_scbench_dataset(data_name)
 
             if args.use_llmlingua:
                 compression_ratio = args.hyper_param.get("llmlingua_ratio", 3) if args.hyper_param else 3

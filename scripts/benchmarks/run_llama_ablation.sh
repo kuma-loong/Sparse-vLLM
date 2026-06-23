@@ -41,7 +41,6 @@ run_train() {
         --max_steps 5000 \
         --learning_rate 2e-4 \
         --use_nonlinear_compressor True \
-        --ref_mode avg \
         --collect_kv_before_rope True \
         --model_type cluster_e2e_big \
         --cluster_soft_assignment False \

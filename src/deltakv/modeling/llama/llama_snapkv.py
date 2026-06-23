@@ -2,8 +2,8 @@ import torch
 from typing import Optional, Union
 from torch import nn
 from transformers.models.llama.modeling_llama import (
-    LlamaAttention, Unpack, FlashAttentionKwargs, Callable, eager_attention_forward, ALL_ATTENTION_FUNCTIONS, LlamaDecoderLayer, LlamaModel, LlamaForCausalLM,
-    KwargsForCausalLM, apply_rotary_pos_emb
+    LlamaAttention, Unpack, TransformersKwargs as FlashAttentionKwargs, Callable, eager_attention_forward, ALL_ATTENTION_FUNCTIONS, LlamaDecoderLayer, LlamaModel, LlamaForCausalLM,
+    TransformersKwargs as KwargsForCausalLM, apply_rotary_pos_emb
 )
 from deltakv.modeling.cache_pipeline import SnapKVCache
 from deltakv.configs.model_config_cls import KVLlamaConfig
@@ -26,9 +26,15 @@ class LlamaSnapKVAttention(LlamaAttention):
             position_embeddings: tuple[torch.Tensor, torch.Tensor],
             attention_mask: Optional[torch.Tensor],
             past_key_value: Optional[SnapKVCache] = None,
+            past_key_values: Optional[SnapKVCache] = None,
             cache_position: Optional[torch.LongTensor] = None,
             **kwargs: Unpack[FlashAttentionKwargs],
     ):
+        if past_key_value is None:
+            past_key_value = past_key_values
+        kwargs.pop("position_ids", None)
+        kwargs.pop("use_cache", None)
+
         input_shape = hidden_states.shape[:-1]
         hidden_shape = (*input_shape, -1, self.head_dim)
         bs, q_len, ___ = hidden_states.shape

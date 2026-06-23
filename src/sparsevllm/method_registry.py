@@ -15,6 +15,12 @@ METHOD_ALIASES = {
     "vanilla": "",
     "attention-sink": "streamingllm",
     "attention_sink": "streamingllm",
+    # DeltaKV now has one public runtime.  The old names stay as aliases so old
+    # config files still load, but all code routes through vllm_sparse_method="deltakv".
+    "deltakv-less-memory": "deltakv",
+    "deltakv_less_memory": "deltakv",
+    "deltakv-less-memory-cudagraph": "deltakv",
+    "deltakv_less_memory_cudagraph": "deltakv",
 }
 
 CANONICAL_SPARSE_METHODS = {
@@ -25,21 +31,13 @@ CANONICAL_SPARSE_METHODS = {
     "omnikv",
     "quest",
     "deltakv",
-    "deltakv-triton",
-    "deltakv-triton-v2",
-    "deltakv-triton-v3",
-    "deltakv-triton-v4",
-    "deltakv-delta-quant",
-    "deltakv_delta_quant",
-    "deltakv-standalone",
-    "deltakv-snapkv",
 }
 
 SUPPORTED_SPARSE_METHODS = set(CANONICAL_SPARSE_METHODS)
+SUPPORTED_SPARSE_METHOD_ALIASES = {str(k) for k in METHOD_ALIASES if k is not None and str(k)}
 
-DECODE_CUDA_GRAPH_SUPPORTED_METHODS = {
-    method for method in CANONICAL_SPARSE_METHODS if not method.startswith("deltakv")
-}
+# All shipped cache managers now expose a graph-stable decode preparation path.
+DECODE_CUDA_GRAPH_SUPPORTED_METHODS = set(CANONICAL_SPARSE_METHODS)
 
 _DEFAULT_PREFILL_POLICY_BY_METHOD = {
     "": PREFILL_POLICY_ALL_CHUNKED,
@@ -49,14 +47,6 @@ _DEFAULT_PREFILL_POLICY_BY_METHOD = {
     "omnikv": PREFILL_POLICY_ALL_CHUNKED,
     "quest": PREFILL_POLICY_ALL_CHUNKED,
     "deltakv": PREFILL_POLICY_LONG_BS1FULL_SHORT_BATCH,
-    "deltakv-triton": PREFILL_POLICY_LONG_BS1FULL_SHORT_BATCH,
-    "deltakv-triton-v2": PREFILL_POLICY_LONG_BS1FULL_SHORT_BATCH,
-    "deltakv-triton-v3": PREFILL_POLICY_LONG_BS1FULL_SHORT_BATCH,
-    "deltakv-triton-v4": PREFILL_POLICY_LONG_BS1FULL_SHORT_BATCH,
-    "deltakv-delta-quant": PREFILL_POLICY_LONG_BS1FULL_SHORT_BATCH,
-    "deltakv_delta_quant": PREFILL_POLICY_LONG_BS1FULL_SHORT_BATCH,
-    "deltakv-standalone": PREFILL_POLICY_LONG_BS1FULL_SHORT_BATCH,
-    "deltakv-snapkv": PREFILL_POLICY_LONG_BS1FULL_SHORT_BATCH,
 }
 
 PREFILL_POLICY_BY_METHOD = {
@@ -64,6 +54,10 @@ PREFILL_POLICY_BY_METHOD = {
     "vanilla": PREFILL_POLICY_ALL_CHUNKED,
     "attention-sink": PREFILL_POLICY_ALL_CHUNKED,
     "attention_sink": PREFILL_POLICY_ALL_CHUNKED,
+    "deltakv-less-memory": PREFILL_POLICY_LONG_BS1FULL_SHORT_BATCH,
+    "deltakv_less_memory": PREFILL_POLICY_LONG_BS1FULL_SHORT_BATCH,
+    "deltakv-less-memory-cudagraph": PREFILL_POLICY_LONG_BS1FULL_SHORT_BATCH,
+    "deltakv_less_memory_cudagraph": PREFILL_POLICY_LONG_BS1FULL_SHORT_BATCH,
 }
 
 
@@ -75,7 +69,7 @@ def normalize_sparse_method(method: str | None) -> str:
 
 
 def is_deltakv_method(method: str | None) -> bool:
-    return normalize_sparse_method(method).startswith("deltakv")
+    return normalize_sparse_method(method) == "deltakv"
 
 
 def is_decode_cuda_graph_supported(method: str | None) -> bool:
@@ -86,8 +80,10 @@ def get_default_prefill_schedule_policy(method: str | None) -> str:
     normalized = normalize_sparse_method(method)
     if normalized not in _DEFAULT_PREFILL_POLICY_BY_METHOD:
         supported = ", ".join(repr(name) for name in sorted(CANONICAL_SPARSE_METHODS) if name)
+        aliases = ", ".join(repr(name) for name in sorted(SUPPORTED_SPARSE_METHOD_ALIASES))
         raise ValueError(
-            f"Unsupported vllm_sparse_method={method!r}. Supported methods: '', {supported}."
+            f"Unsupported vllm_sparse_method={method!r}. Supported methods: '', {supported}. "
+            f"Supported aliases: {aliases}."
         )
     return _DEFAULT_PREFILL_POLICY_BY_METHOD[normalized]
 

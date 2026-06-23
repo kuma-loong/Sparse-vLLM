@@ -15,6 +15,10 @@ except ImportError:
     KV_TYPES = ["dense", "retr_attn", "kivi"]
 
 for attn_type in (
+    "snapkv",
+    "pyramidkv",
+    "palu",
+    "quest",
     "delta_compressed_latent_wo_full",
     "delta_compressed_latent_w_full",
     "delta_origin_wo_full",

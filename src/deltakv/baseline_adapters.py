@@ -4,7 +4,7 @@ import sys
 import torch
 from transformers import AutoConfig
 
-from deltakv.configs.model_config_cls import KVQwen2Config, KVLlamaConfig
+from deltakv.configs.model_config_cls import KVQwen2Config, KVQwen3Config, KVLlamaConfig
 from deltakv.modeling.cache_pipeline import HF_SPARSE_CACHE_OMNIKV
 
 
@@ -24,6 +24,10 @@ def load_omnikv_model(model_path: str, infer_config: dict, cuda_device):
         from deltakv.modeling.qwen2_inference import Qwen2KVCompress as KVModel
 
         config_cls = KVQwen2Config
+    elif base_config.model_type == "qwen3":
+        from deltakv.modeling.qwen3_inference import Qwen3KVCompress as KVModel
+
+        config_cls = KVQwen3Config
     elif base_config.model_type == "llama":
         from deltakv.modeling.llama_inference import LlamaKVCompress as KVModel
 

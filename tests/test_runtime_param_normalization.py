@@ -8,10 +8,9 @@ class RuntimeParamNormalizationTest(unittest.TestCase):
     def test_sparsevllm_normalizes_canonical_runtime_params(self):
         normalized = normalize_runtime_params(
             {
-                "sparse_method": "deltakv-triton-v4",
+                "sparse_method": "deltakv",
                 "deltakv_checkpoint_path": "/tmp/compressor",
                 "decode_keep_tokens": 2048,
-                "prefill_keep_tokens": 4096,
                 "sink_keep_tokens": 8,
                 "recent_keep_tokens": 128,
                 "full_attention_layers": "0,1,2,8,18",
@@ -31,10 +30,9 @@ class RuntimeParamNormalizationTest(unittest.TestCase):
         self.assertEqual(
             normalized.infer_config,
             {
-                "vllm_sparse_method": "deltakv-triton-v4",
+                "vllm_sparse_method": "deltakv",
                 "deltakv_path": "/tmp/compressor",
-                "num_top_tokens": 2048,
-                "num_top_tokens_in_prefill": 4096,
+                "decode_keep_tokens": 2048,
                 "num_sink_tokens": 8,
                 "num_recent_tokens": 128,
                 "full_attn_layers": "0,1,2,8,18",
@@ -61,6 +59,7 @@ class RuntimeParamNormalizationTest(unittest.TestCase):
                 "deltakv_neighbor_count": 4,
                 "deltakv_center_ratio": 0.1,
                 "deltakv_latent_dim": 256,
+                "deltakv_latent_quant_group_size": 32,
                 "hf_prefill_chunk_size": 32768,
             },
             backend="hf",
@@ -79,6 +78,7 @@ class RuntimeParamNormalizationTest(unittest.TestCase):
                 "deltakv_neighbor_count": 4,
                 "cluster_ratio": 0.1,
                 "kv_compressed_size": 256,
+                "kv_quant_group_size": 32,
                 "chunk_prefill_size": 32768,
             },
         )
@@ -92,6 +92,8 @@ class RuntimeParamNormalizationTest(unittest.TestCase):
             "num_top_tokens",
             "chunk_prefill_size",
             "seq_chunk_size",
+            "compressor_token_group_size",
+            "ref_mode",
             "k_neighbors",
             "deltakv_visual_compress_only",
         ):
@@ -102,6 +104,16 @@ class RuntimeParamNormalizationTest(unittest.TestCase):
     def test_sparsevllm_vanilla_alias_maps_to_empty_method(self):
         normalized = normalize_runtime_params({"sparse_method": "vanilla"}, backend="sparsevllm")
         self.assertEqual(normalized.infer_config["vllm_sparse_method"], "")
+
+    def test_hf_less_memory_routes_to_deltakv_model(self):
+        normalized = normalize_runtime_params({"sparse_method": "deltakv-less-memory"}, backend="hf")
+        self.assertEqual(normalized.hf_model_cls, "deltakv")
+
+    def test_hf_kivi_alias_routes_to_hf_kivi_model(self):
+        for sparse_method in ("hf_kivi", "kivi_hf"):
+            with self.subTest(sparse_method=sparse_method):
+                normalized = normalize_runtime_params({"sparse_method": sparse_method}, backend="hf")
+                self.assertEqual(normalized.hf_model_cls, "hf_kivi")
 
     def test_sparsevllm_rejects_ratio_style_keep_budgets(self):
         with self.assertRaisesRegex(ValueError, "explicit token count"):
@@ -117,6 +129,10 @@ class RuntimeParamNormalizationTest(unittest.TestCase):
             full_attention_layers="0,1,2",
             deltakv_neighbor_count=3,
             hf_prefill_chunk_size=32768,
+            deltakv_latent_quant_bits=2,
+            full_layer_kv_quant_bits=4,
+            full_layer_cluster_ratio=0.1,
+            full_layer_stride_alpha=0.0,
             visual_token_prune_only=True,
             visual_token_keep_ratio=0.1,
         )
@@ -129,6 +145,10 @@ class RuntimeParamNormalizationTest(unittest.TestCase):
         self.assertEqual(cfg.full_attn_layers, [0, 1, 2])
         self.assertEqual(cfg.deltakv_neighbor_count, 3)
         self.assertEqual(cfg.chunk_prefill_size, 32768)
+        self.assertEqual(cfg.kv_quant_bits, 2)
+        self.assertEqual(cfg.full_layer_kv_quant_bits, 4)
+        self.assertEqual(cfg.full_layer_cluster_ratio, 0.1)
+        self.assertEqual(cfg.full_layer_stride_alpha, 0.0)
         self.assertTrue(cfg.visual_token_prune_only)
         self.assertEqual(cfg.visual_token_keep_ratio, 0.1)
 

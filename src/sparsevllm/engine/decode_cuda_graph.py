@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections import OrderedDict
 from dataclasses import dataclass, field
 from typing import Callable
 
@@ -10,11 +11,42 @@ from sparsevllm.utils.context import get_context, set_context
 from sparsevllm.utils.profiler import profiler
 
 
+def _default_context_buckets(max_context_len: int) -> list[int]:
+    max_context_len = int(max_context_len)
+    if max_context_len <= 0:
+        max_context_len = 1024
+    size = min(1024, max_context_len)
+    buckets: list[int] = []
+    while size < max_context_len:
+        buckets.append(size)
+        size *= 2
+    buckets.append(size)
+    return sorted(set(buckets))
+
+
+def _normalize_context_buckets(value) -> list[int]:
+    if value is None:
+        return _default_context_buckets(1024)
+    if isinstance(value, str):
+        raw = value.strip().lower()
+        if raw in {"", "auto"}:
+            return _default_context_buckets(1024)
+        buckets = [int(part.strip()) for part in value.split(",") if part.strip()]
+    elif isinstance(value, int):
+        buckets = [int(value)]
+    else:
+        buckets = [int(item) for item in value]
+    buckets = sorted(set(buckets))
+    if not buckets or any(bucket <= 0 for bucket in buckets):
+        raise ValueError(f"decode_cuda_graph_context_sizes must contain positive integers, got {buckets}.")
+    return buckets
+
+
 @dataclass(frozen=True)
 class DecodeCudaGraphKey:
     method: str
     batch_size: int
-    max_context_len: int
+    context_capacity: int
     is_long_text: bool
     capture_sampling: bool
 
@@ -35,11 +67,13 @@ class DecodeCudaGraphState:
 
 
 class DecodeCudaGraphRunner:
-    """Fixed-shape CUDA Graph runner for decode forward.
+    """Fixed-shape decode runner, optionally backed by CUDA Graph replay.
 
     The runner owns graph-stable decode metadata tensors. Cache managers still
     allocate real KV slots every step, but write the per-step metadata into these
-    stable buffers before replay.
+    stable buffers before the model forward. CUDA Graph is an execution mode on
+    top of the same static-compatible decode path; eager decode uses the same
+    preparation and view-building route without capture/replay.
     """
 
     def __init__(
@@ -52,6 +86,8 @@ class DecodeCudaGraphRunner:
         method: str,
         rank: int,
         capture_sizes: list[int],
+        context_sizes: list[int] | tuple[int, ...] | str | int | None = None,
+        graph_pool=None,
     ):
         self.cache_manager = cache_manager
         self.sparse_controller = sparse_controller
@@ -62,21 +98,108 @@ class DecodeCudaGraphRunner:
         self.capture_sizes = sorted(set(int(size) for size in capture_sizes))
         if not self.capture_sizes or any(size <= 0 for size in self.capture_sizes):
             raise ValueError(f"decode_cuda_graph capture_sizes must be positive, got {capture_sizes}.")
+        self.context_sizes = _normalize_context_buckets(context_sizes)
         self.max_context_len_override: int | None = None
-        self._graphs: dict[DecodeCudaGraphKey, DecodeCudaGraphState] = {}
+        self._graphs: OrderedDict[DecodeCudaGraphKey, DecodeCudaGraphState] = OrderedDict()
+        self.max_cached_graphs = self._resolve_max_cached_graphs()
         self.last_state_key: DecodeCudaGraphKey | None = None
         self.last_real_batch_size: int | None = None
+        self.graph_pool = graph_pool
+
+    def _resolve_max_cached_graphs(self) -> int | None:
+        resolver = getattr(self.cache_manager, "decode_cuda_graph_max_cached_graphs", None)
+        if resolver is None:
+            return None
+        max_cached_graphs = resolver()
+        if max_cached_graphs is None:
+            return None
+        max_cached_graphs = int(max_cached_graphs)
+        if max_cached_graphs <= 0:
+            raise ValueError(f"decode_cuda_graph_max_cached_graphs must be positive, got {max_cached_graphs}.")
+        return max_cached_graphs
 
     def set_max_context_len_override(self, max_context_len: int | None):
         self.max_context_len_override = None if max_context_len is None else int(max_context_len)
 
-    def _requested_max_context_len(self, seqs: list[Sequence]) -> int:
+    def clear_captured_graphs(self):
+        for state in list(self._graphs.values()):
+            self._release_graph_state(state)
+        self._graphs.clear()
+        self.last_state_key = None
+        self.last_real_batch_size = None
+
+    @staticmethod
+    def _release_graph_state(state: DecodeCudaGraphState):
+        state.graph = None
+        state.input_ids = None
+        state.positions = None
+        state.slot_mapping = None
+        state.context_lens = None
+        state.req_indices = None
+        state.logits = None
+        state.token_ids = None
+        state.keepalive.clear()
+        state.sparse_state_refs.clear()
+
+    def _touch_graph_state(self, key: DecodeCudaGraphKey):
+        move_to_end = getattr(self._graphs, "move_to_end", None)
+        if move_to_end is not None:
+            move_to_end(key)
+
+    def _evict_cached_graphs(self, protected_key: DecodeCudaGraphKey):
+        max_cached_graphs = getattr(self, "max_cached_graphs", None)
+        if max_cached_graphs is None:
+            return
+        while len(self._graphs) > int(max_cached_graphs):
+            for key in list(self._graphs.keys()):
+                if key == protected_key:
+                    continue
+                state = self._graphs.pop(key)
+                self._release_graph_state(state)
+                break
+            else:
+                break
+
+    def _context_capacity_bucket(self, context_len: int) -> int:
+        """Map a real/requested context length to the configured graph bucket.
+
+        Default buckets are 1k, 2k, 4k, 8k, ... . We intentionally do not
+        match an arbitrary larger cached graph here; bucket selection should
+        decide the exact graph family so a later 4k request does not silently
+        replay a previously captured 128k graph.
+        """
+        context_len = max(1, int(context_len))
+        buckets = getattr(self, "context_sizes", None)
+        if not buckets:
+            buckets = _default_context_buckets(max(1024, context_len))
+            self.context_sizes = buckets
+        for bucket in buckets:
+            if int(bucket) >= context_len:
+                return int(bucket)
+        raise ValueError(
+            "decode_cuda_graph_context_sizes do not cover current context length: "
+            f"context_len={context_len}, context_sizes={list(buckets)}."
+        )
+
+    def _requested_context_capacity(self, seqs: list[Sequence]) -> int:
         max_context_len = max(int(seq.num_prompt_tokens) + int(seq.max_tokens) for seq in seqs)
         if self.max_context_len_override is not None:
             max_context_len = max(max_context_len, int(self.max_context_len_override))
-        return int(max_context_len)
+        return self._context_capacity_bucket(max_context_len)
+
+    def _current_context_capacity(self, seqs: list[Sequence]) -> int:
+        max_context_len = max(int(seq.num_tokens) for seq in seqs)
+        if self.max_context_len_override is not None:
+            max_context_len = max(max_context_len, int(self.max_context_len_override))
+        return self._context_capacity_bucket(max_context_len)
 
     def _select_graph_batch_size(self, real_batch_size: int) -> int:
+        selector = getattr(self.cache_manager, "select_decode_cuda_graph_batch_size", None)
+        if selector is not None:
+            selected = selector(int(real_batch_size), list(self.capture_sizes))
+            if selected is not None:
+                return int(selected)
+
         for size in self.capture_sizes:
             if size >= real_batch_size:
                 return int(size)
@@ -90,9 +213,10 @@ class DecodeCudaGraphRunner:
         *,
         method: str,
         batch_size: int,
-        max_context_len: int,
+        context_capacity: int,
         is_long_text: bool,
         capture_sampling: bool,
+        allow_larger_context_capacity: bool = True,
     ) -> DecodeCudaGraphState:
         candidates = [
             state
@@ -101,15 +225,20 @@ class DecodeCudaGraphRunner:
             and key.batch_size == batch_size
             and key.is_long_text == is_long_text
             and key.capture_sampling == capture_sampling
-            and key.max_context_len >= max_context_len
+            and (
+                key.context_capacity == context_capacity
+                or (allow_larger_context_capacity and key.context_capacity >= context_capacity)
+            )
         ]
         if candidates:
-            return min(candidates, key=lambda state: state.key.max_context_len)
+            state = min(candidates, key=lambda state: state.key.context_capacity)
+            self._touch_graph_state(state.key)
+            return state
 
         key = DecodeCudaGraphKey(
             method=method,
             batch_size=batch_size,
-            max_context_len=max_context_len,
+            context_capacity=context_capacity,
             is_long_text=bool(is_long_text),
             capture_sampling=capture_sampling,
         )
@@ -120,6 +249,7 @@ class DecodeCudaGraphRunner:
         state.context_lens = torch.empty((batch_size,), dtype=torch.int32, device="cuda")
         state.req_indices = torch.empty((batch_size,), dtype=torch.int32, device="cuda")
         self._graphs[key] = state
+        self._evict_cached_graphs(key)
         return state
 
     def _prepare_static_step(
@@ -138,6 +268,7 @@ class DecodeCudaGraphRunner:
         assert state.context_lens is not None
         assert state.req_indices is not None
 
+        self.cache_manager.set_decode_static_max_context_len(int(state.key.context_capacity))
         input_ids, positions, _ = prepare_decode_static(
             seqs,
             state.input_ids,
@@ -154,10 +285,59 @@ class DecodeCudaGraphRunner:
             is_long_text=bool(is_long_text),
             seqs=seqs,
         )
-
-        self.cache_manager.set_decode_static_max_context_len(int(state.key.max_context_len))
+        self.cache_manager.set_decode_static_max_context_len(int(state.key.context_capacity))
 
         return input_ids, positions
+
+    def _static_context_capacity_policy(self, seqs: list[Sequence]) -> tuple[int, bool]:
+        """Return the static decode context bucket and whether larger cached buckets may match."""
+        custom = self._cache_manager_graph_context_capacity(seqs)
+        if custom is not None:
+            return custom
+        return self._current_context_capacity(seqs), False
+
+    def _graph_context_capacity_policy(self, seqs: list[Sequence]) -> tuple[int, bool]:
+        """Return the graph context bucket and whether larger cached buckets may match."""
+        custom = self._cache_manager_graph_context_capacity(seqs)
+        if custom is not None:
+            return custom
+        policy = str(
+            getattr(getattr(self.cache_manager, "config", None), "decode_cuda_graph_context_policy", "current")
+            or "current"
+        ).strip().lower()
+        if policy in {"requested", "request", "final"}:
+            return self._requested_context_capacity(seqs), False
+        if policy not in {"current", "cur", "now"}:
+            raise ValueError(
+                "decode_cuda_graph_context_policy must be 'current' or 'requested', "
+                f"got {policy!r}."
+            )
+        return self._current_context_capacity(seqs), False
+
+    def bucket_plan(self) -> dict[str, object]:
+        return {
+            "batch_sizes": list(self.capture_sizes),
+            "context_sizes": list(self.context_sizes),
+            "context_policy": str(
+                getattr(getattr(self.cache_manager, "config", None), "decode_cuda_graph_context_policy", "current")
+                or "current"
+            ),
+            "max_cached_graphs": self.max_cached_graphs,
+        }
+
+    def _cache_manager_graph_context_capacity(self, seqs: list[Sequence]) -> tuple[int, bool] | None:
+        resolver = getattr(self.cache_manager, "decode_cuda_graph_context_capacity", None)
+        if resolver is None:
+            return None
+        result = resolver(
+            seqs,
+            requested_context_capacity=self._requested_context_capacity(seqs),
+            current_context_capacity=self._current_context_capacity(seqs),
+        )
+        if result is None:
+            return None
+        context_capacity, allow_larger_context_capacity = result
+        return int(context_capacity), bool(allow_larger_context_capacity)
 
     def _snapshot_sparse_state_refs(self) -> dict[int, dict[str, object]]:
         refs: dict[int, dict[str, object]] = {}
@@ -188,6 +368,19 @@ class DecodeCudaGraphRunner:
             for name, value in refs.items():
                 setattr(sparse_state, name, value)
 
+    def _reset_graph_input_attn_scores(self, refs: dict[int, dict[str, object]]):
+        """Reset graph-input score buffers inside capture/replay.
+
+        prepare_forward() allocates and initializes decode attn_score tensors
+        before graph capture. Replay does not re-run that Python setup, so score
+        buffers used by captured observation-layer kernels must be reset by a
+        captured fill before each replay.
+        """
+        for layer_refs in refs.values():
+            attn_score = layer_refs.get("attn_score")
+            if isinstance(attn_score, torch.Tensor):
+                attn_score.fill_(-1e20)
+
     def _capture(
         self,
         state: DecodeCudaGraphState,
@@ -197,7 +390,6 @@ class DecodeCudaGraphRunner:
     ) -> DecodeCudaGraphState:
         ctx = get_context()
         ctx.sparse_controller = self.sparse_controller
-        ctx.decode_cuda_graph_static = True
 
         with profiler.record("decode_cuda_graph_warmup"):
             self.sparse_controller.prepare_forward(seqs, is_prefill=False)
@@ -208,9 +400,15 @@ class DecodeCudaGraphRunner:
 
         with profiler.record("decode_cuda_graph_capture"):
             self.sparse_controller.prepare_forward(seqs, is_prefill=False)
+            # OmniKV observation layers pass a 3D attn_score tensor into the
+            # captured decode kernel, then replace the Python field with a 2D
+            # head-reduced tensor in on_layer_end(). Keep the original refs so
+            # graph replay cannot point at allocator-reused storage.
+            graph_input_sparse_state_refs = self._snapshot_sparse_state_refs()
             graph = torch.cuda.CUDAGraph()
             try:
-                with torch.cuda.graph(graph):
+                with torch.cuda.graph(graph, pool=self.graph_pool):
+                    self._reset_graph_input_attn_scores(graph_input_sparse_state_refs)
                     logits = self.run_model(input_ids, positions, is_prefill=False)
                     if state.key.capture_sampling:
                         token_ids = logits.argmax(dim=-1)
@@ -237,18 +435,12 @@ class DecodeCudaGraphRunner:
         ]
         if token_ids is not None:
             keepalive.append(token_ids)
-        for sparse_state in self.sparse_controller.layer_batch_sparse_states.values():
-            for value in (
-                sparse_state.attn_score,
-                sparse_state.active_indices,
-                sparse_state.active_slots,
-                sparse_state.req_indices,
-                sparse_state.context_lens,
-                sparse_state.active_compressed_indices,
-                sparse_state.global_req_indices,
-            ):
-                if isinstance(value, torch.Tensor):
-                    keepalive.append(value)
+        for sparse_refs_by_layer in (graph_input_sparse_state_refs, state.sparse_state_refs):
+            for refs in sparse_refs_by_layer.values():
+                for value in refs.values():
+                    if isinstance(value, torch.Tensor):
+                        keepalive.append(value)
+        keepalive.extend(self.cache_manager.decode_cuda_graph_keepalive_tensors())
         state.keepalive = keepalive
         return state
 
@@ -266,14 +458,20 @@ class DecodeCudaGraphRunner:
             raise ValueError("decode_cuda_graph capture_sampling currently supports greedy decode only.")
 
         real_batch_size = len(seqs)
+        force_eager = getattr(self.cache_manager, "decode_cuda_graph_force_eager", None)
+        if force_eager is not None and force_eager():
+            return self.run_eager_static(seqs), None
+
         graph_batch_size = self._select_graph_batch_size(real_batch_size)
         is_long_text = self.is_long_text_batch(seqs, False)
+        context_capacity, allow_larger_context_capacity = self._graph_context_capacity_policy(seqs)
         state = self._select_state(
             method=self.method,
             batch_size=graph_batch_size,
-            max_context_len=self._requested_max_context_len(seqs),
+            context_capacity=context_capacity,
             is_long_text=is_long_text,
             capture_sampling=bool(capture_sampling),
+            allow_larger_context_capacity=allow_larger_context_capacity,
         )
         self.last_state_key = state.key
         self.last_real_batch_size = real_batch_size
@@ -282,6 +480,9 @@ class DecodeCudaGraphRunner:
         if state.graph is None:
             state = self._capture(state, seqs, input_ids, positions)
             assert state.logits is not None
+            self._restore_sparse_state_refs(state)
+            with profiler.record("decode_cuda_graph_replay_after_capture"):
+                state.graph.replay()
             logits = state.logits[:real_batch_size]
             token_ids = state.token_ids[:real_batch_size] if state.token_ids is not None else None
             return logits, token_ids
@@ -293,3 +494,31 @@ class DecodeCudaGraphRunner:
         logits = state.logits[:real_batch_size]
         token_ids = state.token_ids[:real_batch_size] if state.token_ids is not None else None
         return logits, token_ids
+
+    def run_eager_static(self, seqs: list[Sequence]) -> torch.Tensor:
+        """Run decode eagerly through the same static-compatible path used by graphs."""
+        if not seqs:
+            raise ValueError("static decode requires a non-empty decode batch.")
+
+        real_batch_size = len(seqs)
+        graph_batch_size = self._select_graph_batch_size(real_batch_size)
+        is_long_text = self.is_long_text_batch(seqs, False)
+        context_capacity, allow_larger_context_capacity = self._static_context_capacity_policy(seqs)
+        state = self._select_state(
+            method=self.method,
+            batch_size=graph_batch_size,
+            context_capacity=context_capacity,
+            is_long_text=is_long_text,
+            capture_sampling=False,
+            allow_larger_context_capacity=allow_larger_context_capacity,
+        )
+        self.last_state_key = state.key
+        self.last_real_batch_size = real_batch_size
+        input_ids, positions = self._prepare_static_step(state, seqs, is_long_text)
+
+        ctx = get_context()
+        ctx.sparse_controller = self.sparse_controller
+        with profiler.record("model_sparse_prepare"):
+            self.sparse_controller.prepare_forward(seqs, is_prefill=False)
+        logits = self.run_model(input_ids, positions, is_prefill=False)
+        return logits[:real_batch_size]

@@ -12,6 +12,7 @@ from transformers.models.llama.modeling_llama import (
 from deltakv.configs.model_config_cls import KVLlamaConfig
 from deltakv.modeling.cache_factory import (
     DELTA_COMPRESSED_LATENT_W_FULL,
+    DELTA_COMPRESSED_QUANT_KIVI_FULL_FP8_REF,
     DELTA_ORIGIN_W_FULL,
     DELTA_ORIGIN_WO_FULL,
 )
@@ -44,6 +45,11 @@ LlamaDeltaCompressedLatentWFull = _variant_class(
     LlamaKVCompress,
     DELTA_COMPRESSED_LATENT_W_FULL,
 )
+LlamaDeltaCompressedQuantKiviFullFp8Ref = _variant_class(
+    "LlamaDeltaCompressedQuantKiviFullFp8Ref",
+    LlamaKVCompress,
+    DELTA_COMPRESSED_QUANT_KIVI_FULL_FP8_REF,
+)
 LlamaDeltaOriginWoFull = _variant_class("LlamaDeltaOriginWoFull", LlamaKVCompress, DELTA_ORIGIN_WO_FULL)
 LlamaDeltaOriginWFull = _variant_class("LlamaDeltaOriginWFull", LlamaKVCompress, DELTA_ORIGIN_W_FULL)
 
@@ -53,6 +59,7 @@ __all__ = [
     "LlamaModelKVCompress",
     "LlamaKVCompress",
     "LlamaDeltaCompressedLatentWFull",
+    "LlamaDeltaCompressedQuantKiviFullFp8Ref",
     "LlamaDeltaOriginWoFull",
     "LlamaDeltaOriginWFull",
 ]

@@ -121,13 +121,10 @@ def test(
         'recent_keep_tokens': recent_keep_tokens,
         'full_attention_layers': full_attention_layers,
         'decode_keep_tokens': decode_keep_tokens,
-        'prefill_keep_tokens': prefill_keep_tokens,
         'use_compression': use_compression,
         'use_cluster': use_cluster,
         'deltakv_center_ratio': deltakv_center_ratio,
-        'stride_alpha': stride_alpha,
         'deltakv_use_omnikv_selection': deltakv_use_omnikv_selection,
-        'chunk_prefill_accel_omnikv': chunk_prefill_accel_omnikv,
         'omnikv_score_method': omnikv_score_method,
         'sparse_method': sparse_method,
         prefill_chunk_key: prefill_chunk_value,
@@ -141,6 +138,10 @@ def test(
         'lt_clip_ratio': lt_clip_ratio,
         'lt_hadamard': lt_hadamard,
     }
+    if backend != "sparsevllm":
+        infer_config['stride_alpha'] = stride_alpha
+        infer_config['prefill_keep_tokens'] = prefill_keep_tokens
+        infer_config['chunk_prefill_accel_omnikv'] = chunk_prefill_accel_omnikv
     chat = get_generate_api(
         model_path,
         infer_config,

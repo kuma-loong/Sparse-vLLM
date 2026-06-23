@@ -5,6 +5,15 @@ import numpy as np
 
 # --- 下面抄自 baselines/kivi/quant/new_pack.py 的 Triton Kernel ---
 
+SUPPORTED_PACK_BITS = (2, 4, 8)
+
+
+def _features_per_int(bits: int) -> int:
+    bits = int(bits)
+    if bits not in SUPPORTED_PACK_BITS:
+        raise ValueError(f"Packed quantization supports bits={SUPPORTED_PACK_BITS}, got {bits}.")
+    return 32 // bits
+
 @triton.jit
 def _pack_along_last_dim(
     bits: tl.constexpr,
@@ -53,8 +62,14 @@ def _minmax_along_last_dim(
 
 def triton_quantize_and_pack_along_last_dim(data: torch.Tensor, group_size: int, bit: int):
     assert len(data.shape) == 4
+    feat_per_int = _features_per_int(bit)
     shape = data.shape
     B, nh, D, T = shape
+    if T % feat_per_int != 0:
+        raise ValueError(
+            f"Packed int{bit} quantization requires the last dimension to be divisible by "
+            f"{feat_per_int}, got {T}."
+        )
     # ================== Get Scale & Zeros ===============
     assert T % group_size == 0
     num_groups = T // group_size
@@ -75,7 +90,6 @@ def triton_quantize_and_pack_along_last_dim(data: torch.Tensor, group_size: int,
     data.div_(scale.unsqueeze(-1) + 1e-6)
     data = data.clamp_(0, 2 ** bit - 1).round_().to(torch.int32)
     data = data.view(-1, T)
-    feat_per_int = 32 // bit
     packshape = (np.prod(shape[:-1]), shape[-1] // feat_per_int,)
     code = torch.zeros(*packshape, device=data.device, dtype=torch.int32)
     grid = lambda meta: (triton.cdiv(data.shape[0], BLOCK_SIZE_N), data.shape[1] // feat_per_int,)
@@ -90,9 +104,8 @@ def unpack_tensor(v_code: torch.Tensor, bits: int, pack_dim: int):
     """
     KIVI 原版解包逻辑 (基于 PyTorch 向量化索引)
     """
-    assert bits in [2,4,8]
+    feat_per_int = _features_per_int(bits)
     shape = v_code.shape
-    feat_per_int = 32 // bits
     new_shape = shape[:pack_dim] + (shape[pack_dim] * feat_per_int,) + shape[pack_dim+1:]
     unpacked_v_code = torch.zeros(new_shape, dtype=torch.int8, device=v_code.device)
     i = torch.arange(new_shape[pack_dim], device=v_code.device) // feat_per_int
@@ -109,23 +122,31 @@ def unpack_tensor(v_code: torch.Tensor, bits: int, pack_dim: int):
         raise NotImplementedError
     return unpacked_v_code
 
-def unpack_4bit_to_16bit(packed, scale, mn, group_size):
+def unpack_quantized_to_16bit(packed, scale, mn, group_size, bits: int):
     """
-    适配 ClusterCompressedKVCache 的包装函数
+    适配 ClusterCompressedKVCache 的包装函数。
     """
-    # 这里的 packed 形状通常是 (B, nh, num_imp, D//8)
+    bits = int(bits)
+    feat_per_int = _features_per_int(bits)
+    # 这里的 packed 形状通常是 (B, nh, num_imp, D//feat_per_int)
     # 我们调用 KIVI 的 unpack_tensor，它在 dim=3 上打包
-    unpacked_int4 = unpack_tensor(packed, bits=4, pack_dim=3)
+    unpacked = unpack_tensor(packed, bits=bits, pack_dim=3)
     
     # 反量化
     # scale/mn 形状是 (B, nh, num_imp, 1) 或者 (B, nh, num_imp, num_groups)
     # 如果是 Per-token 量化，num_groups = 1
     if scale.shape[-1] == 1:
-        return unpacked_int4.to(scale.dtype) * scale + mn
+        return unpacked.to(scale.dtype) * scale + mn
     else:
         # Group-wise 逻辑
-        B, nh, num_imp, D = unpacked_int4.shape
+        B, nh, num_imp, D = unpacked.shape
+        if D % group_size != 0:
+            raise ValueError(f"Unpacked dimension {D} must be divisible by group_size {group_size}.")
         num_groups = D // group_size
-        res = unpacked_int4.view(B, nh, num_imp, num_groups, group_size)
+        res = unpacked.view(B, nh, num_imp, num_groups, group_size)
         res = res * scale.unsqueeze(-1) + mn.unsqueeze(-1)
         return res.view(B, nh, num_imp, D)
+
+
+def unpack_4bit_to_16bit(packed, scale, mn, group_size):
+    return unpack_quantized_to_16bit(packed, scale, mn, group_size, 4)

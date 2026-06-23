@@ -41,7 +41,9 @@ def _normalize_answer(s: str) -> str:
     s = s.replace("$", "")
     s = re.sub(r"\\text\{([^}]*)\}", r"\1", s)
     s = re.sub(r"\\mathrm\{([^}]*)\}", r"\1", s)
+    s = s.replace("\\left", "").replace("\\right", "")
     s = s.replace(",", "").strip()
+    s = re.sub(r"\s+", "", s)
 
     if re.fullmatch(r"[-+]?\d+", s):
         return str(int(s))
@@ -86,6 +88,15 @@ def extract_gold_answer(dataset: str, gold: dict) -> Optional[str]:
             gold_norm[str(k).lower()] = v
 
     # Try common fields first.
+    if dataset == "math500":
+        for key in ("answer", "final_answer", "target", "label"):
+            val = gold_norm.get(key, None)
+            if isinstance(val, (int, float)):
+                return _normalize_answer(str(val))
+            if isinstance(val, str) and val.strip():
+                boxed = _find_last_boxed(val)
+                return _normalize_answer(boxed if boxed is not None else val)
+
     for key in ("final_answer", "answer", "target", "label"):
         val = gold_norm.get(key, None)
         if isinstance(val, (int, float)):

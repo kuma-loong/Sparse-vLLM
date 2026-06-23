@@ -7,5 +7,6 @@ __pycache__/
 *example.png
 wandb/
 /tmp/
+/scripts/tmp/
 /outputs/
 /benchmark/scbench/results/

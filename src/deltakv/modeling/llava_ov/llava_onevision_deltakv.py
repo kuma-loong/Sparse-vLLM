@@ -6,9 +6,9 @@ import torch
 from torch import nn
 from safetensors.torch import load_file
 from transformers import AutoModel
+from transformers.models.llava_onevision import modeling_llava_onevision as llava_ov_modeling
 from transformers.models.llava_onevision.modeling_llava_onevision import (
     FlashAttentionKwargs,
-    KwargsForCausalLM,
     LlavaOnevisionCausalLMOutputWithPast,
     LlavaOnevisionForConditionalGeneration,
     LlavaOnevisionModel,
@@ -16,12 +16,20 @@ from transformers.models.llava_onevision.modeling_llava_onevision import (
     LlavaOnevisionMultiModalProjector,
     LlavaOnevisionPreTrainedModel,
     Unpack,
-    is_torchdynamo_compiling,
+)
+from transformers.utils import is_torchdynamo_compiling
+
+KwargsForCausalLM = getattr(
+    llava_ov_modeling,
+    "KwargsForCausalLM",
+    llava_ov_modeling.TransformersKwargs,
 )
 
 from deltakv.configs.model_config_cls import KVQwen2Config
-from deltakv.modeling.cache_factory import create_deltakv_cache, is_deltakv_cache_instance
+from deltakv.modeling.cache_factory import create_hf_sparse_cache, is_hf_sparse_cache_instance
+from deltakv.modeling.cache_pipeline import SnapKVCache
 from deltakv.modeling.qwen2_inference import Qwen2ModelKVCompress
+from deltakv.modeling.qwen2.qwen2_snapkv import Qwen2SnapKVModel
 
 
 def build_llava_text_deltakv_config(config) -> KVQwen2Config:
@@ -42,10 +50,22 @@ def load_deltakv_compressor_into_llava(model: nn.Module, compressor_path: str, d
     state_dict = load_file(os.path.join(compressor_path, "model.safetensors"), device=str(device))
     mapped_state_dict = {}
     for key, value in state_dict.items():
-        if key.startswith("model."):
+        if key.startswith("model.language_model.model."):
+            mapped_key = "model.language_model." + key[len("model.language_model.model."):]
+        elif key.startswith("model.language_model."):
+            mapped_key = key
+        elif key.startswith("language_model.model."):
+            mapped_key = "model.language_model." + key[len("language_model.model."):]
+        elif key.startswith("model.model."):
+            mapped_key = "model.language_model." + key[len("model.model."):]
+        elif key.startswith("model."):
             mapped_key = "model.language_model." + key[len("model."):]
+        elif key.startswith("language_model.layers.") or key.startswith("language_model.norm."):
+            mapped_key = "model.language_model." + key[len("language_model."):]
         elif key.startswith("language_model."):
-            mapped_key = "model." + key
+            mapped_key = "model.language_model." + key[len("language_model."):]
+        elif key.startswith("layers.") or key.startswith("norm."):
+            mapped_key = "model.language_model." + key
         else:
             mapped_key = "model.language_model." + key
         mapped_state_dict[mapped_key] = value
@@ -64,12 +84,18 @@ class LlavaOnevisionDeltaKVModel(LlavaOnevisionModel):
         self.multi_modal_projector = LlavaOnevisionMultiModalProjector(config)
 
         text_config = build_llava_text_deltakv_config(config)
-        config.text_config = text_config
-        self.language_model = Qwen2ModelKVCompress(text_config)
+        self.deltakv_text_config = text_config
+        self.deltakv_text_model_kind = str(getattr(config, "deltakv_text_model_kind", "deltakv")).strip().lower()
+        if self.deltakv_text_model_kind == "snapkv":
+            self.language_model = Qwen2SnapKVModel(text_config)
+        elif self.deltakv_text_model_kind in {"deltakv", "omnikv", "hf_sparse"}:
+            self.language_model = Qwen2ModelKVCompress(text_config)
+        else:
+            raise ValueError(f"Unsupported LLaVA-OneVision text sparse model kind: {self.deltakv_text_model_kind!r}")
 
-        embed_std = 1 / math.sqrt(config.text_config.hidden_size)
-        self.image_newline = nn.Parameter(torch.randn(config.text_config.hidden_size, dtype=self.dtype) * embed_std)
-        self.vocab_size = config.text_config.vocab_size
+        embed_std = 1 / math.sqrt(text_config.hidden_size)
+        self.image_newline = nn.Parameter(torch.randn(text_config.hidden_size, dtype=self.dtype) * embed_std)
+        self.vocab_size = text_config.vocab_size
         self.pad_token_id = self.config.pad_token_id if self.config.pad_token_id is not None else -1
         self.post_init()
 
@@ -78,6 +104,78 @@ class LlavaOnevisionDeltaKVModel(LlavaOnevisionModel):
 
     def set_input_embeddings(self, value):
         self.language_model.set_input_embeddings(value)
+
+    def _is_expected_cache(self, past_key_values) -> bool:
+        if self.deltakv_text_model_kind == "snapkv":
+            return isinstance(past_key_values, SnapKVCache)
+        return is_hf_sparse_cache_instance(past_key_values, self.deltakv_text_config)
+
+    def _create_sparse_cache(self):
+        if self.deltakv_text_model_kind == "snapkv":
+            return SnapKVCache(self.deltakv_text_config)
+        return create_hf_sparse_cache(self.deltakv_text_config)
+
+    def _forward_snapkv_language_model(
+        self,
+        *,
+        inputs_embeds: torch.Tensor,
+        attention_mask: Optional[torch.Tensor],
+        position_ids: Optional[torch.LongTensor],
+        past_key_values: SnapKVCache,
+        use_cache: Optional[bool],
+        output_attentions: Optional[bool],
+        output_hidden_states: Optional[bool],
+        cache_position: Optional[torch.LongTensor],
+        created_cache: bool,
+        kwargs: dict,
+    ):
+        q_len = int(inputs_embeds.shape[1])
+        window = int(self.deltakv_text_config.snapkv_window_size)
+        chunk_size = max(1, int(self.deltakv_text_config.chunk_prefill_size))
+        should_chunk_prefill = bool(use_cache) and created_cache and q_len > window
+        if not should_chunk_prefill:
+            return self.language_model(
+                attention_mask=attention_mask,
+                position_ids=position_ids,
+                past_key_values=past_key_values,
+                inputs_embeds=inputs_embeds,
+                use_cache=use_cache,
+                output_attentions=output_attentions,
+                output_hidden_states=output_hidden_states,
+                return_dict=True,
+                cache_position=cache_position,
+                **kwargs,
+            )
+
+        past_key_values.num_prompt_tokens = q_len
+        embed_chunks = list(inputs_embeds[:, :-window].split(chunk_size, dim=1)) + [inputs_embeds[:, -window:]]
+        if position_ids is None:
+            position_chunks = [None] * len(embed_chunks)
+        else:
+            position_chunks = list(position_ids[:, :-window].split(chunk_size, dim=1)) + [position_ids[:, -window:]]
+        if cache_position is None:
+            cache_position_chunks = [None] * len(embed_chunks)
+        else:
+            cache_position_chunks = list(cache_position[:-window].split(chunk_size, dim=0)) + [cache_position[-window:]]
+
+        outputs = None
+        for chunk_embeds, chunk_position_ids, chunk_cache_position in zip(
+            embed_chunks, position_chunks, cache_position_chunks
+        ):
+            outputs = self.language_model(
+                attention_mask=None,
+                position_ids=chunk_position_ids,
+                past_key_values=past_key_values,
+                inputs_embeds=chunk_embeds,
+                use_cache=True,
+                output_attentions=output_attentions,
+                output_hidden_states=output_hidden_states,
+                return_dict=True,
+                cache_position=chunk_cache_position,
+                **kwargs,
+            )
+            past_key_values = outputs.past_key_values
+        return outputs
 
     def forward(
         self,
@@ -179,22 +277,38 @@ class LlavaOnevisionDeltaKVModel(LlavaOnevisionModel):
             if input_ids is not None:
                 visual_token_mask = visual_token_mask | (input_ids == self.config.video_token_id)
 
-        if use_cache and not is_deltakv_cache_instance(past_key_values, self.config.text_config):
-            past_key_values = create_deltakv_cache(self.config.text_config)
+        created_cache = False
+        if use_cache and not self._is_expected_cache(past_key_values):
+            past_key_values = self._create_sparse_cache()
+            created_cache = True
 
-        outputs = self.language_model(
-            attention_mask=attention_mask,
-            position_ids=position_ids,
-            past_key_values=past_key_values,
-            inputs_embeds=inputs_embeds,
-            use_cache=use_cache,
-            output_attentions=output_attentions,
-            output_hidden_states=output_hidden_states,
-            return_dict=True,
-            cache_position=cache_position,
-            deltakv_visual_token_mask=visual_token_mask,
-            **kwargs,
-        )
+        if self.deltakv_text_model_kind == "snapkv":
+            outputs = self._forward_snapkv_language_model(
+                inputs_embeds=inputs_embeds,
+                attention_mask=attention_mask,
+                position_ids=position_ids,
+                past_key_values=past_key_values,
+                use_cache=use_cache,
+                output_attentions=output_attentions,
+                output_hidden_states=output_hidden_states,
+                cache_position=cache_position,
+                created_cache=created_cache,
+                kwargs=kwargs,
+            )
+        else:
+            outputs = self.language_model(
+                attention_mask=attention_mask,
+                position_ids=position_ids,
+                past_key_values=past_key_values,
+                inputs_embeds=inputs_embeds,
+                use_cache=use_cache,
+                output_attentions=output_attentions,
+                output_hidden_states=output_hidden_states,
+                return_dict=True,
+                cache_position=cache_position,
+                deltakv_visual_token_mask=visual_token_mask,
+                **kwargs,
+            )
 
         return LlavaOnevisionModelOutputWithPast(
             last_hidden_state=outputs.last_hidden_state,
