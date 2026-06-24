@@ -183,7 +183,7 @@ Known Sparse-vLLM method strings:
 | `omnikv` | OmniKV cache manager. |
 | `quest` | Quest cache manager. |
 | `deltakv` | Maintained compressor-backed DeltaKV runtime. |
-| `deltakv-less-memory` | No-checkpoint DeltaKV center selection plus direct token-space residual storage. Internally rewrites method to `deltakv` for controller semantics. |
+| `deltakv-less-memory`, `deltakv-less-memory-cudagraph` | Legacy aliases retained for old configs and regression manifests. They normalize to `deltakv`; the cudagraph alias also requests decode CUDA graph. |
 
 Sparse-vLLM has text-only Qwen3 support for the current DeltaKV-family paths
 used in this repo's validation runs. Treat Qwen3 DeltaKV changes as
@@ -191,10 +191,9 @@ alignment-sensitive: qk-norm, RoPE theta/dtype, sparse-reference storage, and
 full-layer KIVI views must be validated with HF-vs-Sparse logits checks before
 reporting benchmark results.
 
-`deltakv-less-memory` is Sparse-vLLM-only. It deliberately does not load a
-DeltaKV compressor checkpoint and is allowed to run with
-`deltakv_checkpoint_path` omitted. The canonical hyphenated name should be used
-in new commands. Removed DeltaKV aliases are no longer accepted.
+Use `sparse_method="deltakv"` in new commands. Real Sparse-vLLM DeltaKV runs
+require a matching `deltakv_checkpoint_path`; missing checkpoints are only for
+construction-only tests that explicitly set `allow_missing_deltakv_path=True`.
 
 ## 5. Unknown-Key Behavior
 
@@ -377,9 +376,9 @@ residual = token_kv - mean(selected_centers)
 - The direct path is pad-aware for batched left-padding runs: padding tokens are
   stored with invalid positions and cannot become valid reference centers.
 
-This is the no-compressor variant used by the LLaVA `deltakv-less-memory`
-benchmark. The residual-quant ablation paths below still have their own wrapper
-routing.
+The current LLaVA benchmark exposes this through method `deltakv` with a real
+checkpoint. No-checkpoint multimodal runs are the separate `visual_uniform_keep`
+baseline, not DeltaKV.
 
 ### 7.3 `origin_residual_quant`
 
@@ -482,7 +481,7 @@ Key Sparse-vLLM public names and internal fields:
 | `deltakv_full_pool_reserve_ratio` | `0.1` | Fraction of KV memory reserved for full-KV pool. |
 | `deltakv_triton_*_heads_per_program` | `4` | Triton grouping controls. |
 | `allow_unknown_config_keys` | `False` | Explicit opt-in for ignoring unknown Sparse-vLLM config keys. |
-| `allow_missing_deltakv_path` | `False` | Explicit opt-in for no-checkpoint DeltaKV ablations that intentionally omit compressor weights. |
+| `allow_missing_deltakv_path` | `False` | Construction-only test escape hatch for missing compressor weights. Do not use for reportable benchmark runs. |
 
 `bitsandbytes` is a declared package dependency because 4-bit and 8-bit
 loading paths import it at runtime. A normal `pip install -e .` should install
@@ -490,38 +489,34 @@ it; manually curated environments need to include it explicitly.
 
 ### 9.1 Compressor-Backed DeltaKV
 
-Method `deltakv` is the maintained compressor-backed DeltaKV runtime. It requires
-`deltakv_checkpoint_path` unless an explicit ablation opts into
-`allow_missing_deltakv_path=True`.
+Method `deltakv` is the maintained compressor-backed DeltaKV runtime. It
+requires `deltakv_checkpoint_path` for real runs.
 
-### 9.2 `deltakv-less-memory`
+### 9.2 Legacy `deltakv-less-memory*` Aliases
 
-File: `src/sparsevllm/engine/cache_manager/deltakv_less_memory.py`.
+Files:
 
-This is a no-checkpoint residual-quantization route. It reuses the standard
-DeltaKV center selection and sparse decode-view construction, but stores the
-token-space residual directly instead of a learned latent:
+- `src/sparsevllm/engine/cache_manager/deltakv_runtime.py`
+- `src/sparsevllm/engine/cache_manager/deltakv_less_memory.py`
+- `src/sparsevllm/engine/cache_manager/deltakv_less_memory_cuda_graph.py`
 
-```text
-residual = KV_before_rope - mean(selected_center_KV_before_rope)
-```
+The historical `deltakv-less-memory` names are retained so older configs and
+regression manifests still load. They normalize to the public `deltakv`
+runtime, which initializes compressor modules and requires `deltakv_path`.
+The `deltakv-less-memory-cudagraph` alias additionally sets
+`decode_cuda_graph=True`.
 
-`deltakv_latent_quant_bits` has method-specific meaning here:
+The slim runtime supports two storage combinations:
 
-| Value | Behavior |
+| Full-layer storage | Sparse-layer storage |
 | --- | --- |
-| `2` | Pack the token-space residual as int2 with per-token scale/min metadata. |
-| `4` | Pack the token-space residual as int4 with per-token scale/min metadata. |
-| `0` | Store the token-space residual in model dtype. |
+| `full_layer_kv_quant_bits=0` | `deltakv_latent_quant_bits=0` |
+| `full_layer_kv_quant_bits=4` with full-layer KIVI enabled | `deltakv_latent_quant_bits=4` |
 
-Other values are rejected. `deltakv_latent_dim` is not used by this path because
-there is no learned low-dimensional compressor. `deltakv_neighbor_count`,
+Other bit combinations fail fast. `deltakv_neighbor_count`,
 `deltakv_center_ratio`, `full_attention_layers`, `sink_keep_tokens`,
-`recent_keep_tokens`, and `decode_keep_tokens` still
-affect center/reference selection, full-layer routing, and sparse-view budgets.
-For `deltakv_latent_quant_bits=2` or `4`, reconstruction uses a fused Triton kernel
-that dequantizes residuals and writes reconstructed K/V without
-materializing a full `kv_dim` residual tensor.
+`recent_keep_tokens`, and `decode_keep_tokens` still affect center/reference
+selection, full-layer routing, and sparse-view budgets.
 
 Example Sparse-vLLM smoke command:
 
@@ -531,13 +526,11 @@ python scripts/benchmarks/bench_sparse_vllm.py \
   --model_path /data2/haojitai/models/Qwen2.5-7B-Instruct-1M \
   --lengths 1024 \
   --batch_sizes 2 \
-  --methods deltakv-less-memory \
+  --methods deltakv \
   --output_len 4 \
   --temperature 0 \
-  --hyper_params '{"gpu_memory_utilization":0.9,"engine_prefill_chunk_size":512,"max_num_seqs_in_batch":2,"max_decoding_seqs":2,"max_num_batched_tokens":2048,"full_attention_layers":"0,1","sink_keep_tokens":4,"recent_keep_tokens":32,"decode_keep_tokens":64,"deltakv_center_ratio":0.1,"deltakv_neighbor_count":1,"deltakv_latent_quant_bits":4,"deltakv_full_pool_reserve_ratio":0.2}'
+  --hyper_params '{"gpu_memory_utilization":0.9,"engine_prefill_chunk_size":512,"max_num_seqs_in_batch":2,"max_decoding_seqs":2,"max_num_batched_tokens":2048,"full_attention_layers":"0,1","sink_keep_tokens":4,"recent_keep_tokens":32,"decode_keep_tokens":64,"deltakv_checkpoint_path":"/data2/haojitai/checkpoints/compressor/Qwen2.5-7B-Instruct-1M-Compressor","deltakv_center_ratio":0.1,"deltakv_neighbor_count":1,"deltakv_latent_dim":256,"deltakv_latent_quant_bits":4,"full_layer_kv_quant_bits":4,"enable_full_layer_kivi_quant":true,"deltakv_full_pool_reserve_ratio":0.2}'
 ```
-
-This command intentionally omits `deltakv_checkpoint_path`.
 
 Important differences from HF:
 
@@ -545,10 +538,9 @@ Important differences from HF:
 - `deltakv_center_ratio` influences algorithmic behavior and memory planning.
 - `decode_keep_tokens` must be an integer budget.
 - `full_attention_layers` may derive observation layers.
-- Removed method names fail fast instead of rewriting routing implicitly.
-- Unknown Sparse-vLLM config keys and missing DeltaKV
-  compressor paths fail fast by default. Use the `allow_*` switches only for
-  explicitly documented compatibility or ablation runs.
+- Unknown Sparse-vLLM config keys and missing DeltaKV compressor paths fail
+  fast by default. Use `allow_missing_deltakv_path` only for construction-only
+  tests, not reportable runs.
 - Sparse-vLLM methods can physically evict or re-map cache slots during prefill
   and decode, unlike HF `DynamicCache` wrappers.
 
@@ -690,7 +682,7 @@ Main files:
 
 - `benchmark/multimodal/visual_cache/run_visual_cache.py`
 - `src/deltakv/modeling/llava_onevision_deltakv.py`
-- `docs/llava-onevision-visual-cache-benchmarks.md`
+- `docs/benchmarking/multimodal/README.md`
 
 Current implemented benchmark methods:
 
@@ -698,7 +690,6 @@ Current implemented benchmark methods:
 | --- | --- |
 | `vanilla` | Standard `LlavaOnevisionForConditionalGeneration`. |
 | `deltakv` | LLaVA-OneVision DeltaKV wrapper with a real learned compressor checkpoint. Uses the checkpoint config plus CLI keep budgets. |
-| `deltakv-less-memory` | LLaVA-OneVision DeltaKV wrapper with no learned compressor checkpoint. Uses cluster/ref reconstruction, stores token-space residuals, and int4 quantizes those residuals. |
 | `visual_uniform_keep` | DeltaKV wrapper infrastructure, but no compressor, no cluster, no ref tokens. Uniformly keeps visual tokens and drops the rest. |
 | `visual_uniform_keep_int4` | Same uniform visual token keep path, plus direct int4 storage of kept visual KV. |
 
@@ -709,11 +700,10 @@ Important parameters:
 | `visual_token_prune_only` | Restricts cache dropping/pruning to visual tokens. |
 | `visual_token_keep_ratio` / CLI `--visual_keep_ratio` | Fraction of eligible visual tokens kept by uniform subsampling. |
 | `--quantize_visual_kv` | Sets `deltakv_latent_quant_bits=4` in no-checkpoint fallback. |
-| `--delta_quant_bits` | Sets residual quantization bits for `deltakv-less-memory`; `2` and `4` are implemented. |
-| `--deltakv_center_ratio` | Public center/prototype sampling ratio for `deltakv-less-memory`. |
-| `--deltakv_neighbor_count` | Number of selected ref centers for each compressed token in `deltakv-less-memory`. |
+| `--deltakv_center_ratio` | Center/prototype sampling ratio for compressor-backed `deltakv`. |
+| `--deltakv_neighbor_count` | Number of selected ref centers for compressor-backed `deltakv`. |
 | `recent_keep_tokens`, `sink_keep_tokens`, `full_attention_layers` | Passed into text config and affect cache buffer behavior. |
-| `decode_keep_tokens`, `prefill_keep_tokens` | Present for wrapper compatibility; current no-checkpoint visual uniform path does not use SnapKV-style attention scoring for pruning. |
+| `decode_keep_tokens`, `prefill_keep_tokens` | Present for wrapper compatibility; current visual uniform path does not use SnapKV-style attention scoring for pruning. |
 
 Current limitations:
 
@@ -721,9 +711,6 @@ Current limitations:
   HF cache update.
 - `visual_uniform_keep` explicitly sets `use_compression=False` and
   `use_cluster=False`.
-- `deltakv-less-memory` is a no-checkpoint DeltaKV-style path, but it is not
-  visual-only pruning. It compresses the eligible text-backbone KV stream; in
-  image VQA prompts most eligible tokens are visual tokens.
 - "LLaVA visual keep10" without checkpoint is still not using cluster/ref
   tokens. It is uniform pruning.
 

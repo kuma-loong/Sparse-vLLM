@@ -1,25 +1,20 @@
 # Sparse-VLLM Control Map
 
-Date: 2026-06-12
+Updated: 2026-06-24
 
 This is a working map for recovering control of the Sparse-VLLM side of the
 repo. It is not a benchmark result and should not be cited as evidence for a
 method claim. Use it to decide where a change belongs, which docs to trust, and
 which checks to run before reporting results.
 
-## Current Snapshot
+## Documentation Map
 
-- Local `main` is clean and ahead of `origin/main` by four dynamic-stride /
-  RULER-VT analysis commits only. Those commits do not change Sparse-VLLM
-  runtime code.
-- The current Sparse-VLLM complexity mainly comes from already-merged
-  DeltaKV, CUDA graph, full-layer KIVI, Qwen3, and cache-manager API work.
-- `docs/experiments.md` is a run ledger. It records in-progress, aborted, and
-  superseded runs as well as completed checks. Do not treat the last matching
-  text search hit as the current truth without checking the status line.
-- `docs/code_change_history/` records completed implementation episodes. These
-  files are better for understanding root causes and validation scope.
-- `docs/runtime-parameter-semantics.md` is the canonical parameter contract.
+- Start from `docs/README.md` when choosing where documentation belongs.
+- Stable runbooks and contracts live under the topical `docs/` directories.
+- Keep dated run records, private experiment ledgers, and private doc indexes
+  out of repo docs. Use the run artifacts themselves when a repo-facing claim
+  needs evidence.
+- `docs/configuration/runtime-parameter-semantics.md` is the canonical parameter contract.
   Keep it synchronized before adding new public run configs.
 
 ## One Sentence Model
@@ -56,7 +51,7 @@ flowchart TD
 
 | Path | Role | Ownership rule |
 | --- | --- | --- |
-| `src/sparsevllm/config.py` | Runtime dataclass, validation, graph constraints, method-normalized defaults. | Public knob behavior must be mirrored in `docs/runtime-parameter-semantics.md`. |
+| `src/sparsevllm/config.py` | Runtime dataclass, validation, graph constraints, method-normalized defaults. | Public knob behavior must be mirrored in `docs/configuration/runtime-parameter-semantics.md`. |
 | `src/sparsevllm/method_registry.py` | Sparse method aliases and default prefill policy. | New method strings and policy defaults start here. |
 | `src/sparsevllm/engine/llm_engine.py` | Public engine lifecycle, tokenizer, scheduler loop, warmup, throughput logging. | Should not grow method-specific runtime logic. |
 | `src/sparsevllm/engine/scheduler.py` | Prefill/decode batching, long/short separation, prompt admission, preemption. | Uses cache-manager budget hooks instead of knowing method internals. |
@@ -79,7 +74,7 @@ flowchart TD
 | OmniKV | `omnikv` | Logical masking/view building from observation-layer scores. Full layers should be model-calibrated with `scripts/analysis/select_omnikv_full_layers.py` and then passed as `full_attention_layers`. | `omnikv.py`, `sparse_controller.py`, `omnikv_fused.py` |
 | QuEST | `quest` | Query-aware decode page/chunk selection. | `quest.py` |
 | DeltaKV | `deltakv` | Compressor-backed hybrid cache: sparse full/reference pool plus compressed latent state. | `deltakv.py`, `deltakv_kernels.py` |
-| DeltaKV less-memory | `deltakv-less-memory` | No-checkpoint direct residual quantization ablation; reuses DeltaKV selection semantics. | `deltakv_less_memory.py`, `deltakv_kernels.py` |
+| DeltaKV | `deltakv` plus legacy `deltakv-less-memory*` aliases | Slim compressor-backed DeltaKV runtime with graph-stable decode metadata. | `deltakv_runtime.py`, `deltakv_less_memory*.py`, `deltakv_kernels.py` |
 
 ## State Ownership Contracts
 
@@ -106,30 +101,6 @@ flowchart TD
 | `src/sparsevllm/engine/cache_manager/deltakv.py` | Compressor-backed V4 path combines clustering, latent storage, full pool, staging, reconstruction, and graph hooks. | Avoid cosmetic edits. Change only with a focused HF-vs-Sparse or kernel comparison. |
 | `src/sparsevllm/engine/sparse_controller.py` | Cross-layer policy for OmniKV, DeltaKV, SnapKV, PyramidKV, score dtype, and debug capture all meet here. | Keep new persistent state out. Only add orchestration or score/selection logic here. |
 | `src/sparsevllm/layers/attention.py` | Small enough, but high blast radius because every method passes through it. | Keep it method-agnostic. Prefer adding a cache-manager hook over adding a branch here. |
-| `docs/experiments.md` | Contains mixed completed, running, aborted, and superseded records. | Search by date and status. Extract only completed checks when making claims. |
-
-## Current Qwen3 DeltaKV Status
-
-As of the latest local docs:
-
-- Qwen3 text-only Sparse-VLLM DeltaKV is no longer a blanket unsupported path.
-- The strongest current correctness gate is the 2026-06-11 23:19 cache-API
-  logits check in `docs/experiments.md`: Qwen3-4B, HF
-  `delta_compressed_quant_kivi_full_fp8_ref` vs Sparse-VLLM
-  `deltakv-less-memory`, HotPotQA sample, three teacher-forced decode steps,
-  eager and decode-CUDA-graph paths all kept argmax/top1 aligned.
-- The 2026-06-11 23:26 vanilla/OmniKV regression check also passed after the
-  cache-manager API changes.
-- The 2026-06-11 23:35/23:39 Qwen3 LongBench bs500 stress run was not a scored
-  result; it was waiting/relaunched and then aborted by user request.
-- The 2026-06-11 23:41 SCBench Qwen3 run had completed smoke and was recorded
-  as full running. Do not report final SCBench numbers until the documented
-  completion criteria and row counts are satisfied.
-- Older notes in `docs/code_change_history/qwen3-prefill-batch-kivi-2026-06-12.md`
-  include intermediate decode-mismatch probes. Those are useful for root-cause
-  history, but later `docs/experiments.md` entries supersede them for the
-  cache-manager API state.
-
 ## Change Guardrails
 
 Before changing Sparse-VLLM runtime code:
@@ -149,7 +120,7 @@ Before changing Sparse-VLLM runtime code:
    configs, missing checkpoints, missing datasets, failed parses, or failed
    metrics.
 7. If adding or refactoring a sparse method, follow
-   `skills/add-sparse-method/SKILL.md`: cache-manager first, generic
+  `skills/add-sparse-method/SKILL.md`: cache-manager first, generic
    `attention.py`, method state out of `utils/`.
 
 ## Minimal Local Checks
@@ -192,7 +163,7 @@ CUDA_VISIBLE_DEVICES=<GPU> PYTHONPATH=$PWD:$PWD/src python \
   --compressor_path <COMPRESSOR_DIR> \
   --cases longbench \
   --methods deltakv \
-  --sparse_method deltakv-less-memory \
+  --sparse_method deltakv \
   --hf_sparse_method delta_compressed_quant_kivi_full_fp8_ref \
   --longbench_task hotpotqa \
   --longbench_sample_idx 0 \
@@ -221,13 +192,13 @@ These are control-restoring tasks, not urgent correctness fixes:
 1. Add an immutable `requested_sparse_method` or run-info field before
    cache-manager creation mutates `config.vllm_sparse_method` for DeltaKV
    variants. This would make logs and artifacts easier to interpret.
-2. Make RoPE ownership explicit in cache managers. `docs/todo.md` already notes
-   that cache managers should manage RoPE or related position modules; the
-   Qwen3 theta/dtype fixes show why this matters.
-3. Add a small status index for `docs/experiments.md` so active, aborted,
-   superseded, and completed runs are easy to distinguish.
+2. Make RoPE ownership explicit in cache managers. The Qwen3 theta/dtype fixes
+   show why cache managers need clear ownership of RoPE or related position
+   modules.
+3. Keep repo docs focused on stable contracts and runbooks. Do not add private
+   experiment ledgers or personal note indexes to repo docs.
 4. Avoid splitting the giant DeltaKV cache managers until a functional change
    touches the exact region. When splitting, preserve tests around allocation,
    staging, graph metadata, and reconstruction separately.
-5. Keep `docs/runtime-parameter-semantics.md` synchronized whenever method
+5. Keep `docs/configuration/runtime-parameter-semantics.md` synchronized whenever method
    aliases, graph support, or public knobs change.
