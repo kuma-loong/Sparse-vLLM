@@ -4,21 +4,22 @@ from pathlib import Path
 from datasets import Dataset, load_dataset
 
 
-SCBENCH_PREPROCESSED_ROOT = os.getenv(
-    "SCBENCH_PREPROCESSED_ROOT",
-    "/root/autodl-fs/datasets/SCBench-preprocessed",
-)
+SCBENCH_PREPROCESSED_ROOT = os.getenv("SCBENCH_PREPROCESSED_ROOT")
 
 
 def load_scbench_preprocessed(name):
+    if not SCBENCH_PREPROCESSED_ROOT:
+        raise FileNotFoundError(
+            "SCBench preprocessed data root is not configured.\n"
+            "Set SCBENCH_PREPROCESSED_ROOT to the directory containing <task>.parquet files."
+        )
     local_path = Path(SCBENCH_PREPROCESSED_ROOT) / f"{name}.parquet"
-    if local_path.exists():
-        return load_dataset("parquet", data_files=str(local_path), split="train")
-    return load_dataset(
-        "Jang-Hyun/SCBench-preprocessed",
-        data_files=f"{name}.parquet",
-        split="train",
-    )
+    if not local_path.is_file():
+        raise FileNotFoundError(
+            "Missing SCBench preprocessed dataset file: "
+            f"{local_path}\nSet SCBENCH_PREPROCESSED_ROOT to the correct parquet root."
+        )
+    return load_dataset("parquet", data_files=str(local_path), split="train")
 
 
 def load_dataset_all(name, tokenizer, n_data=100):

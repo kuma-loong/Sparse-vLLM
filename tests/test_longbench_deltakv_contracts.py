@@ -36,6 +36,15 @@ class LongBenchDeltaKVContractsTest(unittest.TestCase):
             finally:
                 longbench_pred.DATA_PREFIX_PATH = old_root
 
+    def test_longbench_data_validation_requires_explicit_root(self):
+        old_root = longbench_pred.DATA_PREFIX_PATH
+        longbench_pred.DATA_PREFIX_PATH = None
+        try:
+            with self.assertRaisesRegex(FileNotFoundError, "DELTAKV_LONGBENCH_DATA_DIR"):
+                longbench_pred.validate_longbench_data_paths(["hotpotqa"], use_longbench_e=False)
+        finally:
+            longbench_pred.DATA_PREFIX_PATH = old_root
+
     def test_new_hf_sparse_methods_route_without_legacy_names(self):
         for sparse_method in (
             DELTA_COMPRESSED_LATENT_WO_FULL,

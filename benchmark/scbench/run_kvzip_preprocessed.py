@@ -9,10 +9,9 @@ from collections import defaultdict
 from pathlib import Path
 from typing import Any
 
-BASE_PATH = "/root/autodl-fs/deltakv_outputs"
-
 THIS_DIR = Path(__file__).resolve().parent
 REPO_ROOT = THIS_DIR.parent.parent
+BASE_PATH = os.environ.get("DELTAKV_OUTPUT_DIR", str(REPO_ROOT / "outputs"))
 
 sys.path.append(str(REPO_ROOT / "src"))
 sys.path.insert(0, str(REPO_ROOT / "baselines" / "kvzip"))
@@ -32,7 +31,11 @@ def parse_args():
     parser.add_argument(
         "--data_root",
         type=str,
-        default="/root/autodl-fs/datasets/SCBench-preprocessed",
+        default=os.environ.get("SCBENCH_PREPROCESSED_ROOT"),
+        help=(
+            "Root containing SCBench preprocessed parquet files. "
+            "Defaults to SCBENCH_PREPROCESSED_ROOT and is required if not passed."
+        ),
     )
     parser.add_argument(
         "--output_dir",
@@ -167,6 +170,35 @@ def load_preprocessed_dataset(args, data_name: str):
     if args.num_eval_examples != -1:
         dataset = dataset.select(range(min(args.num_eval_examples, len(dataset))))
     return dataset
+
+
+def validate_preprocessed_data_root(data_root: str | None, data_names: list[str]) -> Path:
+    if not data_root:
+        raise FileNotFoundError(
+            "SCBench preprocessed data root is not configured.\n"
+            "Set SCBENCH_PREPROCESSED_ROOT or pass --data_root to a directory "
+            "containing <task>.parquet files."
+        )
+
+    root = Path(data_root)
+    if not root.is_dir():
+        raise FileNotFoundError(
+            "SCBench preprocessed data root does not exist: "
+            f"{root}\nSet SCBENCH_PREPROCESSED_ROOT or pass --data_root."
+        )
+
+    missing = [
+        root / f"{data_name}.parquet"
+        for data_name in data_names
+        if not (root / f"{data_name}.parquet").is_file()
+    ]
+    if missing:
+        raise FileNotFoundError(
+            "Missing SCBench preprocessed dataset files:\n"
+            + "\n".join(str(path) for path in missing)
+            + "\nSet SCBENCH_PREPROCESSED_ROOT or pass --data_root to the correct parquet root."
+        )
+    return root
 
 
 def _worker_has_samples(dataset_len: int, start_example_id: int, rank: int, world_size: int) -> bool:
@@ -421,6 +453,7 @@ if __name__ == "__main__":
 
     args = parse_args()
     data_names = args.task.split(",") if "," in args.task else [args.task]
+    args.data_root = str(validate_preprocessed_data_root(args.data_root, data_names))
     if args.ws > 1 and args.worker_rank < 0:
         _spawn_data_parallel_workers(args)
         _finalize_parent(args, data_names)

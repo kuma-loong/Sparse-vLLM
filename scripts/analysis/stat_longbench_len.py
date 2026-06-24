@@ -5,8 +5,7 @@ import numpy as np
 from tqdm import tqdm
 from transformers import AutoTokenizer
 
-# 默认路径
-DEFAULT_DATA_DIR = '/root/autodl-fs/datasets/LongBench/data'
+DEFAULT_DATA_DIR = os.getenv("DELTAKV_LONGBENCH_DATA_DIR") or os.getenv("DELTAKV_DATA_DIR")
 DEFAULT_CONFIG_DIR = 'benchmark/long_bench/config'
 
 def build_chat(tokenizer, prompt, dataset, no_chat_template=False):
@@ -27,7 +26,12 @@ def build_chat(tokenizer, prompt, dataset, no_chat_template=False):
 def parse_args():
     parser = argparse.ArgumentParser(description="统计 LongBench 各任务的 Token 长度")
     parser.add_argument("--model_path", type=str, required=True, help="用于加载 tokenizer 的模型路径")
-    parser.add_argument("--data_dir", type=str, default=DEFAULT_DATA_DIR, help="LongBench 数据集 jsonl 文件所在目录")
+    parser.add_argument(
+        "--data_dir",
+        type=str,
+        default=DEFAULT_DATA_DIR,
+        help="LongBench 数据集 jsonl 文件所在目录；默认读取 DELTAKV_LONGBENCH_DATA_DIR 或 DELTAKV_DATA_DIR",
+    )
     parser.add_argument("--config_dir", type=str, default=DEFAULT_CONFIG_DIR, help="LongBench 配置文件目录")
     parser.add_argument("--e", action="store_true", help="是否统计 LongBench-E")
     parser.add_argument("--no_chat_template", action="store_true", help="不使用对话模板统计长度")
@@ -35,6 +39,11 @@ def parse_args():
 
 def main():
     args = parse_args()
+    if not args.data_dir:
+        raise FileNotFoundError(
+            "LongBench data root is not configured. Set DELTAKV_LONGBENCH_DATA_DIR "
+            "or DELTAKV_DATA_DIR, or pass --data_dir."
+        )
     
     print(f"Loading tokenizer from {args.model_path}...")
     tokenizer = AutoTokenizer.from_pretrained(args.model_path, trust_remote_code=True)

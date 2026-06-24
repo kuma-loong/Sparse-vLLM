@@ -9,16 +9,14 @@ from collections import defaultdict
 from pathlib import Path
 from typing import Any
 
-BASE_PATH = "/root/autodl-fs/deltakv_outputs"
-
 THIS_DIR = Path(__file__).resolve().parent
 REPO_ROOT = THIS_DIR.parent.parent
+BASE_PATH = os.environ.get("DELTAKV_OUTPUT_DIR", str(REPO_ROOT / "outputs"))
 
 sys.path.append(str(REPO_ROOT / "src"))
 
 from datasets import load_dataset
 from eval_utils import DATA_NAME_TO_MAX_NEW_TOKENS, dump_jsonl
-from run_scbench import load_model
 from tqdm import tqdm
 
 sys.path.insert(0, str(REPO_ROOT / "baselines" / "kvzip"))
@@ -32,7 +30,11 @@ def parse_args():
     parser.add_argument(
         "--data_root",
         type=str,
-        default="/root/autodl-fs/datasets/SCBench-preprocessed",
+        default=os.environ.get("SCBENCH_PREPROCESSED_ROOT"),
+        help=(
+            "Root containing SCBench preprocessed parquet files. "
+            "Defaults to SCBENCH_PREPROCESSED_ROOT and is required if not passed."
+        ),
     )
     parser.add_argument(
         "--output_dir",
@@ -221,6 +223,35 @@ def _visible_gpu_ids() -> list[str]:
     return [str(i) for i in range(torch.cuda.device_count())]
 
 
+def validate_preprocessed_data_root(data_root: str | None, data_names: list[str]) -> Path:
+    if not data_root:
+        raise FileNotFoundError(
+            "SCBench preprocessed data root is not configured.\n"
+            "Set SCBENCH_PREPROCESSED_ROOT or pass --data_root to a directory "
+            "containing <task>.parquet files."
+        )
+
+    root = Path(data_root)
+    if not root.is_dir():
+        raise FileNotFoundError(
+            "SCBench preprocessed data root does not exist: "
+            f"{root}\nSet SCBENCH_PREPROCESSED_ROOT or pass --data_root."
+        )
+
+    missing = [
+        root / f"{data_name}.parquet"
+        for data_name in data_names
+        if not (root / f"{data_name}.parquet").is_file()
+    ]
+    if missing:
+        raise FileNotFoundError(
+            "Missing SCBench preprocessed dataset files:\n"
+            + "\n".join(str(path) for path in missing)
+            + "\nSet SCBENCH_PREPROCESSED_ROOT or pass --data_root to the correct parquet root."
+        )
+    return root
+
+
 def _spawn_data_parallel_workers(args):
     gpu_ids = _visible_gpu_ids()
     if len(gpu_ids) < args.ws:
@@ -270,6 +301,8 @@ def _run_worker(args, data_names: list[str]):
     real_model_name = model_name.split("/")[-1]
     worker_hyper_param = args.hyper_param.copy()
     worker_hyper_param["cuda_device"] = 0
+
+    from run_scbench import load_model
 
     model, tok = load_model(
         model_name,
@@ -396,6 +429,7 @@ if __name__ == "__main__":
         data_names = args.task.split(",")
     else:
         data_names = [args.task]
+    args.data_root = str(validate_preprocessed_data_root(args.data_root, data_names))
 
     model_name = args.model_name_or_path
     real_model_name = model_name.split("/")[-1]

@@ -4,6 +4,7 @@ import argparse
 import numpy as np
 import traceback
 from collections import Counter
+from pathlib import Path
 
 from metrics import (
     qa_f1_score,
@@ -17,7 +18,8 @@ from metrics import (
     code_sim_score,
 )
 
-BASE_PATH = os.getenv("DELTAKV_OUTPUT_DIR", "/root/autodl-fs/deltakv_outputs")
+REPO_ROOT = Path(__file__).resolve().parents[2]
+BASE_PATH = os.getenv("DELTAKV_OUTPUT_DIR", str(REPO_ROOT / "outputs"))
 SAMPLE_STATUSES = {
     "success",
     "invalid_input",

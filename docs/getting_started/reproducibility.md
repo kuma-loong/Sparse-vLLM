@@ -34,6 +34,12 @@ LongBench and MathBench read data roots from environment variables:
 - `DELTAKV_OUTPUT_DIR`: output root for benchmark predictions and logs.
 - `DELTAKV_DATA_DIR`: general benchmark dataset root.
 - `DELTAKV_LONGBENCH_DATA_DIR`: LongBench root containing `data/*.jsonl`.
+- `SCBENCH_LOCAL_DATA_DIR`: optional local root for standard SCBench files.
+- `SCBENCH_PREPROCESSED_ROOT`: root containing SCBench preprocessed `<task>.parquet` files.
+
+Benchmark entrypoints do not assume host-specific dataset paths. If required
+data roots or files are missing, the command should fail fast and print the
+environment variable or CLI flag that must be set.
 
 If a command uses local placeholders such as `<DATA_ROOT>`, `<MODEL_ROOT>`, or
 `<OUTPUT_ROOT>`, rewrite them for the target machine and record the final paths

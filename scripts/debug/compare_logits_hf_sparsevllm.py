@@ -111,6 +111,12 @@ def _load_longbench_task(args: argparse.Namespace) -> tuple[str, str, str, list[
     if not task:
         raise ValueError("--longbench_task is required when --cases includes longbench or longbench_batch.")
 
+    if not args.longbench_data_dir:
+        raise FileNotFoundError(
+            "LongBench data root is not configured.\n"
+            "Set DELTAKV_LONGBENCH_DATA_DIR or DELTAKV_DATA_DIR, or pass --longbench_data_dir "
+            "to the LongBench root directory that contains data/*.jsonl."
+        )
     data_root = Path(args.longbench_data_dir)
     if not data_root.is_dir():
         raise FileNotFoundError(f"LongBench data root does not exist: {data_root}")
@@ -3251,7 +3257,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--synthetic_token_high", type=int, default=None)
     parser.add_argument(
         "--longbench_data_dir",
-        default=os.getenv("DELTAKV_LONGBENCH_DATA_DIR", "/root/autodl-fs/datasets/LongBench"),
+        default=os.getenv("DELTAKV_LONGBENCH_DATA_DIR") or os.getenv("DELTAKV_DATA_DIR"),
     )
     parser.add_argument("--longbench_max_length", type=int, default=121000)
     parser.add_argument("--no_chat_template", action="store_true")

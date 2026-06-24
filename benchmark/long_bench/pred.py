@@ -18,11 +18,9 @@ import torch.distributed as dist
 from deltakv.get_chat_api import get_generate_api
 from datetime import datetime
 
-BASE_PATH = os.getenv("DELTAKV_OUTPUT_DIR", "/root/autodl-fs/deltakv_outputs")
-DATA_PREFIX_PATH = os.getenv(
-    "DELTAKV_LONGBENCH_DATA_DIR",
-    os.getenv("DELTAKV_DATA_DIR", "/root/autodl-fs/datasets/LongBench/"),
-)
+REPO_ROOT = Path(__file__).resolve().parents[2]
+BASE_PATH = os.getenv("DELTAKV_OUTPUT_DIR", str(REPO_ROOT / "outputs"))
+DATA_PREFIX_PATH = os.getenv("DELTAKV_LONGBENCH_DATA_DIR") or os.getenv("DELTAKV_DATA_DIR")
 NO_CHAT_TEMPLATE_DATASETS = {"trec", "triviaqa", "samsum", "lsht", "lcc", "repobench-p"}
 SAMPLE_STATUSES = {
     "success",
@@ -35,11 +33,23 @@ SAMPLE_STATUSES = {
 
 
 def get_longbench_data_path(dataset, use_longbench_e):
+    if not DATA_PREFIX_PATH:
+        raise FileNotFoundError(
+            "LongBench data root is not configured.\n"
+            "Set DELTAKV_LONGBENCH_DATA_DIR or DELTAKV_DATA_DIR to the LongBench "
+            "root directory that contains data/*.jsonl."
+        )
     suffix = "_e" if use_longbench_e else ""
     return os.path.join(DATA_PREFIX_PATH, "data", f"{dataset}{suffix}.jsonl")
 
 
 def validate_longbench_data_paths(datasets, use_longbench_e):
+    if not DATA_PREFIX_PATH:
+        raise FileNotFoundError(
+            "LongBench data root is not configured.\n"
+            "Set DELTAKV_LONGBENCH_DATA_DIR or DELTAKV_DATA_DIR to the LongBench "
+            "root directory that contains data/*.jsonl."
+        )
     if not os.path.isdir(DATA_PREFIX_PATH):
         raise FileNotFoundError(
             "LongBench data root does not exist: "

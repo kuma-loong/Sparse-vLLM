@@ -2,27 +2,31 @@
 set -euo pipefail
 
 TAG="${1:-$(date +%m%d_%H%M%S)}"
-TASKS="scbench_kv,scbench_qa_eng,scbench_summary_with_needles"
-MODEL_PATH="/root/autodl-fs/models/Qwen2.5-7B-Instruct-1M"
-DELTAKV_CHECKPOINT_PATH="/root/autodl-fs/checkpoints/compressor/cluster_e2e_cs256_biasFalse_l2_ratio0.1_clusMean_before_rope_lr0.0002_cdownmlp_swiglud3072_cuplinear_0125_222950"
+TASKS="${SCBENCH_TASKS:-scbench_kv,scbench_qa_eng,scbench_summary_with_needles}"
 
-KVZIP_LOG="/root/autodl-fs/bench_logs/scbench_three_kvzip_${TAG}.log"
-DELTAKV_LOG="/root/autodl-fs/bench_logs/scbench_three_deltakv_${TAG}.log"
+: "${SCBENCH_MODEL_PATH:?Set SCBENCH_MODEL_PATH to the local model path.}"
+: "${DELTAKV_CHECKPOINT_PATH:?Set DELTAKV_CHECKPOINT_PATH to the local compressor checkpoint path.}"
+: "${SCBENCH_PREPROCESSED_ROOT:?Set SCBENCH_PREPROCESSED_ROOT to the parquet data root.}"
 
-mkdir -p /root/autodl-fs/bench_logs
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
+LOG_DIR="${SCBENCH_LOG_DIR:-${REPO_ROOT}/outputs/bench_logs}"
+CONDA_BIN="${CONDA_BIN:-conda}"
+CONDA_ENV="${SCBENCH_CONDA_ENV:-kv}"
 
-export https_proxy="http://localhost:7890"
-export http_proxy="http://localhost:7890"
-export SCBENCH_PREPROCESSED_ROOT="/root/autodl-fs/datasets/SCBench-preprocessed"
+KVZIP_LOG="${LOG_DIR}/scbench_three_kvzip_${TAG}.log"
+DELTAKV_LOG="${LOG_DIR}/scbench_three_deltakv_${TAG}.log"
 
-cd /root/autodl-tmp/Sparse-vLLM
-export PYTHONPATH="/root/autodl-tmp/Sparse-vLLM/src:${PYTHONPATH:-}"
+mkdir -p "${LOG_DIR}"
+
+cd "${REPO_ROOT}"
+export PYTHONPATH="${REPO_ROOT}:${REPO_ROOT}/src:${PYTHONPATH:-}"
 
 echo "[START] kvzip $(date)"
-/root/miniconda3/bin/conda run -n kv --no-capture-output \
+"${CONDA_BIN}" run -n "${CONDA_ENV}" --no-capture-output \
   python -u benchmark/scbench/run_kvzip_preprocessed.py \
   --task "${TASKS}" \
-  --model_name_or_path "${MODEL_PATH}" \
+  --data_root "${SCBENCH_PREPROCESSED_ROOT}" \
+  --model_name_or_path "${SCBENCH_MODEL_PATH}" \
   --num_eval_examples -1 \
   --max_seq_length 131072 \
   --ratio 0.3 \
@@ -43,10 +47,11 @@ DELTAKV_HYPER_PARAM='{
 }'
 
 echo "[START] deltakv $(date)"
-/root/miniconda3/bin/conda run -n kv --no-capture-output \
+"${CONDA_BIN}" run -n "${CONDA_ENV}" --no-capture-output \
   python -u benchmark/scbench/run_scbench_preprocessed.py \
   --task "${TASKS}" \
-  --model_name_or_path "${MODEL_PATH}" \
+  --data_root "${SCBENCH_PREPROCESSED_ROOT}" \
+  --model_name_or_path "${SCBENCH_MODEL_PATH}" \
   --attn_type deltakv \
   --num_eval_examples -1 \
   --max_seq_length 131072 \
