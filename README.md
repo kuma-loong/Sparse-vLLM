@@ -88,8 +88,8 @@ For the full dependency list and a minimal `LLM(...)` example, see
 
 ## Benchmarks
 
-Use `scripts/benchmarks/bench_sparse_vllm.py` for throughput measurements and
-the `benchmark/` entrypoints for LongBench, MathBench, SCBench, NIAH, and
+Use `benchmark/microbench.py` for synthetic throughput measurements and the
+other `benchmark/` entrypoints for LongBench, MathBench, SCBench, NIAH, and
 multimodal evaluations.
 
 See [Benchmarks](docs/benchmarking/README.md) for command examples and backend notes.
