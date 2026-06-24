@@ -1,3 +1,4 @@
+import os
 import unittest
 
 import torch
@@ -23,6 +24,38 @@ from sparsevllm.triton_kernel.quant import triton_quantize_and_pack_along_last_d
 
 @unittest.skipUnless(torch.cuda.is_available(), "CUDA is required for DeltaKV Triton kernel tests.")
 class DeltaKVLessMemoryKernelTest(unittest.TestCase):
+    def test_store_kvcache_chunks_large_launches(self):
+        from sparsevllm.triton_kernel.store_kvcache import store_kvcache
+
+        old_value = os.environ.get("SPARSEVLLM_STORE_KVCACHE_CHUNK_TOKENS")
+        os.environ["SPARSEVLLM_STORE_KVCACHE_CHUNK_TOKENS"] = "3"
+        try:
+            device = "cuda"
+            dtype = torch.float16
+            n = 8
+            num_heads = 2
+            head_dim = 4
+            key = torch.arange(n * num_heads * head_dim, device=device, dtype=dtype).view(n, num_heads, head_dim)
+            value = key + 1000
+            k_cache = torch.full((10, num_heads, head_dim), -1, device=device, dtype=dtype)
+            v_cache = torch.full_like(k_cache, -1)
+            slot_mapping = torch.tensor([7, 0, 5, -1, 2, 4, 1, 6], device=device, dtype=torch.int32)
+
+            store_kvcache(key, value, k_cache, v_cache, slot_mapping)
+            torch.cuda.synchronize()
+
+            for token_idx, slot in enumerate(slot_mapping.tolist()):
+                if slot < 0:
+                    continue
+                self.assertTrue(torch.equal(k_cache[slot], key[token_idx]))
+                self.assertTrue(torch.equal(v_cache[slot], value[token_idx]))
+            self.assertTrue(torch.equal(k_cache[3], torch.full_like(k_cache[3], -1)))
+        finally:
+            if old_value is None:
+                os.environ.pop("SPARSEVLLM_STORE_KVCACHE_CHUNK_TOKENS", None)
+            else:
+                os.environ["SPARSEVLLM_STORE_KVCACHE_CHUNK_TOKENS"] = old_value
+
     def test_l2_topk_blockwise_accepts_dynamic_center_positions(self):
         torch.manual_seed(3)
         device = "cuda"
@@ -62,6 +95,66 @@ class DeltaKVLessMemoryKernelTest(unittest.TestCase):
         expected_idx = scores.topk(k=k, dim=1).indices.to(torch.int32)
 
         self.assertTrue(torch.equal(got_idx, expected_idx))
+
+    def test_streaming_cluster_helper_matches_whole_block_cluster(self):
+        from sparsevllm.engine.cache_manager.deltakv_less_memory import DeltaKVLessMemoryCacheManager
+
+        torch.manual_seed(11)
+        device = "cuda"
+        dtype = torch.float16
+        n = 23
+        d = 32
+        existing_count = 2
+        new_center_rel = torch.tensor([0, 4, 9, 13, 20], device=device, dtype=torch.long)
+
+        manager = object.__new__(DeltaKVLessMemoryCacheManager)
+        manager.config = type(
+            "Config",
+            (),
+            {
+                "cluster_metric": "l2",
+                "deltakv_k_neighbors": 3,
+                "deltakv_cluster_gather_chunk_size": 5,
+            },
+        )()
+        manager.deltakv_layer_to_idx = {7: 0}
+
+        kv_states = torch.randn((1, n, d), device=device, dtype=dtype)
+        existing_centers = torch.randn((1, existing_count, d), device=device, dtype=dtype)
+        existing_slots = torch.arange(existing_count, device=device, dtype=torch.int32)
+
+        def gather_existing(l_idx, slots):
+            self.assertEqual(l_idx, 0)
+            return existing_centers.squeeze(0).index_select(0, slots.to(torch.long))
+
+        manager._gather_sparse_ref_raw_kv_by_slots = gather_existing
+        ref_topk, ref_base = DeltaKVLessMemoryCacheManager._cluster_compress(
+            manager,
+            layer_idx=7,
+            kv_states=kv_states,
+            existing_center_slots=existing_slots,
+            cluster_step=4,
+            new_center_rel=new_center_rel,
+        )
+
+        all_centers = torch.cat([existing_centers, kv_states.index_select(1, new_center_rel)], dim=1)
+        topk_chunks = []
+        base_chunks = []
+        for start in (0, 6, 12, 18):
+            end = min(n, start + 6)
+            topk, base = DeltaKVLessMemoryCacheManager._cluster_compress_against_centers(
+                manager,
+                kv_states=kv_states[:, start:end, :],
+                all_centers=all_centers,
+                existing_center_count=existing_count,
+                new_center_rel=new_center_rel,
+                row_start=start,
+            )
+            topk_chunks.append(topk)
+            base_chunks.append(base)
+
+        self.assertTrue(torch.equal(ref_topk, torch.cat(topk_chunks, dim=0)))
+        self.assertTrue(torch.allclose(ref_base, torch.cat(base_chunks, dim=1), atol=1e-3, rtol=1e-3))
 
     def test_static_decode_plan_matches_reference(self):
         device = "cuda"
@@ -557,6 +650,63 @@ class DeltaKVLessMemoryKernelTest(unittest.TestCase):
         self.assertTrue(torch.allclose(manager.full_layer_kivi_key_mins[0, slots], mn_k.squeeze(-1)))
         self.assertTrue(torch.allclose(manager.full_layer_kivi_value_scales[0, slots], scale_v))
         self.assertTrue(torch.allclose(manager.full_layer_kivi_value_mins[0, slots], mn_v))
+
+    def test_full_prefill_kivi_materialize_chunks_block_store(self):
+        from sparsevllm.engine.cache_manager.deltakv_less_memory import DeltaKVLessMemoryCacheManager
+
+        torch.manual_seed(13)
+        device = "cuda"
+        dtype = torch.float16
+        group_size = 8
+        num_blocks = 5
+        num_heads = 2
+        head_dim = 8
+        total_tokens = num_blocks * group_size
+
+        manager = object.__new__(DeltaKVLessMemoryCacheManager)
+        manager.config = type(
+            "Config",
+            (),
+            {
+                "full_layer_kivi_group_size": group_size,
+                "mlp_chunk_size": 16,
+            },
+        )()
+        manager.full_layer_to_idx = {3: 0}
+        manager._full_layer_kivi_full_prefill_materialized_layers = set()
+        manager._full_layer_kivi_full_prefill_plans = {
+            0: {
+                "keep_pos": torch.empty((0,), device=device, dtype=torch.int32),
+                "keep_slots": torch.empty((0,), device=device, dtype=torch.int32),
+                "block_start_pos": torch.arange(0, total_tokens, group_size, device=device, dtype=torch.int32),
+                "block_slots": torch.arange(num_blocks, device=device, dtype=torch.int32),
+            }
+        }
+        manager.deltakv_prefill_staging_kv_cache = torch.randn(
+            2,
+            total_tokens,
+            num_heads,
+            head_dim,
+            device=device,
+            dtype=dtype,
+        )
+        manager.full_kv_cache = torch.empty(2, 1, 0, num_heads, head_dim, device=device, dtype=dtype)
+        manager.num_kv_heads = num_heads
+        manager.head_dim = head_dim
+        chunk_sizes = []
+
+        def record_store(l_idx, block_slots, key_post_rope, value):
+            self.assertEqual(l_idx, 0)
+            chunk_sizes.append(int(block_slots.numel()))
+            expected_shape = (int(block_slots.numel()), group_size, num_heads, head_dim)
+            self.assertEqual(tuple(key_post_rope.shape), expected_shape)
+            self.assertEqual(tuple(value.shape), expected_shape)
+
+        manager._store_full_layer_kivi_blocks = record_store
+        DeltaKVLessMemoryCacheManager._full_layer_kivi_materialize_full_prefill_layer(manager, 3)
+
+        self.assertEqual(chunk_sizes, [2, 2, 1])
+        self.assertIn(3, manager._full_layer_kivi_full_prefill_materialized_layers)
 
     def test_full_layer_kivi_dequant_tokens_matches_unpack(self):
         torch.manual_seed(1)

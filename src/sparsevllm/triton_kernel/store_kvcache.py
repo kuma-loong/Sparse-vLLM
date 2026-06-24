@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import os
+
 import torch
 import triton
 import triton.language as tl
@@ -41,13 +43,29 @@ def store_kvcache(
     assert key.stride(1) == head_dim and value.stride(1) == head_dim
     assert k_cache.stride(-1) == 1
     assert slot_mapping.numel() == n_tokens
-    store_kvcache_kernel[(n_tokens,)](
-        key,
-        key.stride(0),
-        value,
-        value.stride(0),
-        k_cache,
-        v_cache,
-        slot_mapping,
-        d_model,
-    )
+    max_launch_tokens = int(os.getenv("SPARSEVLLM_STORE_KVCACHE_CHUNK_TOKENS", "524288") or 0)
+    if max_launch_tokens <= 0 or n_tokens <= max_launch_tokens:
+        store_kvcache_kernel[(n_tokens,)](
+            key,
+            key.stride(0),
+            value,
+            value.stride(0),
+            k_cache,
+            v_cache,
+            slot_mapping,
+            d_model,
+        )
+        return
+
+    for start in range(0, n_tokens, max_launch_tokens):
+        end = min(n_tokens, start + max_launch_tokens)
+        store_kvcache_kernel[(end - start,)](
+            key[start:end],
+            key.stride(0),
+            value[start:end],
+            value.stride(0),
+            k_cache,
+            v_cache,
+            slot_mapping[start:end],
+            d_model,
+        )

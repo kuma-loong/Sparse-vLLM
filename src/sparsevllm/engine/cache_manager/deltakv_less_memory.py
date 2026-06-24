@@ -1554,6 +1554,7 @@ class DeltaKVLessMemoryCacheManager(DeltaKVCacheTritonManagerV4):
             k_stage = self.deltakv_prefill_staging_kv_cache[0]
             v_stage = self.deltakv_prefill_staging_kv_cache[1]
             group_size = self._full_layer_kivi_group_size()
+            block_chunk_size = self._full_layer_kivi_store_block_chunk_size()
 
             for plan in self._full_layer_kivi_full_prefill_plans.values():
                 keep_pos = plan["keep_pos"].to(torch.long)
@@ -1567,16 +1568,25 @@ class DeltaKVLessMemoryCacheManager(DeltaKVCacheTritonManagerV4):
                 block_slots = plan["block_slots"].to(torch.long)
                 if block_slots.numel() > 0:
                     offsets = torch.arange(group_size, device="cuda", dtype=torch.long)
-                    block_pos = block_starts[:, None] + offsets[None, :]
                     with profiler.record("deltakv_full_prefill_kivi_store_blocks"):
-                        self._store_full_layer_kivi_blocks(
-                            l_idx=l_idx,
-                            block_slots=block_slots,
-                            key_post_rope=k_stage[block_pos],
-                            value=v_stage[block_pos],
-                        )
+                        for start in range(0, int(block_slots.numel()), block_chunk_size):
+                            end = min(int(block_slots.numel()), start + block_chunk_size)
+                            block_pos = block_starts[start:end, None] + offsets[None, :]
+                            self._store_full_layer_kivi_blocks(
+                                l_idx=l_idx,
+                                block_slots=block_slots[start:end],
+                                key_post_rope=k_stage[block_pos],
+                                value=v_stage[block_pos],
+                            )
 
             self._full_layer_kivi_full_prefill_materialized_layers.add(layer_idx)
+
+    def _full_layer_kivi_store_block_chunk_size(self) -> int:
+        token_chunk_size = int(getattr(self.config, "mlp_chunk_size", 16384) or 16384)
+        if token_chunk_size <= 0:
+            raise RuntimeError(f"mlp_chunk_size must be > 0 for full-layer KIVI store, got {token_chunk_size}.")
+        group_size = self._full_layer_kivi_group_size()
+        return max(1, token_chunk_size // group_size)
 
     @torch.no_grad()
     def _allocate_full_positions(self, seq_id: int, positions: torch.Tensor) -> torch.Tensor:
@@ -1826,15 +1836,35 @@ class DeltaKVLessMemoryCacheManager(DeltaKVCacheTritonManagerV4):
     ):
         if store_indices is not None:
             store_indices = store_indices.to(device=kv_block.device, dtype=torch.long)
-        down = self.compress_down[l_idx]
-        if store_indices is not None:
-            kv_to_store = kv_block.index_select(1, store_indices)
-            base_to_store = base_kv.index_select(1, store_indices)
+            selected_indices = store_indices
         else:
-            kv_to_store = kv_block[:, to_compress_mask, :]
-            base_to_store = base_kv[:, to_compress_mask, :]
-        residual = (down(kv_to_store) - down(base_to_store)).squeeze(0)
-        self._store_residual(l_idx, latent_slots, residual)
+            selected_indices = torch.nonzero(
+                to_compress_mask.to(device=kv_block.device),
+                as_tuple=False,
+            ).flatten().to(torch.long)
+        if int(selected_indices.numel()) != int(latent_slots.numel()):
+            raise RuntimeError(
+                "DeltaKV less-memory latent store selected-token mismatch: "
+                f"selected={int(selected_indices.numel())}, latent_slots={int(latent_slots.numel())}."
+            )
+        if int(selected_indices.numel()) == 0:
+            return
+        chunk_size = self._deltakv_latent_store_chunk_size()
+        down = self.compress_down[l_idx]
+        for start in range(0, int(selected_indices.numel()), chunk_size):
+            end = min(int(selected_indices.numel()), start + chunk_size)
+            chunk_indices = selected_indices[start:end]
+            chunk_latent_slots = latent_slots[start:end]
+            kv_to_store = kv_block.index_select(1, chunk_indices)
+            base_to_store = base_kv.index_select(1, chunk_indices)
+            residual = (down(kv_to_store) - down(base_to_store)).squeeze(0)
+            self._store_residual(l_idx, chunk_latent_slots, residual)
+
+    def _deltakv_latent_store_chunk_size(self) -> int:
+        chunk_size = int(getattr(self.config, "mlp_chunk_size", 16384) or 16384)
+        if chunk_size <= 0:
+            raise RuntimeError(f"mlp_chunk_size must be > 0 for DeltaKV latent store, got {chunk_size}.")
+        return chunk_size
 
     def _prefill_pre_rope_stage_active(self) -> bool:
         return bool(
@@ -1985,6 +2015,217 @@ class DeltaKVLessMemoryCacheManager(DeltaKVCacheTritonManagerV4):
             v_cache=v_cache,
         )
 
+    def _deltakv_score_chunk_size(self, num_centers: int) -> int:
+        configured = int(getattr(self.config, "deltakv_cluster_gather_chunk_size", 16384) or 16384)
+        if configured <= 0:
+            raise RuntimeError("deltakv_cluster_gather_chunk_size must be > 0 for chunked cluster scoring.")
+        max_score_elements = int(os.getenv("SPARSEVLLM_DELTAKV_SCORE_MAX_ELEMS", str(128 * 1024 * 1024)))
+        if max_score_elements <= 0:
+            raise RuntimeError(
+                "SPARSEVLLM_DELTAKV_SCORE_MAX_ELEMS must be > 0 when set, "
+                f"got {max_score_elements}."
+            )
+        return max(1, min(configured, max_score_elements // max(1, int(num_centers))))
+
+    def _cluster_compress_against_centers(
+        self,
+        *,
+        kv_states: torch.Tensor,
+        all_centers: torch.Tensor,
+        existing_center_count: int,
+        new_center_rel: torch.Tensor,
+        row_start: int,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        assert kv_states.dim() == 3 and kv_states.shape[0] == 1
+        _, n, kv_dim = kv_states.shape
+        num_centers = int(all_centers.shape[1])
+        if num_centers == 0:
+            raise RuntimeError("DeltaKV less-memory: no available reference centers.")
+
+        k_eff = min(int(self.config.deltakv_k_neighbors), num_centers)
+        if k_eff <= 0:
+            raise RuntimeError("DeltaKV less-memory: no available centers to assign.")
+        score_chunk_size = self._deltakv_score_chunk_size(num_centers)
+        metric_type = self.config.cluster_metric
+        m0 = int(existing_center_count)
+        m_new = int(new_center_rel.numel())
+
+        topk_chunks: list[torch.Tensor] = []
+        base_chunks: list[torch.Tensor] = []
+        for start in range(0, n, score_chunk_size):
+            end = min(n, start + score_chunk_size)
+            kv_chunk = kv_states[:, start:end, :]
+            if metric_type == "l2":
+                scores = self._metric_l2(kv_chunk, all_centers)
+            elif metric_type == "dot":
+                scores = self._metric_dot(kv_chunk, all_centers)
+            elif metric_type == "cosine":
+                scores = self._metric_cosine(kv_chunk, all_centers)
+            elif metric_type == "fastdot":
+                scores = torch.bmm(kv_chunk, all_centers.transpose(1, 2))
+            else:
+                raise ValueError(f"Unknown cluster_metric: {metric_type}")
+
+            if m_new > 0:
+                rows = torch.arange(row_start + start, row_start + end, device=kv_states.device).view(end - start, 1)
+                cols = new_center_rel.view(1, m_new)
+                mask_new = cols <= rows
+                scores[:, :, m0:].masked_fill_(~mask_new.unsqueeze(0), float("-inf"))
+
+            topk_indices_chunk = scores.topk(k=k_eff, dim=-1).indices
+            gather_idx = topk_indices_chunk.reshape(1, -1)[:, :, None].expand(-1, -1, kv_dim)
+            base_chunk = all_centers.gather(1, gather_idx).view(1, end - start, k_eff, kv_dim).mean(dim=2)
+            topk_chunks.append(topk_indices_chunk)
+            base_chunks.append(base_chunk)
+
+        topk_indices = torch.cat(topk_chunks, dim=1)
+        base = torch.cat(base_chunks, dim=1)
+        return topk_indices.squeeze(0).to(torch.int32), base
+
+    def _deltakv_store_father_slots(
+        self,
+        *,
+        l_idx: int,
+        latent_slots: torch.Tensor,
+        all_center_slots: torch.Tensor,
+        topk_center_indices: torch.Tensor,
+        store_indices: torch.Tensor | None = None,
+    ):
+        father_slots_full = all_center_slots[topk_center_indices.to(torch.long)]
+        if store_indices is not None:
+            father_slots = father_slots_full.index_select(
+                0,
+                store_indices.to(device=father_slots_full.device, dtype=torch.long),
+            )
+        else:
+            father_slots = father_slots_full
+        k_neighbors = self.deltakv_latent_to_full_slots.shape[-1]
+        k_eff = father_slots.shape[1]
+        if k_eff < k_neighbors:
+            pad = father_slots[:, :1].expand(-1, k_neighbors - k_eff)
+            father_slots = torch.cat([father_slots, pad], dim=1)
+        elif k_eff > k_neighbors:
+            father_slots = father_slots[:, :k_neighbors]
+        self.deltakv_latent_to_full_slots[l_idx, latent_slots] = father_slots.to(torch.int32)
+
+    def _deltakv_compress_full_prefill_plan_layer(
+        self,
+        *,
+        l_idx: int,
+        layer_idx: int,
+        plan: dict[str, torch.Tensor | int],
+        sink_slots: torch.Tensor,
+        center_pos: torch.Tensor,
+        center_slots: torch.Tensor,
+        latent_slots: torch.Tensor,
+        evict_pos: torch.Tensor,
+        latent_store_mask: torch.Tensor,
+        latent_store_indices: torch.Tensor | None,
+    ):
+        if latent_store_indices is None:
+            store_indices_all = torch.nonzero(latent_store_mask, as_tuple=False).flatten().to(device=evict_pos.device)
+        else:
+            store_indices_all = latent_store_indices.to(device=evict_pos.device, dtype=torch.long)
+        if int(store_indices_all.numel()) != int(latent_slots.numel()):
+            raise RuntimeError(
+                "DeltaKV full-prefill latent store index mismatch: "
+                f"store_indices={int(store_indices_all.numel())}, latent_slots={int(latent_slots.numel())}."
+            )
+        if int(store_indices_all.numel()) == 0:
+            return
+        if not torch.cuda.is_current_stream_capturing():
+            if bool((store_indices_all < 0).any()) or bool((store_indices_all >= int(evict_pos.numel())).any()):
+                raise RuntimeError("DeltaKV full-prefill store indices are outside the evict block.")
+            if int(store_indices_all.numel()) > 1 and bool((store_indices_all[1:] < store_indices_all[:-1]).any()):
+                raise RuntimeError("DeltaKV full-prefill store indices must be sorted by evict position.")
+
+        with profiler.record("deltakv_full_prefill_build_centers"):
+            kv_dim = 2 * self.num_kv_heads * self.head_dim
+            existing_centers = (
+                self._gather_sparse_ref_raw_kv_by_slots(l_idx, sink_slots).unsqueeze(0)
+                if sink_slots.numel() > 0
+                else evict_pos.new_zeros((1, 0, kv_dim), dtype=self.hf_config.torch_dtype)
+            )
+            new_centers = (
+                self._deltakv_gather_raw_kv_from_cache(
+                    slots=center_pos.to(torch.int32),
+                    pos=center_pos.to(torch.int32),
+                    k_cache=self.deltakv_prefill_staging_kv_cache[0],
+                    v_cache=self.deltakv_prefill_staging_kv_cache[1],
+                ).unsqueeze(0)
+                if center_pos.numel() > 0
+                else existing_centers.new_zeros((1, 0, kv_dim))
+            )
+            all_centers = torch.cat([existing_centers, new_centers], dim=1)
+            all_center_slots = torch.cat([sink_slots, center_slots], dim=0)
+            if int(all_centers.shape[1]) == 0:
+                raise RuntimeError("DeltaKV less-memory full-prefill: no available reference centers.")
+
+        evict_start = int(plan["evict_start"])
+        new_center_rel = (center_pos - evict_start).to(device=evict_pos.device, dtype=torch.long)
+        store_cursor = 0
+        store_chunk_size = self._deltakv_latent_store_chunk_size()
+        for start in range(0, int(evict_pos.numel()), store_chunk_size):
+            end = min(int(evict_pos.numel()), start + store_chunk_size)
+            evict_chunk = evict_pos[start:end]
+            with profiler.record("deltakv_full_prefill_gather_raw_chunk"):
+                kv_chunk = self._deltakv_gather_raw_kv_from_cache(
+                    slots=evict_chunk,
+                    pos=evict_chunk,
+                    k_cache=self.deltakv_prefill_staging_kv_cache[0],
+                    v_cache=self.deltakv_prefill_staging_kv_cache[1],
+                ).unsqueeze(0)
+            with profiler.record("deltakv_full_prefill_cluster_chunk"):
+                topk_center_indices, base_kv = self._cluster_compress_against_centers(
+                    kv_states=kv_chunk,
+                    all_centers=all_centers,
+                    existing_center_count=int(existing_centers.shape[1]),
+                    new_center_rel=new_center_rel,
+                    row_start=start,
+                )
+
+            next_cursor = int(
+                torch.searchsorted(
+                    store_indices_all,
+                    torch.tensor(end, device=store_indices_all.device, dtype=store_indices_all.dtype),
+                    right=False,
+                ).item()
+            )
+            if next_cursor == store_cursor:
+                continue
+            selected_global = store_indices_all[store_cursor:next_cursor]
+            if not torch.cuda.is_current_stream_capturing() and (
+                bool((selected_global < start).any()) or bool((selected_global >= end).any())
+            ):
+                raise RuntimeError("DeltaKV full-prefill store index fell outside its chunk.")
+            selected_local = selected_global - start
+            chunk_latent_slots = latent_slots[store_cursor:next_cursor]
+
+            with profiler.record("deltakv_full_prefill_store_fathers_chunk"):
+                self._deltakv_store_father_slots(
+                    l_idx=l_idx,
+                    latent_slots=chunk_latent_slots,
+                    all_center_slots=all_center_slots,
+                    topk_center_indices=topk_center_indices,
+                    store_indices=selected_local,
+                )
+            with profiler.record("deltakv_full_prefill_store_latent_chunk"):
+                self._deltakv_store_layer_latent(
+                    l_idx=l_idx,
+                    latent_slots=chunk_latent_slots,
+                    kv_block=kv_chunk,
+                    base_kv=base_kv,
+                    to_compress_mask=latent_store_mask[start:end],
+                    store_indices=selected_local,
+                )
+            store_cursor = next_cursor
+
+        if store_cursor != int(store_indices_all.numel()):
+            raise RuntimeError(
+                "DeltaKV full-prefill did not store all latent rows: "
+                f"stored={store_cursor}, expected={int(store_indices_all.numel())}."
+            )
+
     @torch.no_grad()
     def _deltakv_compress_full_prefill_layer(self, layer_idx: int):
         with profiler.record("deltakv_full_prefill_compress_total"):
@@ -2026,48 +2267,18 @@ class DeltaKVLessMemoryCacheManager(DeltaKVCacheTritonManagerV4):
                 to_compress_mask = plan["to_compress_mask"]
                 latent_store_mask = plan.get("latent_store_mask", to_compress_mask)
                 latent_store_indices = plan.get("latent_store_indices", None)
-                with profiler.record("deltakv_full_prefill_gather_raw"):
-                    kv_block = self._deltakv_gather_raw_kv_from_cache(
-                        slots=evict_pos,
-                        pos=evict_pos,
-                        k_cache=self.deltakv_prefill_staging_kv_cache[0],
-                        v_cache=self.deltakv_prefill_staging_kv_cache[1],
-                    ).unsqueeze(0)
-                with profiler.record("deltakv_full_prefill_cluster"):
-                    topk_center_indices, base_kv = self._cluster_compress(
-                        layer_idx=layer_idx,
-                        kv_states=kv_block,
-                        existing_center_slots=sink_slots,
-                        cluster_step=self._deltakv_base_cluster_step(),
-                        new_center_rel=(center_pos - int(plan["evict_start"])).to(torch.long),
-                    )
-                with profiler.record("deltakv_full_prefill_store_fathers"):
-                    all_center_slots = torch.cat([sink_slots, center_slots], dim=0)
-                    father_slots_full = all_center_slots[topk_center_indices.to(torch.long)]
-                    if latent_store_indices is not None:
-                        father_slots = father_slots_full.index_select(
-                            0,
-                            latent_store_indices.to(device=father_slots_full.device, dtype=torch.long),
-                        )
-                    else:
-                        father_slots = father_slots_full[latent_store_mask]
-                    k_neighbors = self.deltakv_latent_to_full_slots.shape[-1]
-                    k_eff = father_slots.shape[1]
-                    if k_eff < k_neighbors:
-                        pad = father_slots[:, :1].expand(-1, k_neighbors - k_eff)
-                        father_slots = torch.cat([father_slots, pad], dim=1)
-                    elif k_eff > k_neighbors:
-                        father_slots = father_slots[:, :k_neighbors]
-                    self.deltakv_latent_to_full_slots[l_idx, latent_slots] = father_slots.to(torch.int32)
-                with profiler.record("deltakv_full_prefill_store_latent"):
-                    self._deltakv_store_layer_latent(
-                        l_idx=l_idx,
-                        latent_slots=latent_slots,
-                        kv_block=kv_block,
-                        base_kv=base_kv,
-                        to_compress_mask=latent_store_mask,
-                        store_indices=latent_store_indices,
-                    )
+                self._deltakv_compress_full_prefill_plan_layer(
+                    l_idx=l_idx,
+                    layer_idx=layer_idx,
+                    plan=plan,
+                    sink_slots=sink_slots,
+                    center_pos=center_pos,
+                    center_slots=center_slots,
+                    latent_slots=latent_slots,
+                    evict_pos=evict_pos,
+                    latent_store_mask=latent_store_mask,
+                    latent_store_indices=latent_store_indices,
+                )
 
             self._deltakv_full_prefill_compressed_layers.add(layer_idx)
 
@@ -2138,9 +2349,7 @@ class DeltaKVLessMemoryCacheManager(DeltaKVCacheTritonManagerV4):
         if k_eff <= 0:
             raise RuntimeError("DeltaKV less-memory: no available centers to assign.")
         metric_type = self.config.cluster_metric
-        score_chunk_size = int(getattr(self.config, "deltakv_cluster_gather_chunk_size", 16384))
-        if score_chunk_size <= 0:
-            raise RuntimeError("deltakv_cluster_gather_chunk_size must be > 0 for chunked cluster scoring.")
+        score_chunk_size = self._deltakv_score_chunk_size(int(all_centers.shape[1]))
 
         topk_chunks: list[torch.Tensor] = []
         base_chunks: list[torch.Tensor] = []
@@ -2162,12 +2371,7 @@ class DeltaKVLessMemoryCacheManager(DeltaKVCacheTritonManagerV4):
                 rows = torch.arange(start, end, device=kv_states.device).view(end - start, 1)
                 cols = new_center_rel.view(1, m_new)
                 mask_new = cols <= rows
-                if m0 > 0:
-                    mask_existing = torch.ones((end - start, m0), device=kv_states.device, dtype=torch.bool)
-                    mask = torch.cat([mask_existing, mask_new], dim=1)
-                else:
-                    mask = mask_new
-                scores = scores.masked_fill(~mask.unsqueeze(0), float("-inf"))
+                scores[:, :, m0:].masked_fill_(~mask_new.unsqueeze(0), float("-inf"))
 
             topk_indices_chunk = scores.topk(k=k_eff, dim=-1).indices
             gather_idx = topk_indices_chunk.reshape(1, -1)[:, :, None].expand(-1, -1, kv_dim)
