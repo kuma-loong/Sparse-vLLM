@@ -116,6 +116,8 @@ Set `sparse_method` to one of:
 - `"snapkv"`, `"pyramidkv"` (physical eviction)
 - `"omnikv"` (logical masking)
 - `"quest"` (query-aware page selection on decode; prefill stays full attention)
+- `"rkv"` / `"r-kv"` (decode-time R-KV physical eviction using attention importance and key-vector redundancy)
+- `"skipkv"` (SkipKV sentence-aware KV storage skipping; supported only for the official DeepSeek-R1-Distill Llama-8B, Qwen-7B, and Qwen-14B model basenames with released steering vectors)
 - `"deltakv"` / `"deltakv-*"` (hybrid compression; optional / experimental, see [DeltaKV](#deltakv))
 
 Sparse-vLLM internally stores this as `vllm_sparse_method`, but public commands
@@ -126,6 +128,34 @@ and `LLM(...)` kwargs should use `sparse_method`.
 - `quest_chunk_size`: QuEST page/chunk size in tokens (default `16`)
 - `quest_token_budget`: decode-time token budget before page rounding (default `1024`)
 - `quest_skip_layers`: keep the first N layers dense during decode (default `2`)
+
+`rkv` runtime knobs:
+
+- `rkv_compression_interval`: generated-token buffer size before decode eviction (default `128`; use larger values such as `1024` for fewer, larger paper-style decode evictions)
+- `rkv_alpha`: paper-style joint score lambda, `alpha * importance - (1 - alpha) * redundancy` (default `0.1`)
+- `rkv_similarity_threshold`: cosine threshold used to count key-token redundancy (default `0.8`)
+- `rkv_recent_similar_keep`: preserve links to the most recent similar tokens when estimating redundancy (default `1`)
+- `rkv_max_redundancy_tokens`: explicit safety bound for quadratic redundancy scoring (default `4096`)
+- `rkv_redundancy_window`: candidate window scored for redundancy on each eviction; `0` scores the full candidate set and is the paper-aligned default, positive values opt into a trailing-window speed approximation
+
+`skipkv` runtime knobs:
+
+- `skipkv_compression_interval`: generated-token buffer size before decode eviction (default `128`)
+- `skipkv_alpha`: token-level redundancy penalty weight (default `0.1`)
+- `skipkv_similarity_threshold`: segment cosine threshold for sentence-inspired eviction (default `0.95`)
+- `skipkv_segment_size`: token count per segment when sentence spans are unavailable in the engine (default `32`)
+- `skipkv_max_redundancy_tokens`: explicit safety bound for scoring candidates (default `4096`)
+- `skipkv_redundancy_window`: trailing candidate window scored for token/segment redundancy on each eviction (default `64`)
+- `skipkv_enable_sentence_scoring`: use tokenizer-delimited sentence spans and hidden-state sentence embeddings when available (default `true`)
+- `skipkv_sentence_score_weight`: weight for sentence-level redundancy penalty (default `1.0`)
+- `skipkv_sentence_min_tokens` / `skipkv_sentence_max_tokens`: sentence tracking bounds (defaults `4` / `256`)
+- `skipkv_sentence_embedding_layer`: transformer layer used for sentence embeddings, negative values count from the end (default `-1`)
+- `skipkv_enable_activation_steering`: enable SkipKV activation steering only when `skipkv_steering_vector_path` is set (default `false`); enabling steering without a vector path raises `ValueError`.
+- `skipkv_steering_vector_path`: `.pt` file containing an official released SkipKV steering vector. The repo does not support locally generated heuristic vectors as paper-equivalent vectors.
+- `skipkv_steering_layer`, `skipkv_steering_alpha`, `skipkv_steering_alpha_increment`, `skipkv_steering_alpha_max`: steering injection layer and signed adaptive strength controls. Official SkipKV-style Qwen/Llama runs use layer `20` with negative alpha, e.g. `-1.25` and increment `-0.02`.
+- SkipKV sentence tracking and steering use the paper/official newline-oriented delimiter set (`\n`, `.\n`, `)\n`, `\n\n`, `.\n\n`, `)\n\n`, `?\n\n`), not standalone punctuation such as `.`.
+- SkipKV updates the dynamic steering strength only after completed sentences that contain non-execution markers such as `Alternatively`, `Wait`, or `again`; sentence-similarity redundancy remains an eviction signal.
+- SkipKV compatibility is checked with `model_path.rstrip("/").split("/")[-1]`. Supported basenames are exactly `DeepSeek-R1-Distill-Llama-8B`, `DeepSeek-R1-Distill-Qwen-7B`, and `DeepSeek-R1-Distill-Qwen-14B`; other basenames raise `ValueError`.
 
 ## How to test
 

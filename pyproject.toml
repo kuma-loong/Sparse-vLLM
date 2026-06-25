@@ -29,6 +29,7 @@ dependencies = [
     "datatrove",
     "tqdm",
     "loguru",
+    "math-verify==0.9.0",
 ]
 
 [project.scripts]
