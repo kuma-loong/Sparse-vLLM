@@ -275,6 +275,197 @@ class OpenAIAPIServerTest(unittest.IsolatedAsyncioTestCase):
         finally:
             dispatcher.close()
 
+    async def test_prefix_cache_inspect_route_uses_dispatcher_control_queue(self):
+        from sparsevllm.entrypoints.openai import api_server
+
+        class Tokenizer:
+            bos_token = None
+
+            def encode(self, text, add_special_tokens=False):
+                del text, add_special_tokens
+                return [1, 2]
+
+        class Engine:
+            tokenizer = Tokenizer()
+            config = type("Config", (), {"vllm_sparse_method": ""})()
+
+            def prefix_cache_inspect(self, token_ids, include_subtree=False):
+                return {
+                    "token_ids": list(token_ids),
+                    "include_subtree": bool(include_subtree),
+                    "thread": threading.current_thread().name,
+                }
+
+            def exit(self):
+                pass
+
+        app = api_server.create_app("/tmp/model", served_model_name="model", engine=Engine())
+        endpoint = next(route.endpoint for route in app.routes if getattr(route, "path", None) == "/v1/prefix_cache/inspect")
+        try:
+            response = await endpoint(api_server.PrefixCacheInspectRequest(token_ids=[7, 8], include_subtree=True))
+        finally:
+            app.state.dispatcher.close()
+
+        payload = json.loads(response.body)
+        self.assertEqual(payload["token_ids"], [7, 8])
+        self.assertTrue(payload["include_subtree"])
+        self.assertEqual(payload["thread"], "sparsevllm-openai-dispatcher")
+
+    async def test_prefix_cache_text_selector_tokenizes_server_side(self):
+        from sparsevllm.entrypoints.openai import api_server
+
+        class Tokenizer:
+            bos_token = "<s>"
+
+            def __init__(self):
+                self.calls = []
+
+            def encode(self, text, add_special_tokens=False):
+                self.calls.append((text, add_special_tokens))
+                return [0, 11] if add_special_tokens else [11]
+
+        class Engine:
+            config = type("Config", (), {"vllm_sparse_method": ""})()
+
+            def __init__(self):
+                self.tokenizer = Tokenizer()
+
+            def prefix_cache_inspect(self, token_ids, include_subtree=False):
+                del include_subtree
+                return {"token_ids": list(token_ids), "calls": list(self.tokenizer.calls)}
+
+            def exit(self):
+                pass
+
+        engine = Engine()
+        app = api_server.create_app("/tmp/model", served_model_name="model", engine=engine)
+        endpoint = next(route.endpoint for route in app.routes if getattr(route, "path", None) == "/v1/prefix_cache/inspect")
+        try:
+            response = await endpoint(api_server.PrefixCacheInspectRequest(text="hello"))
+        finally:
+            app.state.dispatcher.close()
+
+        payload = json.loads(response.body)
+        self.assertEqual(payload["token_ids"], [0, 11])
+        self.assertEqual(payload["calls"], [["hello", True]])
+
+    async def test_prefix_cache_selector_rejects_both_or_neither(self):
+        from fastapi import HTTPException
+        from sparsevllm.entrypoints.openai import api_server
+
+        class Engine:
+            tokenizer = object()
+            config = type("Config", (), {"vllm_sparse_method": ""})()
+
+            def exit(self):
+                pass
+
+        app = api_server.create_app("/tmp/model", served_model_name="model", engine=Engine())
+        endpoint = next(route.endpoint for route in app.routes if getattr(route, "path", None) == "/v1/prefix_cache/inspect")
+        try:
+            with self.assertRaises(HTTPException):
+                await endpoint(api_server.PrefixCacheInspectRequest())
+            with self.assertRaises(HTTPException):
+                await endpoint(api_server.PrefixCacheInspectRequest(token_ids=[1], text="x"))
+        finally:
+            app.state.dispatcher.close()
+
+    async def test_prefix_cache_disabled_error_is_explicit(self):
+        from fastapi import HTTPException
+        from sparsevllm.entrypoints.openai import api_server
+
+        class Tokenizer:
+            bos_token = None
+
+            def encode(self, text, add_special_tokens=False):
+                del text, add_special_tokens
+                return [1]
+
+        class Engine:
+            tokenizer = Tokenizer()
+            config = type("Config", (), {"vllm_sparse_method": ""})()
+
+            def prefix_cache_inspect(self, token_ids, include_subtree=False):
+                del token_ids, include_subtree
+                raise RuntimeError("prefix cache is not enabled or not supported by this cache manager.")
+
+            def exit(self):
+                pass
+
+        app = api_server.create_app("/tmp/model", served_model_name="model", engine=Engine())
+        endpoint = next(route.endpoint for route in app.routes if getattr(route, "path", None) == "/v1/prefix_cache/inspect")
+        try:
+            with self.assertRaises(HTTPException) as ctx:
+                await endpoint(api_server.PrefixCacheInspectRequest(token_ids=[1]))
+        finally:
+            app.state.dispatcher.close()
+
+        self.assertEqual(ctx.exception.status_code, 400)
+        self.assertIn("prefix cache is not enabled", ctx.exception.detail)
+
+    async def test_prefix_cache_delete_and_priority_routes_are_synchronous_controls(self):
+        from sparsevllm.entrypoints.openai import api_server
+
+        class Tokenizer:
+            bos_token = None
+
+            def encode(self, text, add_special_tokens=False):
+                del add_special_tokens
+                return [ord(ch) for ch in text]
+
+        class Engine:
+            tokenizer = Tokenizer()
+            config = type("Config", (), {"vllm_sparse_method": ""})()
+
+            def __init__(self):
+                self.calls = []
+
+            def prefix_cache_delete_subtree(self, token_ids):
+                self.calls.append(("delete", list(token_ids), threading.current_thread().name))
+                return {
+                    "deleted_block_ids": ["aa"],
+                    "deleted_block_count": 1,
+                    "blocked_blocks": [{"block_id": "bb", "reason": "referenced"}],
+                }
+
+            def prefix_cache_set_eviction_priority(self, token_ids, priority):
+                self.calls.append(("priority", list(token_ids), int(priority), threading.current_thread().name))
+                return {
+                    "matched": True,
+                    "root_block_id": "aa",
+                    "updated_block_count": 2,
+                    "eviction_priority": int(priority),
+                }
+
+            def exit(self):
+                pass
+
+        engine = Engine()
+        app = api_server.create_app("/tmp/model", served_model_name="model", engine=engine)
+        delete_endpoint = next(
+            route.endpoint for route in app.routes if getattr(route, "path", None) == "/v1/prefix_cache/delete_subtree"
+        )
+        priority_endpoint = next(
+            route.endpoint for route in app.routes if getattr(route, "path", None) == "/v1/prefix_cache/set_eviction_priority"
+        )
+        try:
+            delete_response = await delete_endpoint(api_server.PrefixCacheDeleteSubtreeRequest(text="ab"))
+            priority_response = await priority_endpoint(
+                api_server.PrefixCacheSetEvictionPriorityRequest(token_ids=[7, 8], priority=-5)
+            )
+        finally:
+            app.state.dispatcher.close()
+
+        self.assertEqual(json.loads(delete_response.body)["blocked_blocks"][0]["reason"], "referenced")
+        self.assertEqual(json.loads(priority_response.body)["eviction_priority"], -5)
+        self.assertEqual(
+            engine.calls,
+            [
+                ("delete", [97, 98], "sparsevllm-openai-dispatcher"),
+                ("priority", [7, 8], -5, "sparsevllm-openai-dispatcher"),
+            ],
+        )
+
     async def test_step_failure_aborts_active_request(self):
         from sparsevllm.entrypoints.openai.api_server import AsyncEngineDispatcher
 

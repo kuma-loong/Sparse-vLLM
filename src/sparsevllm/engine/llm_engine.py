@@ -424,6 +424,34 @@ class LLMEngine:
         if should_free:
             self.model_runner.call("free_slots", seq_id)
 
+    def prefix_cache_inspect(
+        self,
+        token_ids: list[int],
+        include_subtree: bool = False,
+    ) -> dict[str, object]:
+        return self.model_runner.call(
+            "prefix_cache_inspect",
+            [int(token_id) for token_id in token_ids],
+            bool(include_subtree),
+        )
+
+    def prefix_cache_delete_subtree(self, token_ids: list[int]) -> dict[str, object]:
+        return self.model_runner.call(
+            "prefix_cache_delete_subtree",
+            [int(token_id) for token_id in token_ids],
+        )
+
+    def prefix_cache_set_eviction_priority(
+        self,
+        token_ids: list[int],
+        priority: int,
+    ) -> dict[str, object]:
+        return self.model_runner.call(
+            "prefix_cache_set_eviction_priority",
+            [int(token_id) for token_id in token_ids],
+            int(priority),
+        )
+
     def step(self):
         """
         执行单个推理步进（一个 Batch）。

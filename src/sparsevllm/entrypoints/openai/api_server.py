@@ -86,6 +86,29 @@ class ChatCompletionRequest(BaseModel):
     top_logprobs: int | None = Field(default=None, ge=0, le=20)
 
 
+class PrefixCacheInspectRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    token_ids: list[int] | None = None
+    text: str | None = None
+    include_subtree: bool = False
+
+
+class PrefixCacheDeleteSubtreeRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    token_ids: list[int] | None = None
+    text: str | None = None
+
+
+class PrefixCacheSetEvictionPriorityRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    token_ids: list[int] | None = None
+    text: str | None = None
+    priority: int
+
+
 def _field_was_set(request: BaseModel, name: str) -> bool:
     return name in request.model_fields_set
 
@@ -133,6 +156,17 @@ class _ActiveRequest:
     emitted_text_len: int = 0
 
 
+@dataclass
+class _ControlRequest:
+    operation: str
+    kwargs: dict[str, Any]
+    loop: asyncio.AbstractEventLoop
+    output_queue: asyncio.Queue
+
+
+_WAKEUP = object()
+
+
 def _model_dump_json(model: BaseModel) -> dict[str, Any]:
     return model.model_dump(mode="json")
 
@@ -149,8 +183,9 @@ def _write_request_log(request_log_dir: Path | None, payload: dict[str, Any]):
 class AsyncEngineDispatcher:
     def __init__(self, engine: LLM):
         self.engine = engine
-        self._pending: queue.Queue[_QueuedRequest | None] = queue.Queue()
+        self._pending: queue.Queue[_QueuedRequest | object | None] = queue.Queue()
         self._aborts: queue.Queue[int] = queue.Queue()
+        self._controls: queue.Queue[_ControlRequest] = queue.Queue()
         self._closing = threading.Event()
         self._failed_message: str | None = None
         self._thread = threading.Thread(target=self._run, name="sparsevllm-openai-dispatcher", daemon=True)
@@ -188,6 +223,26 @@ class AsyncEngineDispatcher:
         )
         return handle
 
+    async def control(self, operation: str, **kwargs: Any) -> Any:
+        if self._failed_message is not None:
+            raise RuntimeError(self._failed_message)
+        if self._closing.is_set():
+            raise RuntimeError("Sparse-vLLM server is shutting down.")
+        output_queue: asyncio.Queue = asyncio.Queue()
+        self._controls.put(
+            _ControlRequest(
+                operation=operation,
+                kwargs=dict(kwargs),
+                loop=asyncio.get_running_loop(),
+                output_queue=output_queue,
+            )
+        )
+        self._pending.put(_WAKEUP)
+        result = await output_queue.get()
+        if result["type"] == "error":
+            raise RuntimeError(result["message"])
+        return result["value"]
+
     def cancel(self, handle: RequestHandle):
         handle.cancelled.set()
         if handle.seq_id is not None:
@@ -208,15 +263,21 @@ class AsyncEngineDispatcher:
     def _put(self, request: _ActiveRequest | _QueuedRequest, item: dict[str, Any]):
         request.loop.call_soon_threadsafe(request.output_queue.put_nowait, item)
 
+    def _put_control(self, request: _ControlRequest, item: dict[str, Any]):
+        request.loop.call_soon_threadsafe(request.output_queue.put_nowait, item)
+
     def _run(self):
         active: dict[int, _ActiveRequest] = {}
         stopping = False
         while not stopping:
+            self._drain_controls()
             self._drain_aborts(active)
             if not active:
                 item = self._pending.get()
                 if item is None:
                     break
+                if item is _WAKEUP:
+                    continue
                 self._admit(item, active)
 
             while True:
@@ -227,8 +288,11 @@ class AsyncEngineDispatcher:
                 if item is None:
                     stopping = True
                     continue
+                if item is _WAKEUP:
+                    continue
                 self._admit(item, active)
 
+            self._drain_controls()
             self._drain_aborts(active)
             if not active:
                 continue
@@ -247,6 +311,26 @@ class AsyncEngineDispatcher:
 
         self._abort_all(active)
         self._drain_pending_after_failure("Sparse-vLLM server is shutting down.")
+
+    def _drain_controls(self):
+        while True:
+            try:
+                item = self._controls.get_nowait()
+            except queue.Empty:
+                return
+            if self._closing.is_set():
+                self._put_control(item, {"type": "error", "message": "Sparse-vLLM server is shutting down."})
+                continue
+            if self._failed_message is not None:
+                self._put_control(item, {"type": "error", "message": self._failed_message})
+                continue
+            try:
+                method = getattr(self.engine, item.operation)
+                value = method(**item.kwargs)
+            except Exception as exc:
+                self._put_control(item, {"type": "error", "message": f"{type(exc).__name__}: {exc}"})
+                continue
+            self._put_control(item, {"type": "result", "value": value})
 
     def _admit(self, item: _QueuedRequest, active: dict[int, _ActiveRequest]):
         if item.cancelled.is_set():
@@ -367,7 +451,7 @@ class AsyncEngineDispatcher:
                 item = self._pending.get_nowait()
             except queue.Empty:
                 return
-            if item is not None:
+            if item is not None and item is not _WAKEUP:
                 self._put(item, {"type": "error", "message": error})
 
     def _publish_finished(
@@ -461,6 +545,38 @@ def create_app(
                 }
             ],
         }
+
+    @app.post("/v1/prefix_cache/inspect")
+    async def prefix_cache_inspect(request: PrefixCacheInspectRequest):
+        token_ids = _prefix_cache_token_ids_from_request(request, engine.tokenizer)
+        result = await _run_prefix_cache_control(
+            dispatcher,
+            "prefix_cache_inspect",
+            token_ids=token_ids,
+            include_subtree=bool(request.include_subtree),
+        )
+        return JSONResponse(result)
+
+    @app.post("/v1/prefix_cache/delete_subtree")
+    async def prefix_cache_delete_subtree(request: PrefixCacheDeleteSubtreeRequest):
+        token_ids = _prefix_cache_token_ids_from_request(request, engine.tokenizer)
+        result = await _run_prefix_cache_control(
+            dispatcher,
+            "prefix_cache_delete_subtree",
+            token_ids=token_ids,
+        )
+        return JSONResponse(result)
+
+    @app.post("/v1/prefix_cache/set_eviction_priority")
+    async def prefix_cache_set_eviction_priority(request: PrefixCacheSetEvictionPriorityRequest):
+        token_ids = _prefix_cache_token_ids_from_request(request, engine.tokenizer)
+        result = await _run_prefix_cache_control(
+            dispatcher,
+            "prefix_cache_set_eviction_priority",
+            token_ids=token_ids,
+            priority=int(request.priority),
+        )
+        return JSONResponse(result)
 
     @app.post("/v1/completions")
     async def completions(request: CompletionRequest):
@@ -626,6 +742,42 @@ def create_app(
         return JSONResponse(response)
 
     return app
+
+
+def _prefix_cache_token_ids_from_request(
+    request: PrefixCacheInspectRequest | PrefixCacheDeleteSubtreeRequest | PrefixCacheSetEvictionPriorityRequest,
+    tokenizer: Any,
+) -> list[int]:
+    has_token_ids = request.token_ids is not None
+    has_text = request.text is not None
+    if has_token_ids == has_text:
+        raise HTTPException(status_code=400, detail="Set exactly one of token_ids or text.")
+    if request.token_ids is not None:
+        return [int(token_id) for token_id in request.token_ids]
+    text = str(request.text)
+    add_special_tokens = True
+    bos_token = getattr(tokenizer, "bos_token", None)
+    if bos_token is None or text.startswith(str(bos_token)):
+        add_special_tokens = False
+    try:
+        token_ids = tokenizer.encode(text, add_special_tokens=add_special_tokens)
+    except TypeError:
+        token_ids = tokenizer.encode(text)
+    return [int(token_id) for token_id in token_ids]
+
+
+async def _run_prefix_cache_control(
+    dispatcher: AsyncEngineDispatcher,
+    operation: str,
+    **kwargs: Any,
+) -> dict[str, Any]:
+    try:
+        result = await dispatcher.control(operation, **kwargs)
+    except RuntimeError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    if not isinstance(result, dict):
+        raise HTTPException(status_code=500, detail=f"Prefix cache control returned non-object result: {type(result).__name__}.")
+    return result
 
 
 def _validate_serving_method(engine_kwargs: dict[str, Any], engine: LLM | None = None):

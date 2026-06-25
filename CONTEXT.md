@@ -55,3 +55,19 @@ _Avoid_: prefill score point, generated sample
 **Asymmetric DeltaKV Compressor**:
 A learned DeltaKV compressor whose compression path and reconstruction path intentionally use different architecture choices or capacity. It does not merely mean that the two paths have separate, untied weights.
 _Avoid_: untied compressor weights
+
+**Prefix Cache Block**:
+A block-aligned segment of prompt tokens that is eligible for prefix-cache reuse across requests. Prefix-cache matching happens at this block granularity; it is a shared prefix-caching concept, not a method-specific storage representation.
+_Avoid_: Quest page, token slot payload, method payload
+
+**Prefix Cache Control Plane**:
+A management surface for inspecting and influencing prefix-cache residency without exposing tree nodes, tensors, or method-specific payloads. It is separate from the runtime attention path.
+_Avoid_: tree node API, payload API, debug-only object access
+
+**Prefix Cache Subtree**:
+The cached descendants rooted at a matched prefix-cache block path. Control-plane deletion and eviction-priority changes target subtrees, while preserving blocks that are still needed by active or locked runtime state.
+_Avoid_: single-block deletion, arbitrary token range deletion, forced live-prefix deletion
+
+**Prefix Cache Eviction Priority**:
+A control-plane value on prefix-cache blocks that determines eviction preference. Negative values mean protected from safe deletion and eviction, zero is default, and positive values prefer eviction.
+_Avoid_: soft lock, LRU score, cache hit score

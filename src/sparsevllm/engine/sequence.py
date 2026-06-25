@@ -27,8 +27,8 @@ class Sequence:
         self.current_chunk_size = None
         self.prefix_cache_enabled = False
         self.prefix_cache_hit_len = 0
-        self.prefix_cache_hit_blocks = 0
-        self.prefix_cache_hit_last_key: bytes | None = None
+        self.prefix_cache_hit_block_count = 0
+        self.prefix_cache_hit_last_block_id: bytes | None = None
         self.prefix_cache_block_size = 0
         self.prefix_cache_method = ""
 
@@ -77,8 +77,8 @@ class Sequence:
     def clear_prefix_cache_hit(self):
         self.prefix_cache_enabled = False
         self.prefix_cache_hit_len = 0
-        self.prefix_cache_hit_blocks = 0
-        self.prefix_cache_hit_last_key = None
+        self.prefix_cache_hit_block_count = 0
+        self.prefix_cache_hit_last_block_id = None
         self.prefix_cache_block_size = 0
         self.prefix_cache_method = ""
 
@@ -123,29 +123,18 @@ class Sequence:
             data,
             self.prefix_cache_enabled,
             self.prefix_cache_hit_len,
-            self.prefix_cache_hit_blocks,
-            self.prefix_cache_hit_last_key,
+            self.prefix_cache_hit_block_count,
+            self.prefix_cache_hit_last_block_id,
             self.prefix_cache_block_size,
             self.prefix_cache_method,
         )
 
     def __setstate__(self, state):
-        if len(state) == 13:
-            (self.seq_id, self.status, self.num_tokens, self.num_prompt_tokens,
-             self.num_prefilled_tokens, self.current_chunk_size, self.temperature,
-             self.top_p, self.top_k, self.max_tokens, self.ignore_eos, self.logprobs, data) = state
-            self.prefix_cache_enabled = False
-            self.prefix_cache_hit_len = 0
-            self.prefix_cache_hit_blocks = 0
-            self.prefix_cache_hit_last_key = None
-            self.prefix_cache_block_size = 0
-            self.prefix_cache_method = ""
-        else:
-            (self.seq_id, self.status, self.num_tokens, self.num_prompt_tokens,
-             self.num_prefilled_tokens, self.current_chunk_size, self.temperature,
-             self.top_p, self.top_k, self.max_tokens, self.ignore_eos, self.logprobs, data,
-             self.prefix_cache_enabled, self.prefix_cache_hit_len, self.prefix_cache_hit_blocks,
-             self.prefix_cache_hit_last_key, self.prefix_cache_block_size, self.prefix_cache_method) = state
+        (self.seq_id, self.status, self.num_tokens, self.num_prompt_tokens,
+         self.num_prefilled_tokens, self.current_chunk_size, self.temperature,
+         self.top_p, self.top_k, self.max_tokens, self.ignore_eos, self.logprobs, data,
+         self.prefix_cache_enabled, self.prefix_cache_hit_len, self.prefix_cache_hit_block_count,
+         self.prefix_cache_hit_last_block_id, self.prefix_cache_block_size, self.prefix_cache_method) = state
         self.completion_token_logprobs = []
         self.completion_top_logprobs = []
 

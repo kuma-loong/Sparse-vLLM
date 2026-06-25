@@ -10,7 +10,7 @@ from sparsevllm.config import Config
 from sparsevllm.engine.sequence import Sequence
 from sparsevllm.engine.prefix_cache import (
     PrefixCacheBlock,
-    PrefixCacheIndex,
+    RadixPrefixIndex,
     build_prefix_cache_fingerprint,
     usable_prefix_cache_tokens,
 )
@@ -22,7 +22,7 @@ from .base import CacheManager, LayerBatchStates, SparseSelection
 
 @dataclass
 class QuestPrefixRuntimeState:
-    parent_key: bytes | None
+    parent_block_id: bytes | None
     next_logical_block_idx: int
     pending_tokens: list[int]
     pending_slots: list[torch.Tensor]
@@ -30,12 +30,18 @@ class QuestPrefixRuntimeState:
 
 @dataclass
 class PendingQuestPrefixBlock:
-    key: bytes
-    parent_key: bytes | None
+    stable_block_id: bytes
+    parent_block_id: bytes | None
     logical_block_idx: int
     page_slot: int
     slots: torch.Tensor
     token_ids: list[int]
+
+
+@dataclass
+class QuestPrefixBlockPayload:
+    block_slot: int
+    token_slots: torch.Tensor
 
 
 class QuestCacheManager(CacheManager):
@@ -71,9 +77,9 @@ class QuestCacheManager(CacheManager):
                 "Quest prefix cache requires prefix_cache_block_size == quest_chunk_size: "
                 f"prefix_cache_block_size={self.prefix_cache_block_size}, quest_chunk_size={self.page_size}."
             )
-        self.prefix_cache: PrefixCacheIndex | None = None
+        self.prefix_cache: RadixPrefixIndex | None = None
         if self.enable_prefix_caching:
-            self.prefix_cache = PrefixCacheIndex(
+            self.prefix_cache = RadixPrefixIndex(
                 block_size=self.prefix_cache_block_size,
                 fingerprint=build_prefix_cache_fingerprint(config, self.prefix_cache_block_size),
                 max_blocks=config.prefix_cache_max_blocks,
@@ -206,10 +212,13 @@ class QuestCacheManager(CacheManager):
     def _prefix_hit_evictable_slots(self, seq: Sequence) -> int:
         if self.prefix_cache is None or int(getattr(seq, "prefix_cache_hit_len", 0) or 0) <= 0:
             return 0
-        if seq.prefix_cache_hit_last_key is None:
-            raise RuntimeError(f"seq_id={seq.seq_id} has prefix hit length but no last key.")
-        chain = self.prefix_cache.get_chain(seq.prefix_cache_hit_last_key, int(seq.prefix_cache_hit_blocks))
-        return sum(self.page_size for block in chain if PrefixCacheIndex.can_evict(block))
+        if seq.prefix_cache_hit_last_block_id is None:
+            raise RuntimeError(f"seq_id={seq.seq_id} has prefix hit length but no last block id.")
+        chain = self.prefix_cache.get_chain(
+            seq.prefix_cache_hit_last_block_id,
+            int(seq.prefix_cache_hit_block_count),
+        )
+        return sum(self.page_size for block in chain if self.prefix_cache.can_evict(block))
 
     def _ceil_to_page_slots(self, n_tokens: int) -> int:
         n_tokens = int(n_tokens)
@@ -243,6 +252,40 @@ class QuestCacheManager(CacheManager):
             stats["prefix_cache_evictable_slots"] = int(self._prefix_evictable_slots())
         return stats
 
+    def _require_prefix_cache(self) -> RadixPrefixIndex:
+        if getattr(self, "prefix_cache", None) is None:
+            raise RuntimeError("prefix cache is not enabled for this cache manager.")
+        return self.prefix_cache
+
+    def prefix_cache_inspect(
+        self,
+        token_ids: list[int],
+        *,
+        include_subtree: bool = False,
+    ) -> dict[str, object]:
+        return self._require_prefix_cache().inspect_prefix(
+            [int(token_id) for token_id in token_ids],
+            include_subtree=include_subtree,
+        )
+
+    def prefix_cache_delete_subtree(self, token_ids: list[int]) -> dict[str, object]:
+        result = self._require_prefix_cache().safe_delete_subtree(
+            [int(token_id) for token_id in token_ids],
+        )
+        self._free_prefix_cache_blocks(result.deleted_blocks)
+        return result.to_dict()
+
+    def prefix_cache_set_eviction_priority(
+        self,
+        token_ids: list[int],
+        *,
+        priority: int,
+    ) -> dict[str, object]:
+        return self._require_prefix_cache().set_subtree_eviction_priority(
+            [int(token_id) for token_id in token_ids],
+            int(priority),
+        )
+
     def refresh_prefix_cache_hit(self, seq: Sequence) -> None:
         self.clear_prefix_cache_hit(seq)
         if not self.enable_prefix_caching or self.prefix_cache is None:
@@ -252,13 +295,13 @@ class QuestCacheManager(CacheManager):
         usable_tokens = usable_prefix_cache_tokens(seq.num_prompt_tokens, self.page_size)
         if usable_tokens <= 0:
             return
-        hit_len, last_key, hit_blocks = self.prefix_cache.lookup_longest_prefix(
+        hit_len, last_block_id, hit_blocks = self.prefix_cache.lookup_longest_prefix(
             seq.prompt_token_ids,
             max_usable_tokens=usable_tokens,
         )
         if hit_len <= 0:
             return
-        if last_key is None or hit_blocks <= 0:
+        if last_block_id is None or hit_blocks <= 0:
             raise RuntimeError("Quest prefix cache lookup returned an invalid hit.")
         if hit_len >= seq.num_prompt_tokens or hit_len % self.page_size != 0:
             raise RuntimeError(
@@ -268,8 +311,8 @@ class QuestCacheManager(CacheManager):
             )
         seq.prefix_cache_enabled = True
         seq.prefix_cache_hit_len = int(hit_len)
-        seq.prefix_cache_hit_blocks = int(hit_blocks)
-        seq.prefix_cache_hit_last_key = last_key
+        seq.prefix_cache_hit_block_count = int(hit_blocks)
+        seq.prefix_cache_hit_last_block_id = last_block_id
         seq.prefix_cache_block_size = self.page_size
         seq.prefix_cache_method = "quest"
 
@@ -281,10 +324,11 @@ class QuestCacheManager(CacheManager):
 
     def _free_prefix_cache_blocks(self, blocks: list[PrefixCacheBlock]) -> None:
         for block in blocks:
-            if block.page_slot is None:
-                raise RuntimeError("Quest prefix cache block is missing page_slot.")
+            payload = block.payload
+            if not isinstance(payload, QuestPrefixBlockPayload):
+                raise RuntimeError("Quest prefix cache block is missing block slot payload.")
             ptr = self._num_free_pages
-            self.free_pages_stack[ptr] = int(block.page_slot)
+            self.free_pages_stack[ptr] = int(payload.block_slot)
             self._num_free_pages += 1
 
     def _validate_page_slots(self, slots: torch.Tensor, page_slot: int | None = None) -> int:
@@ -339,14 +383,17 @@ class QuestCacheManager(CacheManager):
             return
         if seq.seq_id in self.seq_id_to_prefix_blocks:
             return
-        if seq.prefix_cache_hit_last_key is None:
-            raise RuntimeError(f"seq_id={seq.seq_id} has Quest prefix hit length but no last key.")
+        if seq.prefix_cache_hit_last_block_id is None:
+            raise RuntimeError(f"seq_id={seq.seq_id} has Quest prefix hit length but no last block id.")
         if hit_len % self.page_size != 0:
             raise RuntimeError(
                 f"seq_id={seq.seq_id} Quest prefix hit length is not page aligned: "
                 f"hit_len={hit_len} page_size={self.page_size}."
             )
-        chain = self.prefix_cache.get_chain(seq.prefix_cache_hit_last_key, int(seq.prefix_cache_hit_blocks))
+        chain = self.prefix_cache.get_chain(
+            seq.prefix_cache_hit_last_block_id,
+            int(seq.prefix_cache_hit_block_count),
+        )
         if len(chain) * self.page_size != hit_len:
             raise RuntimeError(
                 "Quest prefix cache chain length does not match scheduler metadata: "
@@ -361,7 +408,8 @@ class QuestCacheManager(CacheManager):
 
         cached_pages = self.seq_id_to_cached_pages.setdefault(seq.seq_id, set())
         for block in chain:
-            if block.page_slot is None:
+            payload = block.payload
+            if not isinstance(payload, QuestPrefixBlockPayload):
                 raise RuntimeError(
                     f"Invalid Quest prefix cache block page for seq_id={seq.seq_id}: "
                     f"logical_block_idx={block.logical_block_idx}."
@@ -369,13 +417,10 @@ class QuestCacheManager(CacheManager):
             page_idx = int(block.logical_block_idx)
             start = page_idx * self.page_size
             end = start + self.page_size
-            page_slot = int(block.page_slot)
+            page_slot = int(payload.block_slot)
             self.buffer_req_to_page_slots[row_idx, page_idx] = page_slot
-            if block.slots is not None:
-                self._validate_page_slots(block.slots, page_slot)
-                slots = block.slots
-            else:
-                slots = page_slot * self.page_size + self.page_offsets_i32
+            self._validate_page_slots(payload.token_slots, page_slot)
+            slots = payload.token_slots
             self.buffer_req_to_token_slots[row_idx, start:end] = slots
             block.ref_count += 1
             cached_pages.add(page_idx)
@@ -401,10 +446,10 @@ class QuestCacheManager(CacheManager):
             )
         state = self.prefix_runtime_states.get(seq.seq_id)
         if state is None:
-            hit_blocks = int(getattr(seq, "prefix_cache_hit_blocks", 0) or 0)
-            parent_key = getattr(seq, "prefix_cache_hit_last_key", None)
+            hit_blocks = int(getattr(seq, "prefix_cache_hit_block_count", 0) or 0)
+            parent_block_id = getattr(seq, "prefix_cache_hit_last_block_id", None)
             state = QuestPrefixRuntimeState(
-                parent_key=parent_key,
+                parent_block_id=parent_block_id,
                 next_logical_block_idx=hit_blocks,
                 pending_tokens=[],
                 pending_slots=[],
@@ -419,19 +464,19 @@ class QuestCacheManager(CacheManager):
                 continue
             block_tokens = list(state.pending_tokens)
             block_slots = torch.stack(state.pending_slots).to(dtype=torch.int32)
-            key = self.prefix_cache.hash_block(block_tokens, state.parent_key)
+            stable_block_id = self.prefix_cache.stable_block_id(block_tokens, state.parent_block_id)
             page_slot = self._validate_page_slots(block_slots)
             pending_blocks.append(
                 PendingQuestPrefixBlock(
-                    key=key,
-                    parent_key=state.parent_key,
+                    stable_block_id=stable_block_id,
+                    parent_block_id=state.parent_block_id,
                     logical_block_idx=state.next_logical_block_idx,
                     page_slot=page_slot,
                     slots=block_slots,
                     token_ids=block_tokens,
                 )
             )
-            state.parent_key = key
+            state.parent_block_id = stable_block_id
             state.next_logical_block_idx += 1
             state.pending_tokens = []
             state.pending_slots = []
@@ -610,29 +655,31 @@ class QuestCacheManager(CacheManager):
                 cached_pages = self.seq_id_to_cached_pages.setdefault(seq.seq_id, set())
                 materialized = self.seq_id_to_materialized_blocks.setdefault(seq.seq_id, [])
                 protected: list[PrefixCacheBlock] = []
-                protected_keys = {
-                    key
+                protected_block_ids = {
+                    block_id
                     for pending in pending_blocks
-                    for key in (pending.parent_key, pending.key)
-                    if key is not None and self.prefix_cache.has_block(key)
+                    for block_id in (pending.parent_block_id, pending.stable_block_id)
+                    if block_id is not None and self.prefix_cache.has_block(block_id)
                 }
-                for key in protected_keys:
-                    block = self.prefix_cache.get_block(key)
+                for block_id in protected_block_ids:
+                    block = self.prefix_cache.get_block(block_id)
                     if block is None:
                         continue
                     block.ref_count += 1
                     protected.append(block)
                 try:
                     for pending in pending_blocks:
-                        if not self.prefix_cache.has_block(pending.key):
+                        if not self.prefix_cache.has_block(pending.stable_block_id):
                             self._evict_prefix_cache_for_insert(1)
                         block = PrefixCacheBlock(
-                            key=pending.key,
-                            parent_key=pending.parent_key,
+                            stable_block_id=pending.stable_block_id,
+                            parent_block_id=pending.parent_block_id,
                             block_size=self.page_size,
                             logical_block_idx=pending.logical_block_idx,
-                            slots=pending.slots,
-                            page_slot=pending.page_slot,
+                            payload=QuestPrefixBlockPayload(
+                                block_slot=pending.page_slot,
+                                token_slots=pending.slots,
+                            ),
                             token_ids=tuple(pending.token_ids),
                         )
                         inserted = self.prefix_cache.insert_block(block)

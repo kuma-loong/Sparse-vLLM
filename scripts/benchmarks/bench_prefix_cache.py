@@ -620,7 +620,7 @@ def _run_request_batch(
                     seq = _find_live_seq(llm, seq_id)
                     if seq is not None:
                         state.prefix_cache_hit_len = int(getattr(seq, "prefix_cache_hit_len", 0) or 0)
-                        state.prefix_cache_hit_blocks = int(getattr(seq, "prefix_cache_hit_blocks", 0) or 0)
+                        state.prefix_cache_hit_blocks = int(getattr(seq, "prefix_cache_hit_block_count", 0) or 0)
                 state.generated_token_ids.extend(int(token_id) for token_id in token_ids)
 
             for seq_id in list(active):

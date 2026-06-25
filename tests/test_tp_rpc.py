@@ -4,7 +4,11 @@ import time
 from multiprocessing import get_context
 from multiprocessing.shared_memory import SharedMemory
 from types import SimpleNamespace
+from unittest.mock import patch
 from uuid import uuid4
+
+import torch
+import torch.distributed as dist
 
 from sparsevllm.engine.model_runner import ModelRunner, TP_SHM_NAME_PREFIX, make_tp_shm_name
 
@@ -71,6 +75,24 @@ def test_free_slots_batch_releases_each_seq_id():
     ModelRunner.free_slots_batch(runner, [3, 5, 8])
 
     assert freed == [3, 5, 8]
+
+
+def test_prefix_cache_control_rpc_reports_any_tp_worker_failure():
+    runner = object.__new__(ModelRunner)
+    runner.world_size = 2
+    runner.device = torch.device("cpu")
+
+    def mark_failed(tensor, op=None):
+        assert op == dist.ReduceOp.MAX
+        tensor.fill_(1)
+
+    with patch.object(dist, "is_initialized", return_value=True), patch.object(dist, "all_reduce", side_effect=mark_failed):
+        try:
+            ModelRunner._sync_prefix_cache_control_rpc_status(runner, "prefix_cache_delete_subtree", None)
+        except RuntimeError as exc:
+            assert "At least one TP worker failed" in str(exc)
+        else:
+            raise AssertionError("expected worker failure to be surfaced on rank 0")
 
 
 def test_tp_worker_decode_skips_rank0_sampling_path():

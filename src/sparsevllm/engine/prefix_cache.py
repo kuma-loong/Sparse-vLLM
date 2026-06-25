@@ -4,9 +4,7 @@ import hashlib
 import json
 import struct
 from dataclasses import dataclass, field
-from typing import Any
-
-import torch
+from typing import Any, Protocol
 
 
 def usable_prefix_cache_tokens(prompt_len: int, block_size: int) -> int:
@@ -78,28 +76,224 @@ def _pack_token_ids(token_ids: list[int] | tuple[int, ...]) -> bytes:
     return b"".join(struct.pack("<q", int(token_id)) for token_id in token_ids)
 
 
+class PrefixBlockPayload(Protocol):
+    """Marker protocol for method-owned prefix block payloads."""
+
+
 @dataclass
 class PrefixCacheBlock:
-    key: bytes
-    parent_key: bytes | None
+    stable_block_id: bytes
+    parent_block_id: bytes | None
     block_size: int
     logical_block_idx: int
-    slots: torch.Tensor | None = None
-    page_slot: int | None = None
-    page_slots: torch.Tensor | None = None
+    payload: PrefixBlockPayload
     token_ids: tuple[int, ...] = ()
     ref_count: int = 0
     last_access: int = 0
-    child_keys: set[bytes] = field(default_factory=set)
+    eviction_priority: int = 0
 
 
-class PrefixCacheIndex:
+@dataclass(frozen=True)
+class RadixLookupResult:
+    hit_block_count: int
+    last_block_id: bytes | None
+
+
+@dataclass
+class RadixTreeNode:
+    segment: tuple[bytes, ...] = ()
+    parent: RadixTreeNode | None = None
+    children: dict[bytes, RadixTreeNode] = field(default_factory=dict)
+
+
+class RadixTreeBackend:
+    """Block-level radix backend.
+
+    Edges store one or more stable block ids, and splits only occur between
+    block ids. Every block remains directly addressable through the location
+    map so cache managers can attach, inspect, delete, and evict by block id.
+    """
+
+    def __init__(self):
+        self.root = RadixTreeNode()
+        self._locations: dict[bytes, tuple[RadixTreeNode, int]] = {}
+
+    def lookup(self, block_ids: list[bytes] | tuple[bytes, ...], max_blocks: int) -> RadixLookupResult:
+        node = self.root
+        hit_count = 0
+        last_block_id: bytes | None = None
+        limit = min(int(max_blocks), len(block_ids))
+        while hit_count < limit:
+            child = node.children.get(block_ids[hit_count])
+            if child is None:
+                break
+            for segment_block_id in child.segment:
+                if hit_count >= limit or block_ids[hit_count] != segment_block_id:
+                    return RadixLookupResult(hit_block_count=hit_count, last_block_id=last_block_id)
+                hit_count += 1
+                last_block_id = segment_block_id
+            node = child
+        return RadixLookupResult(hit_block_count=hit_count, last_block_id=last_block_id)
+
+    def insert(self, block_ids: list[bytes] | tuple[bytes, ...]) -> None:
+        block_ids = tuple(block_ids)
+        if not block_ids:
+            return
+        node = self.root
+        offset = 0
+        while offset < len(block_ids):
+            child = node.children.get(block_ids[offset])
+            if child is None:
+                node.children[block_ids[offset]] = RadixTreeNode(segment=block_ids[offset:], parent=node)
+                self._rebuild_locations()
+                return
+
+            common = 0
+            while (
+                offset + common < len(block_ids)
+                and common < len(child.segment)
+                and block_ids[offset + common] == child.segment[common]
+            ):
+                common += 1
+
+            if common == len(child.segment):
+                node = child
+                offset += common
+                continue
+
+            if common <= 0:
+                raise RuntimeError("Radix tree child map is inconsistent with edge segment.")
+
+            prefix = child.segment[:common]
+            suffix = child.segment[common:]
+            split = RadixTreeNode(segment=prefix, parent=node)
+            node.children[prefix[0]] = split
+            child.segment = suffix
+            child.parent = split
+            split.children[suffix[0]] = child
+
+            offset += common
+            if offset < len(block_ids):
+                new_segment = block_ids[offset:]
+                split.children[new_segment[0]] = RadixTreeNode(segment=new_segment, parent=split)
+            self._rebuild_locations()
+            return
+
+        self._rebuild_locations()
+
+    def remove_block(self, block_id: bytes) -> None:
+        location = self._locations.get(block_id)
+        if location is None:
+            raise KeyError("Prefix cache block id is not present in radix tree.")
+        node, index = location
+        if index != len(node.segment) - 1 or node.children:
+            raise RuntimeError("Cannot remove a prefix cache tree block with live children.")
+        if node.parent is None:
+            raise RuntimeError("Cannot remove radix tree root.")
+        if len(node.segment) == 1:
+            del node.parent.children[node.segment[0]]
+        else:
+            node.segment = node.segment[:-1]
+        self._rebuild_locations()
+
+    def path_to_block(self, block_id: bytes) -> tuple[bytes, ...]:
+        location = self._locations.get(block_id)
+        if location is None:
+            raise KeyError("Prefix cache block id is not present in radix tree.")
+        node, index = location
+        segments: list[tuple[bytes, ...]] = [node.segment[: index + 1]]
+        while node.parent is not None:
+            node = node.parent
+            if node.segment:
+                segments.append(node.segment)
+        return tuple(block_id for segment in reversed(segments) for block_id in segment)
+
+    def subtree_block_ids(self, root_block_id: bytes) -> tuple[bytes, ...]:
+        location = self._locations.get(root_block_id)
+        if location is None:
+            raise KeyError("Prefix cache subtree root is not present.")
+        root, index = location
+        result: list[bytes] = []
+        result.extend(root.segment[index:])
+        stack = list(root.children.values())
+        while stack:
+            node = stack.pop()
+            result.extend(node.segment)
+            stack.extend(node.children.values())
+        return tuple(result)
+
+    def child_count(self, block_id: bytes) -> int:
+        location = self._locations.get(block_id)
+        if location is None:
+            raise KeyError("Prefix cache block id is not present in radix tree.")
+        node, index = location
+        if index < len(node.segment) - 1:
+            return 1
+        return len(node.children)
+
+    def leaf_block_ids(self) -> tuple[bytes, ...]:
+        leaves: list[bytes] = []
+        for block_id, (node, index) in self._locations.items():
+            if index == len(node.segment) - 1 and not node.children:
+                leaves.append(block_id)
+        return tuple(leaves)
+
+    def stats(self) -> dict[str, int]:
+        return {
+            "prefix_cache_tree_nodes": int(self._count_nodes(self.root)),
+            "prefix_cache_tree_edges": int(self._count_edges(self.root)),
+        }
+
+    def _rebuild_locations(self) -> None:
+        locations: dict[bytes, tuple[RadixTreeNode, int]] = {}
+        stack = list(self.root.children.values())
+        while stack:
+            node = stack.pop()
+            for index, block_id in enumerate(node.segment):
+                locations[block_id] = (node, index)
+            stack.extend(node.children.values())
+        self._locations = locations
+
+    def _count_nodes(self, node: RadixTreeNode) -> int:
+        return 1 + sum(self._count_nodes(child) for child in node.children.values())
+
+    def _count_edges(self, node: RadixTreeNode) -> int:
+        return len(node.children) + sum(self._count_edges(child) for child in node.children.values())
+
+
+@dataclass(frozen=True)
+class PrefixCacheBlockedBlock:
+    block_id: bytes | None
+    reason: str
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "block_id": None if self.block_id is None else self.block_id.hex(),
+            "reason": self.reason,
+        }
+
+
+@dataclass
+class PrefixCacheDeleteResult:
+    deleted_blocks: list[PrefixCacheBlock]
+    blocked_blocks: list[PrefixCacheBlockedBlock]
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "deleted_block_ids": [block.stable_block_id.hex() for block in self.deleted_blocks],
+            "deleted_block_count": len(self.deleted_blocks),
+            "blocked_blocks": [block.to_dict() for block in self.blocked_blocks],
+        }
+
+
+class RadixPrefixIndex:
     def __init__(
         self,
         *,
         block_size: int,
         fingerprint: bytes,
         max_blocks: int | None = None,
+        backend: RadixTreeBackend | None = None,
     ):
         self.block_size = int(block_size)
         if self.block_size <= 0:
@@ -108,44 +302,70 @@ class PrefixCacheIndex:
             raise ValueError(f"max_blocks must be > 0 when set, got {max_blocks}.")
         self.fingerprint = bytes(fingerprint)
         self.max_blocks = None if max_blocks is None else int(max_blocks)
-        self._blocks: dict[bytes, PrefixCacheBlock] = {}
+        self.backend = backend or RadixTreeBackend()
+        self.blocks: dict[bytes, PrefixCacheBlock] = {}
         self._clock = 0
 
         self.lookup_requests = 0
         self.hit_requests = 0
         self.hit_tokens = 0
         self.hit_blocks = 0
-        self.materialized_blocks = 0
+        self.committed_blocks = 0
         self.evicted_blocks = 0
-        self.duplicate_blocks = 0
+        self.deleted_blocks = 0
+        self.duplicate_commits = 0
+        self.control_inspect_requests = 0
+        self.control_delete_requests = 0
+        self.control_priority_updates = 0
 
     def __len__(self) -> int:
-        return len(self._blocks)
+        return len(self.blocks)
 
-    def has_block(self, key: bytes) -> bool:
-        return key in self._blocks
+    def has_block(self, stable_block_id: bytes) -> bool:
+        return stable_block_id in self.blocks
 
-    def get_block(self, key: bytes) -> PrefixCacheBlock | None:
-        return self._blocks.get(key)
+    def get_block(self, stable_block_id: bytes) -> PrefixCacheBlock | None:
+        return self.blocks.get(stable_block_id)
 
     def _tick(self) -> int:
         self._clock += 1
         return self._clock
 
-    def hash_block(self, token_ids: list[int] | tuple[int, ...], parent_key: bytes | None) -> bytes:
+    def stable_block_id(
+        self,
+        token_ids: list[int] | tuple[int, ...],
+        parent_block_id: bytes | None,
+    ) -> bytes:
         if len(token_ids) != self.block_size:
             raise ValueError(
                 f"prefix cache blocks must be full: got {len(token_ids)} tokens, block_size={self.block_size}."
             )
         hasher = hashlib.sha256()
         hasher.update(self.fingerprint)
-        if parent_key is None:
+        if parent_block_id is None:
             hasher.update(b"\x00")
         else:
             hasher.update(b"\x01")
-            hasher.update(parent_key)
+            hasher.update(parent_block_id)
         hasher.update(_pack_token_ids(token_ids))
         return hasher.digest()
+
+    def block_ids_for_tokens(
+        self,
+        token_ids: list[int],
+        *,
+        max_tokens: int | None = None,
+    ) -> list[bytes]:
+        token_limit = len(token_ids) if max_tokens is None else min(int(max_tokens), len(token_ids))
+        token_limit = (token_limit // self.block_size) * self.block_size
+        parent_block_id: bytes | None = None
+        block_ids: list[bytes] = []
+        for start in range(0, token_limit, self.block_size):
+            block_tokens = token_ids[start: start + self.block_size]
+            block_id = self.stable_block_id(block_tokens, parent_block_id)
+            block_ids.append(block_id)
+            parent_block_id = block_id
+        return block_ids
 
     def lookup_longest_prefix(
         self,
@@ -154,48 +374,37 @@ class PrefixCacheIndex:
         max_usable_tokens: int,
     ) -> tuple[int, bytes | None, int]:
         self.lookup_requests += 1
-        usable_tokens = min(int(max_usable_tokens), (len(token_ids) // self.block_size) * self.block_size)
-        parent_key: bytes | None = None
-        hit_blocks: list[PrefixCacheBlock] = []
-        for start in range(0, usable_tokens, self.block_size):
-            block_tokens = token_ids[start: start + self.block_size]
-            key = self.hash_block(block_tokens, parent_key)
-            block = self._blocks.get(key)
-            if block is None:
-                break
-            hit_blocks.append(block)
-            parent_key = key
+        block_ids = self.block_ids_for_tokens(token_ids, max_tokens=max_usable_tokens)
+        result = self.backend.lookup(block_ids, len(block_ids))
+        if result.hit_block_count <= 0:
+            return 0, None, 0
+        hit_len = result.hit_block_count * self.block_size
+        self.hit_requests += 1
+        self.hit_tokens += hit_len
+        self.hit_blocks += result.hit_block_count
+        return hit_len, result.last_block_id, result.hit_block_count
 
-        if hit_blocks:
-            self.hit_requests += 1
-            hit_len = len(hit_blocks) * self.block_size
-            self.hit_tokens += hit_len
-            self.hit_blocks += len(hit_blocks)
-            return hit_len, hit_blocks[-1].key, len(hit_blocks)
-        return 0, None, 0
-
-    def get_chain(self, last_key: bytes, num_blocks: int) -> list[PrefixCacheBlock]:
-        num_blocks = int(num_blocks)
-        if num_blocks <= 0:
-            raise ValueError(f"num_blocks must be > 0, got {num_blocks}.")
-        chain: list[PrefixCacheBlock] = []
-        key: bytes | None = last_key
-        while key is not None and len(chain) < num_blocks:
-            block = self._blocks.get(key)
-            if block is None:
-                short_key = key.hex()[:16]
-                raise RuntimeError(
-                    "Prefix cache chain is incomplete: "
-                    f"missing_key={short_key} recovered_blocks={len(chain)} expected_blocks={num_blocks}."
-                )
-            chain.append(block)
-            key = block.parent_key
-        if len(chain) != num_blocks:
+    def get_chain(self, last_block_id: bytes, block_count: int) -> list[PrefixCacheBlock]:
+        block_count = int(block_count)
+        if block_count <= 0:
+            raise ValueError(f"block_count must be > 0, got {block_count}.")
+        path = self.backend.path_to_block(last_block_id)
+        if len(path) < block_count:
             raise RuntimeError(
                 "Prefix cache chain is shorter than expected: "
-                f"recovered_blocks={len(chain)} expected_blocks={num_blocks}."
+                f"recovered_blocks={len(path)} expected_blocks={block_count}."
             )
-        chain.reverse()
+        chain_ids = path[-block_count:]
+        chain: list[PrefixCacheBlock] = []
+        for block_id in chain_ids:
+            block = self.blocks.get(block_id)
+            if block is None:
+                short_key = block_id.hex()[:16]
+                raise RuntimeError(
+                    "Prefix cache chain is incomplete: "
+                    f"missing_block_id={short_key} recovered_blocks={len(chain)} expected_blocks={block_count}."
+                )
+            chain.append(block)
         return chain
 
     def ensure_insert_capacity(self, needed_blocks: int = 1) -> list[PrefixCacheBlock]:
@@ -204,39 +413,41 @@ class PrefixCacheIndex:
         needed_blocks = int(needed_blocks)
         if needed_blocks <= 0:
             raise ValueError(f"needed_blocks must be > 0, got {needed_blocks}.")
-        over_capacity = len(self._blocks) + needed_blocks - self.max_blocks
+        over_capacity = len(self.blocks) + needed_blocks - self.max_blocks
         if over_capacity <= 0:
             return []
         evicted = self.evict_until_freeable(over_capacity)
         if len(evicted) != over_capacity:
             raise RuntimeError(
                 "Prefix cache capacity exceeded and not enough blocks are evictable: "
-                f"live_blocks={len(self._blocks)} max_blocks={self.max_blocks} "
+                f"live_blocks={len(self.blocks)} max_blocks={self.max_blocks} "
                 f"needed_blocks={needed_blocks} evicted_blocks={len(evicted)} "
                 f"evictable_blocks={self.evictable_blocks()}."
             )
         return evicted
 
     def insert_block(self, block: PrefixCacheBlock) -> PrefixCacheBlock:
-        existing = self._blocks.get(block.key)
+        existing = self.blocks.get(block.stable_block_id)
         if existing is not None:
-            self.duplicate_blocks += 1
+            self.duplicate_commits += 1
             existing.last_access = self._tick()
             return existing
-        if self.max_blocks is not None and len(self._blocks) >= self.max_blocks:
+        if self.max_blocks is not None and len(self.blocks) >= self.max_blocks:
             raise RuntimeError(
                 "Prefix cache capacity exceeded before insert: "
-                f"live_blocks={len(self._blocks)} max_blocks={self.max_blocks} "
+                f"live_blocks={len(self.blocks)} max_blocks={self.max_blocks} "
                 f"evictable_blocks={self.evictable_blocks()}."
             )
-        if block.parent_key is not None:
-            parent = self._blocks.get(block.parent_key)
-            if parent is None:
+        if block.parent_block_id is None:
+            path = (block.stable_block_id,)
+        else:
+            if block.parent_block_id not in self.blocks:
                 raise KeyError("Cannot insert prefix cache block because parent is missing.")
-            parent.child_keys.add(block.key)
+            path = self.backend.path_to_block(block.parent_block_id) + (block.stable_block_id,)
         block.last_access = self._tick()
-        self._blocks[block.key] = block
-        self.materialized_blocks += 1
+        self.blocks[block.stable_block_id] = block
+        self.backend.insert(path)
+        self.committed_blocks += 1
         return block
 
     def touch_chain(self, blocks: list[PrefixCacheBlock]) -> None:
@@ -244,53 +455,191 @@ class PrefixCacheIndex:
         for block in blocks:
             block.last_access = access
 
-    @staticmethod
-    def can_evict(block: PrefixCacheBlock) -> bool:
-        return int(block.ref_count) == 0 and not block.child_keys
+    def child_count(self, stable_block_id: bytes) -> int:
+        return self.backend.child_count(stable_block_id)
+
+    def can_evict(self, block: PrefixCacheBlock) -> bool:
+        if int(block.ref_count) != 0 or int(block.eviction_priority) < 0:
+            return False
+        return self.child_count(block.stable_block_id) == 0
 
     def evictable_blocks(self) -> int:
-        return sum(1 for block in self._blocks.values() if self.can_evict(block))
+        return sum(1 for block in self.blocks.values() if self.can_evict(block))
+
+    def _remove_block_from_index(self, stable_block_id: bytes) -> PrefixCacheBlock:
+        block = self.blocks.get(stable_block_id)
+        if block is None:
+            raise KeyError("Prefix cache block is not present.")
+        if int(block.ref_count) != 0:
+            raise RuntimeError("Cannot remove a referenced prefix cache block.")
+        if int(block.eviction_priority) < 0:
+            raise RuntimeError("Cannot remove a negative-priority prefix cache block.")
+        if self.child_count(stable_block_id) != 0:
+            raise RuntimeError("Cannot remove a prefix cache block with live children.")
+        self.backend.remove_block(stable_block_id)
+        del self.blocks[stable_block_id]
+        return block
 
     def evict_until_freeable(self, needed_blocks: int) -> list[PrefixCacheBlock]:
         evicted: list[PrefixCacheBlock] = []
         needed_blocks = int(needed_blocks)
         while len(evicted) < needed_blocks:
-            candidates = [block for block in self._blocks.values() if self.can_evict(block)]
+            candidates = [block for block in self.blocks.values() if self.can_evict(block)]
             if not candidates:
                 break
-            block = min(candidates, key=lambda candidate: candidate.last_access)
-            self.remove(block.key)
-            evicted.append(block)
+            block = min(candidates, key=lambda candidate: (-int(candidate.eviction_priority), candidate.last_access))
+            evicted.append(self._remove_block_from_index(block.stable_block_id))
+            self.evicted_blocks += 1
         return evicted
 
-    def remove(self, key: bytes) -> PrefixCacheBlock:
-        block = self._blocks.get(key)
-        if block is None:
-            raise KeyError("Prefix cache block is not present.")
-        if int(block.ref_count) != 0:
-            raise RuntimeError("Cannot evict a referenced prefix cache block.")
-        if block.child_keys:
-            raise RuntimeError("Cannot evict a prefix cache block with live children.")
-        del self._blocks[key]
-        if block.parent_key is not None:
-            parent = self._blocks.get(block.parent_key)
-            if parent is not None:
-                parent.child_keys.discard(key)
-        block.child_keys.clear()
-        self.evicted_blocks += 1
-        return block
+    def inspect_prefix(
+        self,
+        token_ids: list[int],
+        *,
+        include_subtree: bool = False,
+    ) -> dict[str, Any]:
+        self.control_inspect_requests += 1
+        block_ids = self.block_ids_for_tokens(token_ids)
+        if not block_ids:
+            return {
+                "matched": False,
+                "reason": "prefix_shorter_than_block_size",
+                "selector_block_count": 0,
+                "hit_block_count": 0,
+                "hit_len": 0,
+                "last_block_id": None,
+                "path_blocks": [],
+            }
+        result = self.backend.lookup(block_ids, len(block_ids))
+        path_ids = block_ids[: result.hit_block_count]
+        path_blocks = [self._block_status_dict(block_id) for block_id in path_ids if block_id in self.blocks]
+        response: dict[str, Any] = {
+            "matched": result.hit_block_count > 0,
+            "selector_block_count": len(block_ids),
+            "hit_block_count": int(result.hit_block_count),
+            "hit_len": int(result.hit_block_count * self.block_size),
+            "last_block_id": None if result.last_block_id is None else result.last_block_id.hex(),
+            "path_blocks": path_blocks,
+        }
+        if include_subtree and result.last_block_id is not None:
+            subtree_ids = self.backend.subtree_block_ids(result.last_block_id)
+            response["subtree"] = self._subtree_summary(subtree_ids)
+        return response
+
+    def _block_status_dict(self, block_id: bytes) -> dict[str, Any]:
+        block = self.blocks[block_id]
+        return {
+            "block_id": block_id.hex(),
+            "logical_block_idx": int(block.logical_block_idx),
+            "ref_count": int(block.ref_count),
+            "eviction_priority": int(block.eviction_priority),
+            "child_count": int(self.child_count(block_id)),
+            "last_access": int(block.last_access),
+        }
+
+    def _subtree_summary(self, block_ids: tuple[bytes, ...]) -> dict[str, int]:
+        existing = [self.blocks[block_id] for block_id in block_ids if block_id in self.blocks]
+        return {
+            "block_count": int(len(existing)),
+            "referenced_block_count": int(sum(1 for block in existing if int(block.ref_count) > 0)),
+            "negative_priority_block_count": int(sum(1 for block in existing if int(block.eviction_priority) < 0)),
+            "leaf_block_count": int(sum(1 for block in existing if self.child_count(block.stable_block_id) == 0)),
+        }
+
+    def _exact_subtree_ids_for_tokens(self, token_ids: list[int]) -> tuple[bytes, ...] | None:
+        block_ids = self.block_ids_for_tokens(token_ids)
+        if not block_ids:
+            return None
+        result = self.backend.lookup(block_ids, len(block_ids))
+        if result.hit_block_count != len(block_ids) or result.last_block_id is None:
+            return None
+        return self.backend.subtree_block_ids(result.last_block_id)
+
+    def safe_delete_subtree(self, token_ids: list[int]) -> PrefixCacheDeleteResult:
+        self.control_delete_requests += 1
+        subtree_ids = self._exact_subtree_ids_for_tokens(token_ids)
+        if subtree_ids is None:
+            return PrefixCacheDeleteResult(
+                deleted_blocks=[],
+                blocked_blocks=[PrefixCacheBlockedBlock(block_id=None, reason="not_found")],
+            )
+        sorted_ids = sorted(
+            subtree_ids,
+            key=lambda block_id: len(self.backend.path_to_block(block_id)),
+            reverse=True,
+        )
+        deleted: list[PrefixCacheBlock] = []
+        blocked: list[PrefixCacheBlockedBlock] = []
+        for block_id in sorted_ids:
+            block = self.blocks.get(block_id)
+            if block is None:
+                continue
+            reason = None
+            if int(block.ref_count) > 0:
+                reason = "referenced"
+            elif int(block.eviction_priority) < 0:
+                reason = "negative_priority"
+            elif self.child_count(block_id) > 0:
+                reason = "has_children"
+            if reason is not None:
+                blocked.append(PrefixCacheBlockedBlock(block_id=block_id, reason=reason))
+                continue
+            deleted.append(self._remove_block_from_index(block_id))
+            self.deleted_blocks += 1
+        return PrefixCacheDeleteResult(deleted_blocks=deleted, blocked_blocks=blocked)
+
+    def set_subtree_eviction_priority(self, token_ids: list[int], priority: int) -> dict[str, Any]:
+        self.control_priority_updates += 1
+        block_ids = self.block_ids_for_tokens(token_ids)
+        if not block_ids:
+            return {
+                "matched": False,
+                "reason": "prefix_shorter_than_block_size",
+                "root_block_id": None,
+                "updated_block_count": 0,
+                "eviction_priority": int(priority),
+            }
+        result = self.backend.lookup(block_ids, len(block_ids))
+        if result.hit_block_count != len(block_ids) or result.last_block_id is None:
+            return {
+                "matched": False,
+                "reason": "not_found",
+                "root_block_id": None,
+                "updated_block_count": 0,
+                "eviction_priority": int(priority),
+            }
+        subtree_ids = self.backend.subtree_block_ids(result.last_block_id)
+        for block_id in subtree_ids:
+            block = self.blocks.get(block_id)
+            if block is not None:
+                block.eviction_priority = int(priority)
+        return {
+            "matched": True,
+            "root_block_id": result.last_block_id.hex(),
+            "updated_block_count": int(sum(1 for block_id in subtree_ids if block_id in self.blocks)),
+            "eviction_priority": int(priority),
+        }
 
     def stats(self) -> dict[str, int]:
-        pinned_blocks = sum(1 for block in self._blocks.values() if int(block.ref_count) > 0)
-        return {
+        tree_stats = self.backend.stats()
+        stats = {
             "prefix_cache_lookup_requests": int(self.lookup_requests),
             "prefix_cache_hit_requests": int(self.hit_requests),
             "prefix_cache_hit_tokens": int(self.hit_tokens),
             "prefix_cache_hit_blocks": int(self.hit_blocks),
-            "prefix_cache_materialized_blocks": int(self.materialized_blocks),
+            "prefix_cache_committed_blocks": int(self.committed_blocks),
+            "prefix_cache_duplicate_commits": int(self.duplicate_commits),
+            "prefix_cache_deleted_blocks": int(self.deleted_blocks),
             "prefix_cache_evicted_blocks": int(self.evicted_blocks),
-            "prefix_cache_live_blocks": int(len(self._blocks)),
-            "prefix_cache_evictable_blocks": int(self.evictable_blocks()),
-            "prefix_cache_pinned_blocks": int(pinned_blocks),
-            "prefix_cache_duplicate_blocks": int(self.duplicate_blocks),
+            "prefix_cache_live_blocks": int(len(self.blocks)),
+            "prefix_cache_referenced_blocks": int(sum(1 for block in self.blocks.values() if int(block.ref_count) > 0)),
+            "prefix_cache_negative_priority_blocks": int(
+                sum(1 for block in self.blocks.values() if int(block.eviction_priority) < 0)
+            ),
+            "prefix_cache_leaf_blocks": int(len(self.backend.leaf_block_ids())),
+            "prefix_cache_control_inspect_requests": int(self.control_inspect_requests),
+            "prefix_cache_control_delete_requests": int(self.control_delete_requests),
+            "prefix_cache_control_priority_updates": int(self.control_priority_updates),
         }
+        stats.update(tree_stats)
+        return stats

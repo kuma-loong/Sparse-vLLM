@@ -113,8 +113,8 @@ class FakeMemoryOracle:
             return
         seq.prefix_cache_enabled = True
         seq.prefix_cache_hit_len = self.prefix_hit_len
-        seq.prefix_cache_hit_blocks = self.prefix_hit_blocks
-        seq.prefix_cache_hit_last_key = b"test"
+        seq.prefix_cache_hit_block_count = self.prefix_hit_blocks
+        seq.prefix_cache_hit_last_block_id = b"test"
         seq.prefix_cache_block_size = 4
         seq.prefix_cache_method = ""
 
@@ -1009,29 +1009,22 @@ class SchedulerPrefillPolicyTest(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "No prefill candidate can use"):
             scheduler.schedule()
 
-    def test_sequence_setstate_accepts_pre_prefix_cache_ipc_state(self):
+    def test_sequence_setstate_round_trips_prefix_cache_block_metadata(self):
         seq = seq_with_len(4)
         seq.current_chunk_size = 4
-        old_state = (
-            seq.seq_id,
-            seq.status,
-            seq.num_tokens,
-            seq.num_prompt_tokens,
-            seq.num_prefilled_tokens,
-            seq.current_chunk_size,
-            seq.temperature,
-            seq.top_p,
-            seq.top_k,
-            seq.max_tokens,
-            seq.ignore_eos,
-            seq.logprobs,
-            seq.token_ids,
-        )
+        seq.prefix_cache_enabled = True
+        seq.prefix_cache_hit_len = 8
+        seq.prefix_cache_hit_block_count = 2
+        seq.prefix_cache_hit_last_block_id = b"block"
+        seq.prefix_cache_block_size = 4
+        seq.prefix_cache_method = "omnikv"
         restored = object.__new__(Sequence)
-        restored.__setstate__(old_state)
+        restored.__setstate__(seq.__getstate__())
 
-        self.assertFalse(restored.prefix_cache_enabled)
-        self.assertEqual(restored.prefix_cache_hit_len, 0)
+        self.assertTrue(restored.prefix_cache_enabled)
+        self.assertEqual(restored.prefix_cache_hit_len, 8)
+        self.assertEqual(restored.prefix_cache_hit_block_count, 2)
+        self.assertEqual(restored.prefix_cache_hit_last_block_id, b"block")
 
 
 class DeltaKVFullPrefillStagingTest(unittest.TestCase):

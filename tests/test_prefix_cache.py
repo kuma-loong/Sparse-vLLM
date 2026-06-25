@@ -9,12 +9,13 @@ import pytest
 import torch
 
 from sparsevllm.config import Config
-from sparsevllm.engine.cache_manager.quest import QuestCacheManager
-from sparsevllm.engine.cache_manager.standard import StandardCacheManager
+from sparsevllm.engine.cache_manager.quest import QuestCacheManager, QuestPrefixBlockPayload
+from sparsevllm.engine.cache_manager.standard import StandardCacheManager, StandardPrefixBlockPayload
 from sparsevllm.engine.sequence import Sequence
 from sparsevllm.engine.prefix_cache import (
     PrefixCacheBlock,
-    PrefixCacheIndex,
+    RadixPrefixIndex,
+    RadixTreeBackend,
     build_prefix_cache_fingerprint,
     resolve_prefix_cache_block_size,
     usable_prefix_cache_tokens,
@@ -42,24 +43,25 @@ def _cfg(method="", salt="", block_size=4):
     )
 
 
-def _insert_tokens(index: PrefixCacheIndex, token_ids: list[int]) -> bytes:
-    parent_key = None
-    last_key = None
+def _insert_tokens(index: RadixPrefixIndex, token_ids: list[int]) -> bytes:
+    parent_block_id = None
+    last_block_id = None
     for logical_idx, start in enumerate(range(0, len(token_ids), index.block_size)):
         block_tokens = token_ids[start: start + index.block_size]
-        key = index.hash_block(block_tokens, parent_key)
+        stable_block_id = index.stable_block_id(block_tokens, parent_block_id)
         block = PrefixCacheBlock(
-            key=key,
-            parent_key=parent_key,
+            stable_block_id=stable_block_id,
+            parent_block_id=parent_block_id,
             block_size=index.block_size,
             logical_block_idx=logical_idx,
+            payload=SimpleNamespace(name="dummy"),
             token_ids=tuple(block_tokens),
         )
         index.insert_block(block)
-        parent_key = key
-        last_key = key
-    assert last_key is not None
-    return last_key
+        parent_block_id = stable_block_id
+        last_block_id = stable_block_id
+    assert last_block_id is not None
+    return last_block_id
 
 
 def _hf_config():
@@ -89,7 +91,7 @@ def _make_standard_manager_for_prefix(block_size=2):
     manager.config = cfg
     manager.enable_prefix_caching = True
     manager.prefix_cache_block_size = block_size
-    manager.prefix_cache = PrefixCacheIndex(block_size=block_size, fingerprint=fingerprint)
+    manager.prefix_cache = RadixPrefixIndex(block_size=block_size, fingerprint=fingerprint)
     manager.buffer_req_to_token_slots = torch.zeros((2, 16), dtype=torch.int32)
     manager.free_slots_stack = torch.arange(100, dtype=torch.int32)
     manager._num_free_slots = 90
@@ -113,7 +115,7 @@ def _make_quest_manager_for_prefix(page_size=2):
     manager.page_size = page_size
     manager.num_pages = 10
     manager.prefix_cache_block_size = page_size
-    manager.prefix_cache = PrefixCacheIndex(block_size=page_size, fingerprint=fingerprint)
+    manager.prefix_cache = RadixPrefixIndex(block_size=page_size, fingerprint=fingerprint)
     manager.page_offsets_i32 = torch.arange(page_size, dtype=torch.int32)
     manager.buffer_req_to_token_slots = torch.zeros((2, 16), dtype=torch.int32)
     manager.buffer_req_to_page_slots = torch.full((2, 8), -1, dtype=torch.int32)
@@ -158,14 +160,14 @@ def test_usable_prefix_cache_tokens_leaves_logits_work():
     assert usable_prefix_cache_tokens(1, 16) == 0
 
 
-def test_prefix_cache_hash_is_stable_and_parent_sensitive():
+def test_radix_prefix_index_block_id_is_stable_and_parent_sensitive():
     fp = build_prefix_cache_fingerprint(_cfg(), 4)
-    index = PrefixCacheIndex(block_size=4, fingerprint=fp)
+    index = RadixPrefixIndex(block_size=4, fingerprint=fp)
 
-    first = index.hash_block([1, 2, 3, 4], None)
-    assert first == index.hash_block([1, 2, 3, 4], None)
-    assert first != index.hash_block([1, 2, 3, 5], None)
-    assert index.hash_block([5, 6, 7, 8], first) != index.hash_block([5, 6, 7, 8], None)
+    first = index.stable_block_id([1, 2, 3, 4], None)
+    assert first == index.stable_block_id([1, 2, 3, 4], None)
+    assert first != index.stable_block_id([1, 2, 3, 5], None)
+    assert index.stable_block_id([5, 6, 7, 8], first) != index.stable_block_id([5, 6, 7, 8], None)
 
 
 def test_prefix_cache_fingerprint_isolates_salt_and_method():
@@ -195,26 +197,72 @@ def test_standard_prompt_admission_accounts_for_free_rows():
 
 def test_lookup_returns_longest_full_block_prefix():
     fp = build_prefix_cache_fingerprint(_cfg(), 4)
-    index = PrefixCacheIndex(block_size=4, fingerprint=fp)
-    last_key = _insert_tokens(index, list(range(8)))
+    index = RadixPrefixIndex(block_size=4, fingerprint=fp)
+    last_block_id = _insert_tokens(index, list(range(8)))
 
-    hit_len, hit_last_key, hit_blocks = index.lookup_longest_prefix(
+    hit_len, hit_last_block_id, hit_blocks = index.lookup_longest_prefix(
         list(range(12)),
         max_usable_tokens=usable_prefix_cache_tokens(12, 4),
     )
 
     assert hit_len == 8
-    assert hit_last_key == last_key
+    assert hit_last_block_id == last_block_id
     assert hit_blocks == 2
-    chain = index.get_chain(hit_last_key, hit_blocks)
+    chain = index.get_chain(hit_last_block_id, hit_blocks)
     assert [block.logical_block_idx for block in chain] == [0, 1]
+
+
+def test_lookup_never_returns_half_block_match():
+    fp = build_prefix_cache_fingerprint(_cfg(), 4)
+    index = RadixPrefixIndex(block_size=4, fingerprint=fp)
+    _insert_tokens(index, [1, 2, 3, 4])
+
+    hit_len, hit_last_block_id, hit_blocks = index.lookup_longest_prefix(
+        [1, 2, 3, 4, 5, 6],
+        max_usable_tokens=6,
+    )
+
+    assert hit_len == 4
+    assert hit_last_block_id is not None
+    assert hit_blocks == 1
+
+
+def test_radix_backend_splits_edges_only_between_block_ids():
+    backend = RadixTreeBackend()
+    backend.insert((b"a", b"b", b"c"))
+    backend.insert((b"a", b"b", b"d"))
+
+    assert backend.lookup((b"a", b"b", b"c"), max_blocks=3).hit_block_count == 3
+    assert backend.lookup((b"a", b"b", b"x"), max_blocks=3).hit_block_count == 2
+    assert backend.child_count(b"a") == 1
+    assert backend.child_count(b"b") == 2
+    assert set(backend.leaf_block_ids()) == {b"c", b"d"}
+
+
+def test_radix_backend_removes_leaf_from_compressed_segment_and_preserves_siblings():
+    backend = RadixTreeBackend()
+    backend.insert((b"a", b"b", b"c", b"d"))
+    backend.insert((b"a", b"b", b"x", b"y"))
+    backend.insert((b"a", b"q"))
+
+    assert backend.path_to_block(b"d") == (b"a", b"b", b"c", b"d")
+    assert backend.path_to_block(b"y") == (b"a", b"b", b"x", b"y")
+    assert backend.child_count(b"b") == 2
+    assert backend.child_count(b"c") == 1
+    assert set(backend.subtree_block_ids(b"b")) == {b"b", b"c", b"d", b"x", b"y"}
+
+    backend.remove_block(b"d")
+
+    assert backend.path_to_block(b"c") == (b"a", b"b", b"c")
+    assert backend.path_to_block(b"y") == (b"a", b"b", b"x", b"y")
+    assert set(backend.leaf_block_ids()) == {b"c", b"y", b"q"}
 
 
 def test_lookup_does_not_touch_lru_state():
     fp = build_prefix_cache_fingerprint(_cfg(), 4)
-    index = PrefixCacheIndex(block_size=4, fingerprint=fp)
-    last_key = _insert_tokens(index, [1, 2, 3, 4])
-    block = index.get_chain(last_key, 1)[0]
+    index = RadixPrefixIndex(block_size=4, fingerprint=fp)
+    last_block_id = _insert_tokens(index, [1, 2, 3, 4])
+    block = index.get_chain(last_block_id, 1)[0]
     last_access = block.last_access
 
     index.lookup_longest_prefix([1, 2, 3, 4, 5], max_usable_tokens=4)
@@ -224,7 +272,7 @@ def test_lookup_does_not_touch_lru_state():
 
 def test_leaf_only_eviction_preserves_parent_until_child_is_removed():
     fp = build_prefix_cache_fingerprint(_cfg(), 4)
-    index = PrefixCacheIndex(block_size=4, fingerprint=fp)
+    index = RadixPrefixIndex(block_size=4, fingerprint=fp)
     _insert_tokens(index, list(range(8)))
 
     evicted = index.evict_until_freeable(1)
@@ -238,9 +286,9 @@ def test_leaf_only_eviction_preserves_parent_until_child_is_removed():
 
 def test_referenced_blocks_are_not_evictable():
     fp = build_prefix_cache_fingerprint(_cfg(), 4)
-    index = PrefixCacheIndex(block_size=4, fingerprint=fp)
-    last_key = _insert_tokens(index, [1, 2, 3, 4])
-    block = index.get_chain(last_key, 1)[0]
+    index = RadixPrefixIndex(block_size=4, fingerprint=fp)
+    last_block_id = _insert_tokens(index, [1, 2, 3, 4])
+    block = index.get_chain(last_block_id, 1)[0]
     block.ref_count = 1
 
     assert index.evict_until_freeable(1) == []
@@ -248,13 +296,109 @@ def test_referenced_blocks_are_not_evictable():
     assert index.evict_until_freeable(1) == [block]
 
 
+def test_duplicate_commit_returns_existing_block_and_counts_duplicate():
+    fp = build_prefix_cache_fingerprint(_cfg(), 4)
+    index = RadixPrefixIndex(block_size=4, fingerprint=fp)
+    stable_block_id = index.stable_block_id([1, 2, 3, 4], None)
+    first = PrefixCacheBlock(
+        stable_block_id=stable_block_id,
+        parent_block_id=None,
+        block_size=4,
+        logical_block_idx=0,
+        payload=SimpleNamespace(name="first"),
+        token_ids=(1, 2, 3, 4),
+    )
+    second = PrefixCacheBlock(
+        stable_block_id=stable_block_id,
+        parent_block_id=None,
+        block_size=4,
+        logical_block_idx=0,
+        payload=SimpleNamespace(name="second"),
+        token_ids=(1, 2, 3, 4),
+    )
+
+    assert index.insert_block(first) is first
+    assert index.insert_block(second) is first
+    assert index.stats()["prefix_cache_duplicate_commits"] == 1
+
+
+def test_eviction_priority_prefers_larger_positive_priority():
+    fp = build_prefix_cache_fingerprint(_cfg(), 4)
+    index = RadixPrefixIndex(block_size=4, fingerprint=fp)
+    first_id = _insert_tokens(index, [1, 2, 3, 4])
+    second_id = _insert_tokens(index, [5, 6, 7, 8])
+    first = index.get_block(first_id)
+    second = index.get_block(second_id)
+    assert first is not None and second is not None
+    first.eviction_priority = 1
+    second.eviction_priority = 10
+
+    assert index.evict_until_freeable(1) == [second]
+    assert first_id in index.blocks
+
+
+def test_negative_priority_blocks_eviction_and_safe_delete():
+    fp = build_prefix_cache_fingerprint(_cfg(), 4)
+    index = RadixPrefixIndex(block_size=4, fingerprint=fp)
+    block_id = _insert_tokens(index, [1, 2, 3, 4])
+    block = index.get_block(block_id)
+    assert block is not None
+    block.eviction_priority = -1
+
+    assert index.evict_until_freeable(1) == []
+    result = index.safe_delete_subtree([1, 2, 3, 4])
+    assert result.deleted_blocks == []
+    assert [blocked.reason for blocked in result.blocked_blocks] == ["negative_priority"]
+
+
+def test_subtree_delete_reports_referenced_child_and_preserves_parent():
+    fp = build_prefix_cache_fingerprint(_cfg(), 4)
+    index = RadixPrefixIndex(block_size=4, fingerprint=fp)
+    last_block_id = _insert_tokens(index, list(range(8)))
+    parent, child = index.get_chain(last_block_id, 2)
+    child.ref_count = 1
+
+    result = index.safe_delete_subtree(list(range(4)))
+
+    assert result.deleted_blocks == []
+    assert [blocked.reason for blocked in result.blocked_blocks] == ["referenced", "has_children"]
+    assert parent.stable_block_id in index.blocks
+    assert child.stable_block_id in index.blocks
+
+
+def test_subtree_delete_deletes_safe_child_and_blocks_protected_branch():
+    fp = build_prefix_cache_fingerprint(_cfg(), 2)
+    index = RadixPrefixIndex(block_size=2, fingerprint=fp)
+    root_id = _insert_tokens(index, [1, 2])
+    referenced_child_id = _insert_tokens(index, [1, 2, 3, 4])
+    free_child_id = _insert_tokens(index, [1, 2, 5, 6])
+    referenced_child = index.get_block(referenced_child_id)
+    assert referenced_child is not None
+    referenced_child.ref_count = 1
+
+    result = index.safe_delete_subtree([1, 2])
+
+    assert [block.stable_block_id for block in result.deleted_blocks] == [free_child_id]
+    assert {blocked.reason for blocked in result.blocked_blocks} == {"referenced", "has_children"}
+    assert root_id in index.blocks
+    assert referenced_child_id in index.blocks
+    assert free_child_id not in index.blocks
+
+
 def test_max_blocks_requires_explicit_capacity_before_insert():
     fp = build_prefix_cache_fingerprint(_cfg(), 4)
-    index = PrefixCacheIndex(block_size=4, fingerprint=fp, max_blocks=1)
+    index = RadixPrefixIndex(block_size=4, fingerprint=fp, max_blocks=1)
     _insert_tokens(index, [1, 2, 3, 4])
 
-    key = index.hash_block([5, 6, 7, 8], None)
-    block = PrefixCacheBlock(key=key, parent_key=None, block_size=4, logical_block_idx=0)
+    stable_block_id = index.stable_block_id([5, 6, 7, 8], None)
+    block = PrefixCacheBlock(
+        stable_block_id=stable_block_id,
+        parent_block_id=None,
+        block_size=4,
+        logical_block_idx=0,
+        payload=SimpleNamespace(name="dummy"),
+        token_ids=(5, 6, 7, 8),
+    )
     with pytest.raises(RuntimeError, match="capacity exceeded"):
         index.insert_block(block)
 
@@ -265,13 +409,13 @@ def test_max_blocks_requires_explicit_capacity_before_insert():
 
 def test_get_chain_fails_fast_on_incomplete_chain():
     fp = build_prefix_cache_fingerprint(_cfg(), 4)
-    index = PrefixCacheIndex(block_size=4, fingerprint=fp)
-    last_key = _insert_tokens(index, list(range(8)))
-    parent = index.get_chain(last_key, 2)[0]
-    del index._blocks[parent.key]
+    index = RadixPrefixIndex(block_size=4, fingerprint=fp)
+    last_block_id = _insert_tokens(index, list(range(8)))
+    parent = index.get_chain(last_block_id, 2)[0]
+    del index.blocks[parent.stable_block_id]
 
     with pytest.raises(RuntimeError, match="incomplete"):
-        index.get_chain(last_key, 2)
+        index.get_chain(last_block_id, 2)
 
 
 def test_resolve_prefix_cache_block_size_uses_quest_page_size():
@@ -332,21 +476,21 @@ def test_config_rejects_unvalidated_prefix_cache_options():
 def test_standard_attach_pins_prefix_slots_and_free_seq_keeps_cached_slots():
     manager = _make_standard_manager_for_prefix(block_size=2)
     seq = Sequence([1, 2, 3])
-    key = manager.prefix_cache.hash_block([1, 2], None)
+    stable_block_id = manager.prefix_cache.stable_block_id([1, 2], None)
     block = PrefixCacheBlock(
-        key=key,
-        parent_key=None,
+        stable_block_id=stable_block_id,
+        parent_block_id=None,
         block_size=2,
         logical_block_idx=0,
-        slots=torch.tensor([10, 11], dtype=torch.int32),
+        payload=StandardPrefixBlockPayload(token_slots=torch.tensor([10, 11], dtype=torch.int32)),
         token_ids=(1, 2),
     )
     _remove_free_slots(manager, [10, 11])
     manager.prefix_cache.insert_block(block)
     seq.prefix_cache_enabled = True
     seq.prefix_cache_hit_len = 2
-    seq.prefix_cache_hit_blocks = 1
-    seq.prefix_cache_hit_last_key = key
+    seq.prefix_cache_hit_block_count = 1
+    seq.prefix_cache_hit_last_block_id = stable_block_id
     seq.prefix_cache_block_size = 2
     seq.prefix_cache_method = ""
 
@@ -375,10 +519,79 @@ def test_standard_materializes_blocks_only_after_forward_end():
 
     manager.on_forward_end([seq], is_prefill=True)
     assert len(manager.prefix_cache) == 1
-    block = next(iter(manager.prefix_cache._blocks.values()))
+    block = next(iter(manager.prefix_cache.blocks.values()))
     assert block.ref_count == 1
-    assert block.slots.tolist() == [20, 21]
+    assert isinstance(block.payload, StandardPrefixBlockPayload)
+    assert block.payload.token_slots.tolist() == [20, 21]
     assert manager.seq_id_to_cached_ranges[seq.seq_id] == [(0, 2)]
+
+
+def test_standard_safe_delete_releases_payload_slots():
+    manager = _make_standard_manager_for_prefix(block_size=2)
+    stable_block_id = manager.prefix_cache.stable_block_id([1, 2], None)
+    block = PrefixCacheBlock(
+        stable_block_id=stable_block_id,
+        parent_block_id=None,
+        block_size=2,
+        logical_block_idx=0,
+        payload=StandardPrefixBlockPayload(token_slots=torch.tensor([10, 11], dtype=torch.int32)),
+        token_ids=(1, 2),
+    )
+    _remove_free_slots(manager, [10, 11])
+    manager.prefix_cache.insert_block(block)
+    assert manager._num_free_slots == 88
+
+    result = manager.prefix_cache_delete_subtree([1, 2])
+
+    assert result["deleted_block_ids"] == [stable_block_id.hex()]
+    assert manager._num_free_slots == 90
+    assert stable_block_id not in manager.prefix_cache.blocks
+
+
+def test_standard_safe_delete_partial_subtree_releases_only_deleted_child_slots():
+    manager = _make_standard_manager_for_prefix(block_size=2)
+    root_id = manager.prefix_cache.stable_block_id([1, 2], None)
+    referenced_child_id = manager.prefix_cache.stable_block_id([3, 4], root_id)
+    free_child_id = manager.prefix_cache.stable_block_id([5, 6], root_id)
+    root = PrefixCacheBlock(
+        stable_block_id=root_id,
+        parent_block_id=None,
+        block_size=2,
+        logical_block_idx=0,
+        payload=StandardPrefixBlockPayload(token_slots=torch.tensor([10, 11], dtype=torch.int32)),
+        token_ids=(1, 2),
+    )
+    referenced_child = PrefixCacheBlock(
+        stable_block_id=referenced_child_id,
+        parent_block_id=root_id,
+        block_size=2,
+        logical_block_idx=1,
+        payload=StandardPrefixBlockPayload(token_slots=torch.tensor([12, 13], dtype=torch.int32)),
+        token_ids=(3, 4),
+        ref_count=1,
+    )
+    free_child = PrefixCacheBlock(
+        stable_block_id=free_child_id,
+        parent_block_id=root_id,
+        block_size=2,
+        logical_block_idx=1,
+        payload=StandardPrefixBlockPayload(token_slots=torch.tensor([14, 15], dtype=torch.int32)),
+        token_ids=(5, 6),
+    )
+    _remove_free_slots(manager, [10, 11, 12, 13, 14, 15])
+    manager.prefix_cache.insert_block(root)
+    manager.prefix_cache.insert_block(referenced_child)
+    manager.prefix_cache.insert_block(free_child)
+    assert manager._num_free_slots == 84
+
+    result = manager.prefix_cache_delete_subtree([1, 2])
+
+    assert result["deleted_block_ids"] == [free_child_id.hex()]
+    assert {item["reason"] for item in result["blocked_blocks"]} == {"referenced", "has_children"}
+    assert manager._num_free_slots == 86
+    assert root_id in manager.prefix_cache.blocks
+    assert referenced_child_id in manager.prefix_cache.blocks
+    assert free_child_id not in manager.prefix_cache.blocks
 
 
 def test_standard_pending_slots_do_not_alias_free_stack_storage():
@@ -398,19 +611,19 @@ def test_standard_admission_reserves_evictable_hit_blocks():
     manager = _make_standard_manager_for_prefix(block_size=2)
     manager._num_free_slots = 1
     seq = Sequence([1, 2, 3])
-    key = manager.prefix_cache.hash_block([1, 2], None)
+    stable_block_id = manager.prefix_cache.stable_block_id([1, 2], None)
     block = PrefixCacheBlock(
-        key=key,
-        parent_key=None,
+        stable_block_id=stable_block_id,
+        parent_block_id=None,
         block_size=2,
         logical_block_idx=0,
-        slots=torch.tensor([10, 11], dtype=torch.int32),
+        payload=StandardPrefixBlockPayload(token_slots=torch.tensor([10, 11], dtype=torch.int32)),
         token_ids=(1, 2),
     )
     manager.prefix_cache.insert_block(block)
     seq.prefix_cache_hit_len = 2
-    seq.prefix_cache_hit_blocks = 1
-    seq.prefix_cache_hit_last_key = key
+    seq.prefix_cache_hit_block_count = 1
+    seq.prefix_cache_hit_last_block_id = stable_block_id
 
     assert manager.prompt_admission_free_slots() == 3
     assert manager.prompt_admission_cost(seq) == 3
@@ -419,25 +632,60 @@ def test_standard_admission_reserves_evictable_hit_blocks():
     assert manager.prompt_admission_cost(seq) == 1
 
 
+def test_standard_materializes_child_after_prefix_hit_with_parent_sensitive_id():
+    manager = _make_standard_manager_for_prefix(block_size=2)
+    seq = Sequence([1, 2, 3, 4])
+    root_id = manager.prefix_cache.stable_block_id([1, 2], None)
+    root = PrefixCacheBlock(
+        stable_block_id=root_id,
+        parent_block_id=None,
+        block_size=2,
+        logical_block_idx=0,
+        payload=StandardPrefixBlockPayload(token_slots=torch.tensor([10, 11], dtype=torch.int32)),
+        token_ids=(1, 2),
+    )
+    manager.prefix_cache.insert_block(root)
+    seq.prefix_cache_enabled = True
+    seq.prefix_cache_hit_len = 2
+    seq.prefix_cache_hit_block_count = 1
+    seq.prefix_cache_hit_last_block_id = root_id
+    seq.prefix_cache_block_size = 2
+
+    manager._record_prefix_materialization(seq, [3, 4], torch.tensor([20, 21], dtype=torch.int32))
+    manager.on_forward_end([seq], is_prefill=True)
+
+    child_id = manager.prefix_cache.stable_block_id([3, 4], root_id)
+    child = manager.prefix_cache.get_block(child_id)
+    assert child is not None
+    assert child.parent_block_id == root_id
+    assert child.logical_block_idx == 1
+    assert child.ref_count == 1
+    assert isinstance(child.payload, StandardPrefixBlockPayload)
+    assert child.payload.token_slots.tolist() == [20, 21]
+    assert [block.stable_block_id for block in manager.prefix_cache.get_chain(child_id, 2)] == [root_id, child_id]
+
+
 def test_quest_attach_pins_pages_and_free_seq_keeps_cached_page():
     manager = _make_quest_manager_for_prefix(page_size=2)
     seq = Sequence([1, 2, 3])
-    key = manager.prefix_cache.hash_block([1, 2], None)
+    stable_block_id = manager.prefix_cache.stable_block_id([1, 2], None)
     block = PrefixCacheBlock(
-        key=key,
-        parent_key=None,
+        stable_block_id=stable_block_id,
+        parent_block_id=None,
         block_size=2,
         logical_block_idx=0,
-        slots=torch.tensor([10, 11], dtype=torch.int32),
-        page_slot=5,
+        payload=QuestPrefixBlockPayload(
+            block_slot=5,
+            token_slots=torch.tensor([10, 11], dtype=torch.int32),
+        ),
         token_ids=(1, 2),
     )
     _remove_free_page(manager, 5)
     manager.prefix_cache.insert_block(block)
     seq.prefix_cache_enabled = True
     seq.prefix_cache_hit_len = 2
-    seq.prefix_cache_hit_blocks = 1
-    seq.prefix_cache_hit_last_key = key
+    seq.prefix_cache_hit_block_count = 1
+    seq.prefix_cache_hit_last_block_id = stable_block_id
     seq.prefix_cache_block_size = 2
     seq.prefix_cache_method = "quest"
 
@@ -518,32 +766,62 @@ def test_quest_materializes_pages_only_after_forward_end():
 
     manager.on_forward_end([seq], is_prefill=True)
     assert len(manager.prefix_cache) == 1
-    block = next(iter(manager.prefix_cache._blocks.values()))
+    block = next(iter(manager.prefix_cache.blocks.values()))
     assert block.ref_count == 1
-    assert block.page_slot == 2
-    assert block.slots.tolist() == [4, 5]
+    assert not hasattr(block, "page_slot")
+    assert not hasattr(block, "slots")
+    assert isinstance(block.payload, QuestPrefixBlockPayload)
+    assert block.payload.block_slot == 2
+    assert block.payload.token_slots.tolist() == [4, 5]
     assert manager.seq_id_to_cached_pages[seq.seq_id] == {0}
+
+
+def test_quest_safe_delete_releases_payload_block_slot():
+    manager = _make_quest_manager_for_prefix(page_size=2)
+    stable_block_id = manager.prefix_cache.stable_block_id([1, 2], None)
+    block = PrefixCacheBlock(
+        stable_block_id=stable_block_id,
+        parent_block_id=None,
+        block_size=2,
+        logical_block_idx=0,
+        payload=QuestPrefixBlockPayload(
+            block_slot=5,
+            token_slots=torch.tensor([10, 11], dtype=torch.int32),
+        ),
+        token_ids=(1, 2),
+    )
+    _remove_free_page(manager, 5)
+    manager.prefix_cache.insert_block(block)
+    assert manager._num_free_pages == 9
+
+    result = manager.prefix_cache_delete_subtree([1, 2])
+
+    assert result["deleted_block_ids"] == [stable_block_id.hex()]
+    assert manager._num_free_pages == 10
+    assert stable_block_id not in manager.prefix_cache.blocks
 
 
 def test_quest_admission_is_page_aligned_and_reserves_hit_pages():
     manager = _make_quest_manager_for_prefix(page_size=2)
     manager._num_free_pages = 1
     seq = Sequence([1, 2, 3])
-    key = manager.prefix_cache.hash_block([1, 2], None)
+    stable_block_id = manager.prefix_cache.stable_block_id([1, 2], None)
     block = PrefixCacheBlock(
-        key=key,
-        parent_key=None,
+        stable_block_id=stable_block_id,
+        parent_block_id=None,
         block_size=2,
         logical_block_idx=0,
-        slots=torch.tensor([10, 11], dtype=torch.int32),
-        page_slot=5,
+        payload=QuestPrefixBlockPayload(
+            block_slot=5,
+            token_slots=torch.tensor([10, 11], dtype=torch.int32),
+        ),
         token_ids=(1, 2),
     )
     _remove_free_page(manager, 5)
     manager.prefix_cache.insert_block(block)
     seq.prefix_cache_hit_len = 2
-    seq.prefix_cache_hit_blocks = 1
-    seq.prefix_cache_hit_last_key = key
+    seq.prefix_cache_hit_block_count = 1
+    seq.prefix_cache_hit_last_block_id = stable_block_id
 
     assert manager.prompt_admission_free_slots() == 4
     assert manager.prompt_admission_cost(seq) == 4

@@ -33,6 +33,11 @@ except ImportError:
 
 
 TP_SHM_NAME_PREFIX = "sparsevllm_"
+PREFIX_CACHE_CONTROL_RPC_METHODS = {
+    "prefix_cache_inspect",
+    "prefix_cache_delete_subtree",
+    "prefix_cache_set_eviction_priority",
+}
 
 
 def make_tp_shm_name() -> str:
@@ -165,7 +170,13 @@ class ModelRunner:
         """子进程的主循环：监听共享内存，解析并执行来自 Rank 0 的方法指令"""
         while True:
             method_name, args = self.read_shm()
-            self.call(method_name, *args)
+            try:
+                self.call(method_name, *args)
+            except Exception as exc:
+                if method_name in PREFIX_CACHE_CONTROL_RPC_METHODS:
+                    logger.error("TP worker prefix-cache control RPC failed: {}: {}", type(exc).__name__, exc)
+                else:
+                    raise
             if method_name == "exit":
                 break
 
@@ -209,8 +220,36 @@ class ModelRunner:
         method = getattr(self, method_name, None)
         # Ensure *all* runner-side ops (including sparse post-processing like DeltaKV eviction)
         # run without autograd bookkeeping to avoid large activation graphs / OOM.
+        if method_name in PREFIX_CACHE_CONTROL_RPC_METHODS:
+            local_error: BaseException | None = None
+            result = None
+            try:
+                with torch.inference_mode():
+                    result = method(*args)
+            except BaseException as exc:
+                local_error = exc
+            self._sync_prefix_cache_control_rpc_status(method_name, local_error)
+            if local_error is not None:
+                raise local_error
+            return result
         with torch.inference_mode():
             return method(*args)
+
+    def _sync_prefix_cache_control_rpc_status(
+        self,
+        method_name: str,
+        local_error: BaseException | None,
+    ) -> None:
+        if self.world_size <= 1 or not dist.is_initialized():
+            return
+        failed = torch.tensor(
+            [1 if local_error is not None else 0],
+            dtype=torch.int32,
+            device=self.device,
+        )
+        dist.all_reduce(failed, op=dist.ReduceOp.MAX)
+        if int(failed.item()) != 0 and local_error is None:
+            raise RuntimeError(f"At least one TP worker failed during {method_name}.")
 
     def load_deltakv_compressors(self):
         """加载 DeltaKV 压缩器权重"""
@@ -264,6 +303,31 @@ class ModelRunner:
                     else [int(x) for x in non_execution_token_ids]
                 ),
             )
+
+    def prefix_cache_inspect(
+        self,
+        token_ids: list[int],
+        include_subtree: bool = False,
+    ) -> dict[str, object]:
+        return self.cache_manager.prefix_cache_inspect(
+            [int(token_id) for token_id in token_ids],
+            include_subtree=bool(include_subtree),
+        )
+
+    def prefix_cache_delete_subtree(self, token_ids: list[int]) -> dict[str, object]:
+        return self.cache_manager.prefix_cache_delete_subtree(
+            [int(token_id) for token_id in token_ids],
+        )
+
+    def prefix_cache_set_eviction_priority(
+        self,
+        token_ids: list[int],
+        priority: int,
+    ) -> dict[str, object]:
+        return self.cache_manager.prefix_cache_set_eviction_priority(
+            [int(token_id) for token_id in token_ids],
+            priority=int(priority),
+        )
 
     def _long_text_threshold(self, is_prefill: bool) -> int:
         if self.config.vllm_sparse_method in ("streamingllm", "attention-sink", "attention_sink"):

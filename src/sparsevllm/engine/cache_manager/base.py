@@ -457,6 +457,28 @@ class CacheManager(ABC):
         """Optional hook after all layers have stored KV for a forward step."""
         return None
 
+    def prefix_cache_inspect(
+        self,
+        token_ids: list[int],
+        *,
+        include_subtree: bool = False,
+    ) -> dict[str, object]:
+        del token_ids, include_subtree
+        raise RuntimeError("prefix cache is not enabled or not supported by this cache manager.")
+
+    def prefix_cache_delete_subtree(self, token_ids: list[int]) -> dict[str, object]:
+        del token_ids
+        raise RuntimeError("prefix cache is not enabled or not supported by this cache manager.")
+
+    def prefix_cache_set_eviction_priority(
+        self,
+        token_ids: list[int],
+        *,
+        priority: int,
+    ) -> dict[str, object]:
+        del token_ids, priority
+        raise RuntimeError("prefix cache is not enabled or not supported by this cache manager.")
+
     def has_prefill_staging_view(self, layer_idx: int) -> bool:
         """Whether the current prefill layer should read from a temporary staging KV view."""
         return False
