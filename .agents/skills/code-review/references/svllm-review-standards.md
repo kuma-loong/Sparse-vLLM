@@ -13,6 +13,14 @@ Use these checks for Sparse-vLLM's Python/Triton research engine.
 
 Flag method logic hidden in `utils/`, method branches added directly to `attention.py`, or benchmark scripts redefining method semantics.
 
+## Platform Abstraction
+
+Platform-specific behavior should flow through `src/sparsevllm/platforms/` and shared device/runtime interfaces.
+
+For platform abstraction changes, inspect `src/sparsevllm/platforms/` plus changed shared-runtime call sites such as config normalization, model runner setup, cache managers, sparse controller, CUDA graph runner, loaders, and profilers.
+
+Treat direct hardware-specific calls in common runtime code as an architecture issue. Code outside `src/sparsevllm/platforms/`, narrowly scoped hardware backends, guarded one-off probes, or tests should avoid explicit APIs such as `torch.cuda`, CUDA device strings, CUDA memory queries, CUDA synchronization, and backend-specific distributed names. Prefer `sparsevllm.platforms.current_platform`, platform methods, cache-manager/model-runner `device` fields, and backend-neutral config aliases so CUDA, ROCm, CPU, or future devices follow the same control flow.
+
 ## Scheduling
 
 Prefill policy is registry-owned in `src/sparsevllm/method_registry.py`.
@@ -33,6 +41,8 @@ Prefer fail-fast errors with method/cache-manager name, prompt length, needed/fr
 ## OpenAI-Compatible Serving
 
 Serving changes must preserve Sparse-vLLM engine semantics instead of adding server-only execution paths.
+
+For OpenAI-compatible serving or client changes, inspect `src/sparsevllm/entrypoints/openai/api_server.py`, `src/sparsevllm/entrypoints/openai/client.py`, `src/sparsevllm/sampling_params.py`, `src/sparsevllm/layers/sampler.py`, and `tests/test_openai_api_server.py`.
 
 - Request JSON should reject unknown fields and validate `model`, `n`, `max_tokens`, `temperature`, `top_p`, `top_k`, `stop`, and `logprobs` before entering the engine.
 - `CompletionRequest` and chat request handling should map directly to `SamplingParams`; sampler changes need coverage for greedy, top-p, top-k, and logprob behavior.
