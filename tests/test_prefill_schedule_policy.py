@@ -16,6 +16,7 @@ from sparsevllm.engine.cache_manager.deltakv_less_memory import DeltaKVLessMemor
 from sparsevllm.engine.cache_manager.deltakv_less_memory_cuda_graph import (
     DeltaKVLessMemoryCudaGraphCacheManager,
 )
+from sparsevllm.engine.cache_manager.snapkv import SnapKVCacheManager
 from sparsevllm.engine.decode_cuda_graph import DecodeCudaGraphKey, DecodeCudaGraphRunner, DecodeCudaGraphState
 from sparsevllm.engine.llm_engine import _deltakv_graph_warmup_profile, _use_graph_scaled_warmup
 from sparsevllm.engine.scheduler import Scheduler
@@ -843,6 +844,17 @@ class SchedulerPrefillPolicyTest(unittest.TestCase):
         self.assertEqual(scheduled, [decode_seq])
         self.assertEqual(short_seq.current_chunk_size, None)
         self.assertEqual(list(scheduler.waiting), [short_seq])
+
+    def test_snapkv_remaining_prefill_no_longer_reserves_score_window_chunk(self):
+        manager = object.__new__(SnapKVCacheManager)
+        manager.config = SimpleNamespace(chunk_prefill_size=5, snapkv_window_size=2, vllm_sparse_method="snapkv")
+        seq = seq_with_len(20)
+
+        self.assertEqual(SnapKVCacheManager.remaining_prefill_tokens(manager, seq), 20)
+
+        seq.current_chunk_size = 5
+        seq.num_prefilled_tokens = 5
+        self.assertEqual(SnapKVCacheManager.remaining_prefill_tokens(manager, seq), 15)
 
     def test_deltakv_short_prefill_fails_fast_when_no_work_can_free_slots(self):
         scheduler = make_scheduler(

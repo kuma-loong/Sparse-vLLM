@@ -107,6 +107,13 @@ class Attention(nn.Module):
                     chunk_lens=chunk_lens,
                     max_input_len=max_input_len,
                 )
+                cache_manager.collect_prefill_attention_score(
+                    layer_idx,
+                    q,
+                    prefill_view,
+                    b_start_loc=b_start_loc,
+                    chunk_lens=chunk_lens,
+                )
             else:    # decode
                 batch_size = q.shape[0]
                 selection = sparse_controller.get_decode_selection(

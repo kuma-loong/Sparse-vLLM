@@ -692,12 +692,19 @@ def _collect_sparse_deltakv_metadata(runner: ModelRunner, seq: Sequence) -> dict
         "attn_score": {},
         "dynamic_selection_debug": getattr(sc, "debug_dynamic_selection", {}),
     }
-    row_idx = getattr(cm, "seq_id_to_row", {}).get(seq.seq_id)
+    seq_id_to_row = getattr(cm, "seq_id_to_row", {})
+    if isinstance(seq_id_to_row, list):
+        seq_id_to_row = seq_id_to_row[0] if seq_id_to_row else {}
+    row_idx = seq_id_to_row.get(seq.seq_id)
     if row_idx is not None:
         row_idx = int(row_idx)
         meta["row_idx"] = row_idx
         if hasattr(cm, "row_seq_lens"):
-            meta["row_seq_len"] = int(cm.row_seq_lens[row_idx])
+            row_seq_lens = cm.row_seq_lens
+            if isinstance(row_seq_lens, list):
+                row_seq_lens = row_seq_lens[0] if row_seq_lens else None
+            if row_seq_lens is not None:
+                meta["row_seq_len"] = int(row_seq_lens[row_idx])
         if hasattr(cm, "row_deltakv_compressed_lens"):
             meta["row_deltakv_compressed_len"] = int(cm.row_deltakv_compressed_lens[row_idx])
         if hasattr(cm, "sparse_layer_raw_slots_map"):
@@ -798,7 +805,10 @@ def _collect_sparse_compressed_state_debug(runner: ModelRunner, seq: Sequence, l
     if not layers:
         return {}
     cm = runner.cache_manager
-    row_idx = getattr(cm, "seq_id_to_row", {}).get(seq.seq_id)
+    seq_id_to_row = getattr(cm, "seq_id_to_row", {})
+    if isinstance(seq_id_to_row, list):
+        seq_id_to_row = seq_id_to_row[0] if seq_id_to_row else {}
+    row_idx = seq_id_to_row.get(seq.seq_id)
     if row_idx is None:
         return {}
     row_idx = int(row_idx)
@@ -1724,6 +1734,7 @@ def _hf_infer_config(args: argparse.Namespace, method: str, prompt_len: int) -> 
             "sink_keep_tokens": int(args.sink_keep_tokens),
             "recent_keep_tokens": int(args.recent_keep_tokens),
             "snapkv_window_size": int(args.snapkv_window_size),
+            "pool_kernel_size": int(args.pool_kernel_size),
             "hf_prefill_chunk_size": hf_prefill_chunk_size,
             "pyramidkv_start_layer": int(args.pyramidkv_start_layer),
             "pyramidkv_start_ratio": float(args.pyramidkv_start_ratio),
@@ -1811,6 +1822,7 @@ def _sparse_infer_config(args: argparse.Namespace, method: str) -> dict[str, Any
                 "sink_keep_tokens": int(args.sink_keep_tokens),
                 "recent_keep_tokens": int(args.recent_keep_tokens),
                 "snapkv_window_size": int(args.snapkv_window_size),
+                "pool_kernel_size": int(args.pool_kernel_size),
                 "pyramidkv_start_layer": int(args.pyramidkv_start_layer),
                 "pyramidkv_start_ratio": float(args.pyramidkv_start_ratio),
                 "pyramidkv_least_layer": args.pyramidkv_least_layer,
@@ -3282,6 +3294,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--sink_keep_tokens", type=int, default=8)
     parser.add_argument("--recent_keep_tokens", type=int, default=128)
     parser.add_argument("--snapkv_window_size", type=int, default=32)
+    parser.add_argument("--pool_kernel_size", type=int, default=1)
     parser.add_argument("--pyramidkv_start_layer", type=int, default=0)
     parser.add_argument("--pyramidkv_start_ratio", type=float, default=0.6)
     parser.add_argument("--pyramidkv_least_layer", type=int, default=None)

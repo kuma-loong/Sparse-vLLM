@@ -8,10 +8,12 @@ import torch
 from sparsevllm.config import Config
 from sparsevllm.engine.sequence import Sequence
 from sparsevllm.method_registry import PREFILL_POLICY_LONG_BS1FULL_SHORT_BATCH
+from sparsevllm.triton_kernel.prefill_score import prefill_score_fwd
+from sparsevllm.utils.context import get_context
 from sparsevllm.utils.log import logger, log_level
 from sparsevllm.utils.profiler import profiler
 
-from .base import CacheManager, LayerBatchStates, SparseSelection
+from .base import CacheManager, LayerBatchStates, PrefillComputeView, SparseSelection
 
 
 class SnapKVCacheManager(CacheManager):
@@ -37,6 +39,7 @@ class SnapKVCacheManager(CacheManager):
         self.row_seq_lens = []
         self.layer_batch_states = [LayerBatchStates() for _ in range(self.num_layers)]
         self._decode_static_buffers: dict[int, tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = {}
+        self._prefill_attn_score_accumulators: dict[tuple[int, int], torch.Tensor] = {}
 
         for layer_id in range(self.num_layers):
             num_slots = (
@@ -254,21 +257,193 @@ class SnapKVCacheManager(CacheManager):
         return int(reserved)
 
     def prefill_batched_tokens_margin(self) -> int:
-        # Keep headroom for the "window" tokens used by SnapKV/PyramidKV logic.
-        return int(self.config.snapkv_window_size)
+        return 0
 
     def remaining_prefill_tokens(self, seq: Sequence) -> int:
-        remaining = int(seq.num_prompt_tokens - seq.num_prefilled_tokens)
-        if (
-            self._pyramidkv_can_use_full_prefill_staging()
-            and int(seq.num_prefilled_tokens) == 0
-            and remaining > int(self.config.chunk_prefill_size)
-        ):
-            return remaining
-        window = int(self.config.snapkv_window_size)
-        if window > 0 and remaining > window:
-            return remaining - window
-        return remaining
+        return int(seq.num_prompt_tokens - seq.num_prefilled_tokens)
+
+    def _prefill_score_dtype(self) -> torch.dtype:
+        score_dtype_name = str(getattr(self.config, "sparse_attn_score_dtype", "float32") or "float32").lower()
+        try:
+            return {
+                "float32": torch.float32,
+                "bfloat16": torch.bfloat16,
+                "float16": torch.float16,
+            }[score_dtype_name]
+        except KeyError as exc:
+            raise ValueError(
+                "sparse_attn_score_dtype must be 'float32', 'bfloat16', or 'float16', "
+                f"got {score_dtype_name!r}."
+            ) from exc
+
+    def _prefill_score_layer_budget(self, layer_idx: int) -> int | None:
+        if int(layer_idx) < int(getattr(self.config, "snapkv_num_full_layers", 0) or 0):
+            return None
+        if self.config.vllm_sparse_method == "pyramidkv":
+            if self.config.pyramid_layer_ratios is None:
+                return None
+            return self._pyramidkv_layer_budget(layer_idx)
+        if self.config.vllm_sparse_method == "snapkv":
+            return (
+                int(self.config.num_sink_tokens)
+                + int(self.config.decode_keep_tokens)
+                + int(self.config.num_recent_tokens)
+            )
+        return None
+
+    def _prefill_score_rows(
+        self,
+        layer_idx: int,
+        seqs: list[Sequence],
+    ) -> list[tuple[int, Sequence, int, int]]:
+        budget = self._prefill_score_layer_budget(layer_idx)
+        if budget is None:
+            return []
+        window = int(getattr(self.config, "snapkv_window_size", 0) or 0)
+        if window <= 0:
+            return []
+
+        rows = []
+        for b_idx, seq in enumerate(seqs):
+            if seq.current_chunk_size is None:
+                raise RuntimeError(
+                    "Prefill score collection requires current_chunk_size. "
+                    f"layer={layer_idx} seq_id={seq.seq_id}"
+                )
+            prompt_len = int(seq.num_prompt_tokens)
+            if prompt_len <= int(budget):
+                continue
+            score_end = prompt_len
+            score_start = max(0, score_end - window)
+            chunk_start = int(seq.num_prefilled_tokens)
+            chunk_end = chunk_start + int(seq.current_chunk_size)
+            if chunk_start <= score_start and chunk_end >= score_end:
+                rows.append((b_idx, seq, score_start, score_end))
+            elif seq.is_last_chunk_prefill and chunk_start < score_end and chunk_end > score_start:
+                raise RuntimeError(
+                    "SnapKV/PyramidKV prefill score requires the score query window to fit in "
+                    "the final prefill chunk. "
+                    f"layer={layer_idx} seq_id={seq.seq_id} score_range=[{score_start}, {score_end}) "
+                    f"chunk_range=[{chunk_start}, {chunk_end})."
+                )
+        return rows
+
+    def _clear_prefill_attention_scores(self, seq_id: int):
+        seq_id = int(seq_id)
+        for key in list(self._prefill_attn_score_accumulators):
+            if key[1] == seq_id:
+                self._prefill_attn_score_accumulators.pop(key, None)
+
+    def _get_prefill_attention_score_accumulator(
+        self,
+        layer_idx: int,
+        seq: Sequence,
+        *,
+        prompt_len: int,
+        device: torch.device,
+    ) -> torch.Tensor:
+        key = (int(layer_idx), int(seq.seq_id))
+        if int(seq.num_prefilled_tokens) == 0:
+            self._prefill_attn_score_accumulators.pop(key, None)
+        acc = self._prefill_attn_score_accumulators.get(key)
+        if acc is None:
+            acc = torch.zeros(
+                (int(prompt_len),),
+                dtype=self._prefill_score_dtype(),
+                device=device,
+            )
+            self._prefill_attn_score_accumulators[key] = acc
+        return acc
+
+    @torch.no_grad()
+    def collect_prefill_attention_score(
+        self,
+        layer_idx: int,
+        q: torch.Tensor,
+        view: PrefillComputeView,
+        *,
+        b_start_loc: torch.Tensor,
+        chunk_lens: torch.Tensor,
+    ):
+        ctx = get_context()
+        if not ctx.is_prefill or not ctx.is_long_text:
+            return None
+        if self.config.vllm_sparse_method not in ("snapkv", "pyramidkv"):
+            return None
+        seqs = getattr(ctx, "seqs", None)
+        if seqs is None:
+            raise RuntimeError("Prefill score collection requires current seqs in context.")
+
+        rows = self._prefill_score_rows(layer_idx, seqs)
+        if not rows:
+            return None
+
+        b_prompt_cache_len = view.context_lens - chunk_lens
+        max_query_len = int(chunk_lens.max().item())
+        if len(rows) == 1:
+            b_idx, seq, score_start, score_end = rows[0]
+            acc = self._get_prefill_attention_score_accumulator(
+                layer_idx,
+                seq,
+                prompt_len=int(seq.num_prompt_tokens),
+                device=q.device,
+            )
+            prefill_score_fwd(
+                q,
+                view.k_cache,
+                acc.unsqueeze(0),
+                view.req_indices[b_idx : b_idx + 1],
+                b_start_loc[b_idx : b_idx + 1],
+                view.context_lens[b_idx : b_idx + 1],
+                b_prompt_cache_len[b_idx : b_idx + 1],
+                int(chunk_lens[b_idx].item()),
+                view.active_slots,
+                torch.tensor([score_start], dtype=torch.int32, device=q.device),
+                torch.tensor([score_end], dtype=torch.int32, device=q.device),
+                candidate_start=int(self.config.num_sink_tokens),
+                num_recent_tokens=int(self.config.num_recent_tokens),
+            )
+            return None
+
+        score_starts = torch.zeros((len(seqs),), dtype=torch.int32, device=q.device)
+        score_ends = torch.zeros((len(seqs),), dtype=torch.int32, device=q.device)
+        for b_idx, _seq, score_start, score_end in rows:
+            score_starts[b_idx] = int(score_start)
+            score_ends[b_idx] = int(score_end)
+
+        step_score = torch.zeros(
+            (len(seqs), int(view.context_lens.max().item())),
+            dtype=self._prefill_score_dtype(),
+            device=q.device,
+        )
+        prefill_score_fwd(
+            q,
+            view.k_cache,
+            step_score,
+            view.req_indices,
+            b_start_loc,
+            view.context_lens,
+            b_prompt_cache_len,
+            max_query_len,
+            view.active_slots,
+            score_starts,
+            score_ends,
+            candidate_start=int(self.config.num_sink_tokens),
+            num_recent_tokens=int(self.config.num_recent_tokens),
+        )
+        for b_idx, seq, _score_start, _score_end in rows:
+            acc = self._get_prefill_attention_score_accumulator(
+                layer_idx,
+                seq,
+                prompt_len=int(seq.num_prompt_tokens),
+                device=q.device,
+            )
+            context_len = int(view.context_lens[b_idx].item())
+            acc[:context_len] = torch.maximum(acc[:context_len], step_score[b_idx, :context_len])
+        return None
+
+    def pop_prefill_attention_score(self, layer_idx: int, seq: Sequence) -> torch.Tensor | None:
+        return self._prefill_attn_score_accumulators.pop((int(layer_idx), int(seq.seq_id)), None)
 
     def _get_free_row(self, layer_idx: int, seq_id: int) -> int:
         if seq_id in self.seq_id_to_row[layer_idx]:
@@ -334,6 +509,7 @@ class SnapKVCacheManager(CacheManager):
 
     def free_seq(self, seq_id: int):
         with profiler.record("cache_free_seq"):
+            self._clear_prefill_attention_scores(seq_id)
             for layer_idx in range(self.num_layers):
                 row_idx = self.seq_id_to_row[layer_idx].pop(seq_id, None)
                 if row_idx is None:
@@ -443,6 +619,10 @@ class SnapKVCacheManager(CacheManager):
 
     def _prepare_prefill(self, seqs: list[Sequence]):
         with profiler.record("cache_prepare_prefill"):
+            for seq in seqs:
+                if int(seq.num_prefilled_tokens) == 0:
+                    self._clear_prefill_attention_scores(seq.seq_id)
+
             use_full_prefill_staging = self._should_use_pyramidkv_full_prefill_staging(seqs)
             total_chunk_tokens = sum(seq.current_chunk_size for seq in seqs)
             if use_full_prefill_staging and total_chunk_tokens > int(self.pyramidkv_prefill_staging_num_slots):

@@ -1,6 +1,7 @@
 from dataclasses import dataclass
 import os
 import torch
+import torch.nn.functional as F
 from sparsevllm.config import Config
 from sparsevllm.engine.sequence import Sequence
 from sparsevllm.engine.cache_manager import CacheManager, SparseSelection
@@ -283,11 +284,6 @@ class SparseController:
             return
 
         state = self.layer_batch_sparse_states[layer_idx]
-        attn_scores = state.attn_score
-        if attn_scores is None:
-            raise RuntimeError("PyramidKV full-prefill staging requires layer attention scores.")
-        if attn_scores.dim() == 3:
-            attn_scores = attn_scores.max(dim=1).values
         budget = self._get_layer_budget(layer_idx, is_prefill=True)
         if budget is None:
             raise RuntimeError("PyramidKV full-prefill staging requires a layer budget.")
@@ -302,8 +298,19 @@ class SparseController:
             if kv_len <= budget:
                 keep_indices = torch.arange(kv_len, device=self.device, dtype=torch.long)
             else:
+                attn_scores = self.cache_manager.pop_prefill_attention_score(layer_idx, seq)
+                if attn_scores is None:
+                    raise RuntimeError(
+                        "PyramidKV full-prefill staging requires prefill attention scores. "
+                        f"layer={layer_idx} seq_id={seq.seq_id}"
+                    )
+                if attn_scores.dim() == 2:
+                    attn_scores = attn_scores.max(dim=0).values
                 keep_indices = self._snapkv_select_indices(
-                    attn_scores[b_idx, :kv_len], kv_len, budget
+                    attn_scores[:kv_len],
+                    kv_len,
+                    budget,
+                    pool_kernel_size=int(getattr(self.config, "pool_kernel_size", 1) or 1),
                 )
             self.cache_manager.materialize_prefill_staging_layer(layer_idx, seq, keep_indices)
 
@@ -506,11 +513,6 @@ class SparseController:
     def _snapkv_prefill_eviction(self, seqs: list[Sequence]):
         for layer_idx in range(self.num_layers):
             state = self.layer_batch_sparse_states[layer_idx]
-            attn_scores = state.attn_score
-            if attn_scores is None:
-                continue
-            if attn_scores.dim() == 3:
-                attn_scores = attn_scores.max(dim=1).values
             budget = self._get_layer_budget(layer_idx, is_prefill=True)
             if budget is None:
                 continue
@@ -520,13 +522,24 @@ class SparseController:
                 kv_len = int(state.context_lens[b_idx])
                 if kv_len <= budget:
                     continue
+                seq_scores = self.cache_manager.pop_prefill_attention_score(layer_idx, seq)
+                if seq_scores is None:
+                    raise RuntimeError(
+                        "SnapKV/PyramidKV prefill eviction requires prefill attention scores. "
+                        f"method={self.sparse_method} layer={layer_idx} seq_id={seq.seq_id}"
+                    )
+                if seq_scores.dim() == 2:
+                    seq_scores = seq_scores.max(dim=0).values
                 if log_level == 'DEBUG':
                     logger.debug(
                         "[SnapKV] prefill eviction: "
                         f"layer={layer_idx} seq_id={seq.seq_id} kv_len={kv_len} budget={budget}"
                     )
                 keep_indices = self._snapkv_select_indices(
-                    attn_scores[b_idx, :kv_len], kv_len, budget
+                    seq_scores[:kv_len],
+                    kv_len,
+                    budget,
+                    pool_kernel_size=int(getattr(self.config, "pool_kernel_size", 1) or 1),
                 )
                 self.cache_manager.free_part_slots(layer_idx, seq, keep_indices)
 
@@ -614,7 +627,14 @@ class SparseController:
         recent_indices = torch.arange(recent_start, kv_len, device=device, dtype=torch.long)
         return torch.cat([sink_indices, recent_indices], dim=0)
 
-    def _snapkv_select_indices(self, scores: torch.Tensor, kv_len: int, budget: int) -> torch.Tensor:
+    def _snapkv_select_indices(
+        self,
+        scores: torch.Tensor,
+        kv_len: int,
+        budget: int,
+        *,
+        pool_kernel_size: int = 1,
+    ) -> torch.Tensor:
         assert kv_len > budget
         device = scores.device
         
@@ -629,6 +649,14 @@ class SparseController:
         num_topk = budget - self.num_sink - self.num_recent
         if num_topk > 0 and recent_start > self.num_sink:
             middle_scores = scores[self.num_sink:recent_start]
+            pool_kernel_size = int(pool_kernel_size)
+            if pool_kernel_size > 1:
+                middle_scores = F.max_pool1d(
+                    middle_scores[None, None, :],
+                    kernel_size=pool_kernel_size,
+                    padding=pool_kernel_size // 2,
+                    stride=1,
+                ).squeeze(0).squeeze(0)
             topk_indices_relative = middle_scores.topk(min(num_topk, middle_scores.shape[0]), dim=-1).indices
             topk_indices = topk_indices_relative + self.num_sink
             keep_indices = torch.cat([sink_indices, topk_indices, recent_indices])
@@ -805,10 +833,7 @@ class SparseController:
             return True
         if self.sparse_method in ('snapkv', 'pyramidkv'):
             if is_prefill:
-                if get_context().is_long_text is False:
-                    return False
-                is_last_chunk = any(seq.is_last_chunk_prefill for seq in seqs)
-                return is_last_chunk
+                return False
 
             # Decode: only collect scores when we're about to evict.
             budget = self._get_layer_budget(layer_idx, is_prefill=False)

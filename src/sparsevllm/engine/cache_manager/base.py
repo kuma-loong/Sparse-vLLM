@@ -352,6 +352,24 @@ class CacheManager(ABC):
             temp_slots=temp_slots,
         )
 
+    def collect_prefill_attention_score(
+        self,
+        layer_idx: int,
+        q: torch.Tensor,
+        view: PrefillComputeView,
+        *,
+        b_start_loc: torch.Tensor,
+        chunk_lens: torch.Tensor,
+    ):
+        """Optional method-owned prefill score collection after attention output is computed."""
+        del layer_idx, q, view, b_start_loc, chunk_lens
+        return None
+
+    def pop_prefill_attention_score(self, layer_idx: int, seq: Sequence) -> torch.Tensor | None:
+        """Return and clear a method-owned prefill score for one completed sequence."""
+        del layer_idx, seq
+        return None
+
     @abstractmethod
     def get_layer_buffer_req_to_token_slots(self, layer_idx: int) -> torch.Tensor:
         raise NotImplementedError
