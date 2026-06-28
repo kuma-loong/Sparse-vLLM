@@ -547,6 +547,47 @@ class RadixPrefixIndex:
             and int(block.eviction_priority) >= 0
         )
 
+    def freeable_block_ids(self) -> set[bytes]:
+        """Return blocks removable by repeated leaf eviction without mutating the tree."""
+        freeable: set[bytes] = set()
+        subtree_freeable: dict[int, bool] = {}
+        stack: list[tuple[RadixTreeNode, bool]] = [(self.backend.root, False)]
+
+        while stack:
+            node, visited = stack.pop()
+            node_key = id(node)
+            if not visited:
+                stack.append((node, True))
+                for child in node.children.values():
+                    stack.append((child, False))
+                continue
+
+            children_freeable = True
+            for child in node.children.values():
+                if not subtree_freeable.pop(id(child), False):
+                    children_freeable = False
+
+            suffix_freeable = children_freeable
+            for block_id in reversed(node.segment):
+                block = self.blocks.get(block_id)
+                locally_freeable = (
+                    block is not None
+                    and int(block.ref_count) == 0
+                    and int(block.eviction_priority) >= 0
+                )
+                if locally_freeable and suffix_freeable:
+                    freeable.add(block_id)
+                    suffix_freeable = True
+                else:
+                    suffix_freeable = False
+
+            subtree_freeable[node_key] = suffix_freeable
+
+        return freeable
+
+    def freeable_blocks(self) -> int:
+        return len(self.freeable_block_ids())
+
     def _remove_block_from_index(self, stable_block_id: bytes) -> PrefixCacheBlock:
         block = self.blocks.get(stable_block_id)
         if block is None:
@@ -742,6 +783,7 @@ class RadixPrefixIndex:
                 sum(1 for block in self.blocks.values() if int(block.eviction_priority) < 0)
             ),
             "prefix_cache_leaf_blocks": int(len(self.backend.leaf_block_ids())),
+            "prefix_cache_freeable_blocks": int(self.freeable_blocks()),
             "prefix_cache_control_inspect_requests": int(self.control_inspect_requests),
             "prefix_cache_control_delete_requests": int(self.control_delete_requests),
             "prefix_cache_control_priority_updates": int(self.control_priority_updates),

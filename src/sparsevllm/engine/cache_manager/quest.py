@@ -127,12 +127,12 @@ class QuestCacheManager(PrefixCacheMixin, CacheManager):
     def _prefix_evictable_slots(self) -> int:
         if self.prefix_cache is None:
             return 0
-        return int(self.prefix_cache.evictable_blocks() * self.page_size)
+        return int(self.prefix_cache.freeable_blocks() * self.page_size)
 
     def _prefix_evictable_pages(self) -> int:
         if self.prefix_cache is None:
             return 0
-        return int(self.prefix_cache.evictable_blocks())
+        return int(self.prefix_cache.freeable_blocks())
 
     def _partial_page_free_slots(self) -> int:
         total = 0
@@ -199,7 +199,8 @@ class QuestCacheManager(PrefixCacheMixin, CacheManager):
             seq.prefix_cache_hit_last_block_id,
             int(seq.prefix_cache_hit_block_count),
         )
-        return sum(self.page_size for block in chain if self.prefix_cache.can_evict(block))
+        freeable_block_ids = self.prefix_cache.freeable_block_ids()
+        return sum(self.page_size for block in chain if block.stable_block_id in freeable_block_ids)
 
     def _ceil_to_page_slots(self, n_tokens: int) -> int:
         n_tokens = int(n_tokens)

@@ -189,7 +189,7 @@ class StandardCacheManager(PrefixCacheMixin, CacheManager):
     def _prefix_evictable_slots(self) -> int:
         if getattr(self, "prefix_cache", None) is None:
             return 0
-        return int(self.prefix_cache.evictable_blocks() * self.prefix_cache_block_size)
+        return int(self.prefix_cache.freeable_blocks() * self.prefix_cache_block_size)
 
     def prefill_step_free_slots(self) -> int:
         return int(self.num_free_slots + self._prefix_evictable_slots())
@@ -209,10 +209,11 @@ class StandardCacheManager(PrefixCacheMixin, CacheManager):
             seq.prefix_cache_hit_last_block_id,
             int(seq.prefix_cache_hit_block_count),
         )
+        freeable_block_ids = self.prefix_cache.freeable_block_ids()
         return sum(
             self.prefix_cache_block_size
             for block in chain
-            if self.prefix_cache.can_evict(block)
+            if block.stable_block_id in freeable_block_ids
         )
 
     def prompt_admission_cost(self, seq: Sequence) -> int:

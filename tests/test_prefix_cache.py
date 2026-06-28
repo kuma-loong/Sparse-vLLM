@@ -362,6 +362,35 @@ def test_leaf_only_eviction_preserves_parent_until_child_is_removed():
     assert len(index) == 0
 
 
+def test_freeable_blocks_counts_cascade_evictable_chain_without_mutation():
+    fp = build_prefix_cache_fingerprint(_cfg(), 4)
+    index = RadixPrefixIndex(block_size=4, fingerprint=fp)
+    _insert_tokens(index, list(range(16)))
+
+    assert index.evictable_blocks() == 1
+    assert index.freeable_blocks() == 4
+    assert len(index) == 4
+
+    evicted = index.evict_until_freeable(4)
+    assert [block.logical_block_idx for block in evicted] == [3, 2, 1, 0]
+    assert len(index) == 0
+
+
+def test_freeable_blocks_excludes_ancestors_of_referenced_descendant():
+    fp = build_prefix_cache_fingerprint(_cfg(), 2)
+    index = RadixPrefixIndex(block_size=2, fingerprint=fp)
+    root_id = _insert_tokens(index, [1, 2])
+    referenced_child_id = _insert_tokens(index, [1, 2, 3, 4])
+    free_child_id = _insert_tokens(index, [1, 2, 5, 6])
+    referenced_child = index.get_block(referenced_child_id)
+    assert referenced_child is not None
+    referenced_child.ref_count = 1
+
+    assert index.freeable_block_ids() == {free_child_id}
+    assert index.freeable_blocks() == 1
+    assert root_id in index.blocks
+
+
 def test_bulk_eviction_scans_initial_leaves_once(monkeypatch):
     fp = build_prefix_cache_fingerprint(_cfg(), 4)
     index = RadixPrefixIndex(block_size=4, fingerprint=fp)
@@ -1245,3 +1274,29 @@ def test_quest_admission_is_page_aligned_and_reserves_hit_pages():
 
     block.ref_count = 1
     assert manager.prompt_admission_cost(seq) == 2
+
+
+def test_quest_admission_counts_cascade_freeable_prefix_pages():
+    manager = _make_quest_manager_for_prefix(page_size=2)
+    manager._num_free_pages = 0
+    parent_block_id = None
+    for logical_idx, start in enumerate(range(0, 6, 2)):
+        token_ids = [start + 1, start + 2]
+        stable_block_id = manager.prefix_cache.stable_block_id(token_ids, parent_block_id)
+        manager.prefix_cache.insert_block(
+            PrefixCacheBlock(
+                stable_block_id=stable_block_id,
+                parent_block_id=parent_block_id,
+                block_size=2,
+                logical_block_idx=logical_idx,
+                payload=QuestPrefixBlockPayload(
+                    block_slot=logical_idx,
+                    token_slots=torch.tensor([logical_idx * 2, logical_idx * 2 + 1], dtype=torch.int32),
+                ),
+                token_ids=tuple(token_ids),
+            )
+        )
+        parent_block_id = stable_block_id
+
+    assert manager.prefix_cache.evictable_blocks() == 1
+    assert manager.prompt_admission_free_slots() == 6
