@@ -171,7 +171,7 @@ class DeltaKVLessMemoryCudaGraphCacheManager(DeltaKVLessMemoryCacheManager):
             max_s = sink + int(k_max) + int(max_buffer)
             self._ensure_decode_static_temp_slots(graph_batch_size, k_max)
             self._ensure_decode_static_plan_buffers(graph_batch_size, k_max, max_s, device)
-            self._ensure_materialized_sparse_view(graph_batch_size, max_s, device)
+            self._ensure_materialized_sparse_view_capacity(graph_batch_size, max_s, device)
 
         if self._full_layer_quant_enabled():
             static_cap = getattr(self, "_decode_static_max_context_len", None)
@@ -179,6 +179,32 @@ class DeltaKVLessMemoryCudaGraphCacheManager(DeltaKVLessMemoryCacheManager):
                 static_cap = getattr(self.full_layer_batch_states, "max_context_len", None)
             if static_cap is not None and int(static_cap) > 0:
                 self._ensure_full_layer_quant_decode_workspace(graph_batch_size, int(static_cap))
+
+    def _ensure_materialized_sparse_view_capacity(self, batch_size: int, width: int, device: torch.device) -> None:
+        batch_size = int(batch_size)
+        width = int(width)
+        total = batch_size * width
+        if total > int(self.deltakv_materialized_compute_num_slots):
+            raise RuntimeError(
+                "DeltaKV materialized sparse workspace is too small: "
+                f"need={total} capacity={int(self.deltakv_materialized_compute_num_slots)} "
+                f"batch={batch_size} width={width}. Increase max_num_batched_tokens or reduce decode keep tokens."
+            )
+
+        cap_batch = self._decode_graph_capture_size_capacity(batch_size)
+        alloc_width = max(1, width)
+        cache = getattr(self, "_deltakv_graph_materialized_sparse_view_by_capacity", None)
+        if cache is None:
+            cache = {}
+            self._deltakv_graph_materialized_sparse_view_by_capacity = cache
+        key = (cap_batch, alloc_width, str(device))
+        if cache.get(key) is not None:
+            return
+        self._raise_if_capture_allocation("materialized sparse view", (cap_batch, alloc_width, str(device)))
+        active = torch.empty((cap_batch, alloc_width), dtype=torch.int32, device=device)
+        flat = torch.arange(max(1, cap_batch * alloc_width), dtype=torch.int32, device=device)
+        local_req = torch.arange(cap_batch, dtype=torch.int32, device=device)
+        cache[key] = (active, flat, local_req)
 
     def _ensure_decode_static_temp_slots(self, batch_size: int, k_max: int) -> torch.Tensor:
         batch_size = int(batch_size)
@@ -447,7 +473,7 @@ class DeltaKVLessMemoryCudaGraphCacheManager(DeltaKVLessMemoryCacheManager):
         self._prewarm_decode_graph_static_workspaces(int(input_ids.numel()), input_ids.device)
         return super().prepare_decode_static(seqs, input_ids, positions, slot_mapping, context_lens, req_indices)
 
-    def _set_postrope_slots(self, layer_idx: int, slots: torch.Tensor) -> None:
+    def _set_postrope_slots(self, layer_idx: int, slots: torch.Tensor, *, validate: bool = True) -> None:
         masks = getattr(self, "_deltakv_postrope_slot_mask", None)
         if masks is None or slots is None:
             return
@@ -458,6 +484,10 @@ class DeltaKVLessMemoryCudaGraphCacheManager(DeltaKVLessMemoryCacheManager):
             return
 
         slots_i32 = slots.to(layer_mask.device).to(torch.int32).flatten()
+        if not validate:
+            layer_mask.index_fill_(0, slots_i32.to(torch.long), True)
+            return
+
         valid = (slots_i32 >= 0) & (slots_i32 < int(layer_mask.shape[0]))
         if self._is_cuda_graph_capturing():
             dummy_slot = self._ensure_deltakv_postrope_dummy_slot().to(layer_mask.device).to(torch.int32)

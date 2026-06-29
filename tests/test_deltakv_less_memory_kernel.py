@@ -19,11 +19,57 @@ from sparsevllm.triton_kernel.gqa_flash_decoding_stage1 import flash_decode_stag
 from sparsevllm.triton_kernel.gqa_flash_decoding_stage1 import (
     flash_decode_stage1_with_score as gqa_flash_decode_stage1_with_score,
 )
-from sparsevllm.triton_kernel.quant import triton_quantize_and_pack_along_last_dim, unpack_quantized_to_16bit
+from sparsevllm.triton_kernel.quant import (
+    triton_dequantize_2d_int4_grouped,
+    triton_quantize_and_pack_2d_int4_grouped,
+    triton_quantize_and_pack_along_last_dim,
+    unpack_quantized_to_16bit,
+)
 
 
 @unittest.skipUnless(torch.cuda.is_available(), "CUDA is required for DeltaKV Triton kernel tests.")
 class DeltaKVLessMemoryKernelTest(unittest.TestCase):
+    def test_residual_2d_int4_quant_matches_reference_for_float32(self):
+        torch.manual_seed(19)
+        device = "cuda"
+        n = 37
+        d = 512
+        group_size = 32
+        x = torch.randn(n, d, device=device, dtype=torch.float32)
+
+        ref_packed, ref_scale, ref_mn = triton_quantize_and_pack_along_last_dim(
+            x.unsqueeze(0).unsqueeze(0),
+            group_size,
+            4,
+        )
+        got_packed, got_scale, got_mn = triton_quantize_and_pack_2d_int4_grouped(x, group_size)
+        torch.cuda.synchronize()
+
+        self.assertTrue(torch.equal(got_packed, ref_packed.squeeze(0).squeeze(0).to(torch.int32)))
+        self.assertTrue(torch.equal(got_scale, ref_scale.squeeze(0).squeeze(0)))
+        self.assertTrue(torch.equal(got_mn, ref_mn.squeeze(0).squeeze(0)))
+
+    def test_residual_2d_int4_dequant_matches_reference_for_float32(self):
+        torch.manual_seed(23)
+        device = "cuda"
+        n = 41
+        d = 512
+        group_size = 32
+        x = torch.randn(n, d, device=device, dtype=torch.float32)
+        packed, scale, mn = triton_quantize_and_pack_2d_int4_grouped(x, group_size)
+
+        ref = unpack_quantized_to_16bit(
+            packed.unsqueeze(0).unsqueeze(0),
+            scale.unsqueeze(0).unsqueeze(0),
+            mn.unsqueeze(0).unsqueeze(0),
+            group_size,
+            4,
+        ).squeeze(0).squeeze(0)
+        got = triton_dequantize_2d_int4_grouped(packed, scale, mn, group_size, d)
+        torch.cuda.synchronize()
+
+        self.assertTrue(torch.allclose(got, ref, atol=1e-6, rtol=1e-6))
+
     def test_store_kvcache_chunks_large_launches(self):
         from sparsevllm.triton_kernel.store_kvcache import store_kvcache
 
@@ -123,7 +169,8 @@ class DeltaKVLessMemoryKernelTest(unittest.TestCase):
         existing_centers = torch.randn((1, existing_count, d), device=device, dtype=dtype)
         existing_slots = torch.arange(existing_count, device=device, dtype=torch.int32)
 
-        def gather_existing(l_idx, slots):
+        def gather_existing(l_idx, slots, *, validate=True):
+            del validate
             self.assertEqual(l_idx, 0)
             return existing_centers.squeeze(0).index_select(0, slots.to(torch.long))
 

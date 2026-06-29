@@ -6,7 +6,12 @@ import os
 import torch
 
 from sparsevllm.engine.sequence import Sequence
-from sparsevllm.triton_kernel.quant import triton_quantize_and_pack_along_last_dim, unpack_quantized_to_16bit
+from sparsevllm.triton_kernel.quant import (
+    triton_dequantize_2d_int4_grouped,
+    triton_quantize_and_pack_2d_int4_grouped,
+    triton_quantize_and_pack_along_last_dim,
+    unpack_quantized_to_16bit,
+)
 from sparsevllm.layers.rotary_embedding import apply_rotary_emb
 from sparsevllm.utils.compressor import create_compressor
 from sparsevllm.utils.context import get_context
@@ -376,7 +381,7 @@ class DeltaKVLessMemoryCacheManager(DeltaKVCacheTritonManagerV4):
         safe_slots = slots.to(torch.long).clamp(0, int(layer_mask.shape[0]) - 1)
         return valid & layer_mask[safe_slots]
 
-    def _set_postrope_slots(self, layer_idx: int, slots: torch.Tensor) -> None:
+    def _set_postrope_slots(self, layer_idx: int, slots: torch.Tensor, *, validate: bool = True) -> None:
         masks = getattr(self, "_deltakv_postrope_slot_mask", None)
         if masks is None or slots is None:
             return
@@ -387,7 +392,6 @@ class DeltaKVLessMemoryCacheManager(DeltaKVCacheTritonManagerV4):
             return
 
         slots_i32 = slots.to(layer_mask.device).to(torch.int32).flatten()
-        valid = (slots_i32 >= 0) & (slots_i32 < int(layer_mask.shape[0]))
         is_capturing = self._is_stream_capturing()
         if is_capturing:
             raise RuntimeError(
@@ -395,9 +399,11 @@ class DeltaKVLessMemoryCacheManager(DeltaKVCacheTritonManagerV4):
                 "Use vllm_sparse_method='deltakv' with decode_cuda_graph=True for graph runs."
             )
         else:
-            if not bool(valid.any()):
-                return
-            layer_mask.index_fill_(0, slots_i32[valid].to(torch.long), True)
+            if validate:
+                valid = (slots_i32 >= 0) & (slots_i32 < int(layer_mask.shape[0]))
+                layer_mask.index_fill_(0, slots_i32[valid].to(torch.long), True)
+            else:
+                layer_mask.index_fill_(0, slots_i32.to(torch.long), True)
 
     def _max_decode_scratch_seqs(self) -> int:
         max_seqs = max(int(self.config.max_num_seqs_in_batch), int(self.config.max_decoding_seqs))
@@ -1533,6 +1539,7 @@ class DeltaKVLessMemoryCacheManager(DeltaKVCacheTritonManagerV4):
         self.full_layer_slots_map[row_idx, :total_len] = -1
         if keep_pos.numel() > 0:
             self.full_layer_slots_map[row_idx, keep_pos.to(torch.long)] = keep_slots
+        block_pos = None
         if block_slots.numel() > 0:
             offsets = torch.arange(group_size, device=self.device, dtype=torch.long)
             block_pos = block_start_pos.to(torch.long)[:, None] + offsets[None, :]
@@ -1549,8 +1556,8 @@ class DeltaKVLessMemoryCacheManager(DeltaKVCacheTritonManagerV4):
             "total_len": int(total_len),
             "keep_pos": keep_pos,
             "keep_slots": keep_slots,
-            "block_start_pos": block_start_pos,
             "block_slots": block_slots,
+            "block_pos": block_pos,
         }
 
     @torch.no_grad()
@@ -1563,7 +1570,6 @@ class DeltaKVLessMemoryCacheManager(DeltaKVCacheTritonManagerV4):
             l_idx = self.full_layer_to_idx[layer_idx]
             k_stage = self.deltakv_prefill_staging_kv_cache[0]
             v_stage = self.deltakv_prefill_staging_kv_cache[1]
-            group_size = self._full_layer_kivi_group_size()
             block_chunk_size = self._full_layer_kivi_store_block_chunk_size()
 
             for plan in self._full_layer_kivi_full_prefill_plans.values():
@@ -1574,14 +1580,21 @@ class DeltaKVLessMemoryCacheManager(DeltaKVCacheTritonManagerV4):
                         self.full_kv_cache[0, l_idx, keep_slots] = k_stage[keep_pos]
                         self.full_kv_cache[1, l_idx, keep_slots] = v_stage[keep_pos]
 
-                block_starts = plan["block_start_pos"].to(torch.long)
                 block_slots = plan["block_slots"].to(torch.long)
                 if block_slots.numel() > 0:
-                    offsets = torch.arange(group_size, device=k_stage.device, dtype=torch.long)
+                    if "block_pos" in plan:
+                        block_pos_all = plan["block_pos"].to(torch.long)
+                    else:
+                        offsets = torch.arange(
+                            self._full_layer_kivi_group_size(),
+                            device=k_stage.device,
+                            dtype=torch.long,
+                        )
+                        block_pos_all = plan["block_start_pos"].to(torch.long)[:, None] + offsets[None, :]
                     with profiler.record("deltakv_full_prefill_kivi_store_blocks"):
                         for start in range(0, int(block_slots.numel()), block_chunk_size):
                             end = min(int(block_slots.numel()), start + block_chunk_size)
-                            block_pos = block_starts[start:end, None] + offsets[None, :]
+                            block_pos = block_pos_all[start:end]
                             self._store_full_layer_kivi_blocks(
                                 l_idx=l_idx,
                                 block_slots=block_slots[start:end],
@@ -1674,67 +1687,6 @@ class DeltaKVLessMemoryCacheManager(DeltaKVCacheTritonManagerV4):
         self.full_layer_kivi_value_scales[l_idx, block_slots] = scale_v.to(self.full_layer_kivi_value_scales.dtype)
         self.full_layer_kivi_value_mins[l_idx, block_slots] = mn_v.to(self.full_layer_kivi_value_mins.dtype)
 
-    def _store_full_layer_kivi_block(
-        self,
-        *,
-        l_idx: int,
-        block_slot: int | torch.Tensor,
-        key_post_rope: torch.Tensor,
-        value: torch.Tensor,
-    ):
-        """Store one full-layer KIVI block.
-
-        Contract: key_post_rope is already after RoPE. Full-layer KIVI packed
-        storage preserves the same key-space as full_kv_cache and prefill
-        staging KV cache, so fused/static decode kernels must not apply RoPE
-        again after dequantization.
-        """
-        group_size = self._full_layer_kivi_group_size()
-        if tuple(key_post_rope.shape) != (group_size, self.num_kv_heads, self.head_dim):
-            raise ValueError(
-                "Full-layer KIVI key block shape mismatch: "
-                f"got={tuple(key_post_rope.shape)} expected={(group_size, self.num_kv_heads, self.head_dim)}."
-            )
-        if tuple(value.shape) != tuple(key_post_rope.shape):
-            raise ValueError(f"Full-layer KIVI value block shape mismatch: got={tuple(value.shape)}.")
-        block_slots = (
-            block_slot.reshape(1)
-            if isinstance(block_slot, torch.Tensor)
-            else torch.tensor([int(block_slot)], device=key_post_rope.device, dtype=torch.long)
-        )
-        self._store_full_layer_kivi_blocks(
-            l_idx=l_idx,
-            block_slots=block_slots,
-            key_post_rope=key_post_rope.unsqueeze(0),
-            value=value.unsqueeze(0),
-        )
-
-    def _load_full_layer_kivi_block(self, *, l_idx: int, block_slot: int | torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        group_size = self._full_layer_kivi_group_size()
-        quant_bits = int(getattr(self.config, "full_layer_kv_quant_bits", 0) or 0)
-        if quant_bits != 4:
-            raise ValueError(f"Full-layer KIVI load expects int4, got {quant_bits}.")
-        block_i = int(block_slot.item()) if isinstance(block_slot, torch.Tensor) else int(block_slot)
-
-        key_dequant = unpack_quantized_to_16bit(
-            self.full_layer_kivi_key_packed[l_idx, block_i].unsqueeze(0),
-            self.full_layer_kivi_key_scales[l_idx, block_i].unsqueeze(0).unsqueeze(-1),
-            self.full_layer_kivi_key_mins[l_idx, block_i].unsqueeze(0).unsqueeze(-1),
-            group_size,
-            quant_bits,
-        )
-        key = key_dequant.permute(0, 3, 1, 2).squeeze(0).contiguous()
-
-        value_dequant = unpack_quantized_to_16bit(
-            self.full_layer_kivi_value_packed[l_idx, block_i].unsqueeze(0),
-            self.full_layer_kivi_value_scales[l_idx, block_i].unsqueeze(0),
-            self.full_layer_kivi_value_mins[l_idx, block_i].unsqueeze(0),
-            group_size,
-            quant_bits,
-        )
-        value = value_dequant.permute(0, 2, 1, 3).squeeze(0).contiguous()
-        return key.to(self.hf_config.torch_dtype), value.to(self.hf_config.torch_dtype)
-
     def on_layer_attention_end(self, layer_idx: int):
         if not self.has_prefill_staging_view(layer_idx):
             return
@@ -1777,6 +1729,8 @@ class DeltaKVLessMemoryCacheManager(DeltaKVCacheTritonManagerV4):
         if quant_bits != 4:
             raise ValueError(f"Quantized residual storage requires quant_bits=4, got {quant_bits}.")
         group_size = self._quant_group_size(int(residual.shape[-1]))
+        if residual.dim() == 2:
+            return triton_quantize_and_pack_2d_int4_grouped(residual, group_size)
         packed, scale, mn = triton_quantize_and_pack_along_last_dim(
             residual.unsqueeze(0).unsqueeze(0),
             group_size,
@@ -1796,6 +1750,8 @@ class DeltaKVLessMemoryCacheManager(DeltaKVCacheTritonManagerV4):
         if quant_bits != 4:
             raise ValueError(f"Quantized residual load requires quant_bits=4, got {quant_bits}.")
         group_size = self._quant_group_size(int(kv_dim))
+        if packed.dim() == 2:
+            return triton_dequantize_2d_int4_grouped(packed, scale, mn, group_size, int(packed.shape[-1]) * 8)
         return unpack_quantized_to_16bit(
             packed.unsqueeze(0).unsqueeze(0),
             scale.unsqueeze(0).unsqueeze(0),
@@ -1816,8 +1772,8 @@ class DeltaKVLessMemoryCacheManager(DeltaKVCacheTritonManagerV4):
                 "DeltaKV less-memory latent residual store shape mismatch: "
                 f"slots={int(latent_slots.numel())}, residual_rows={int(residual.shape[0])}."
             )
-        capturing = self._is_stream_capturing()
-        if not capturing:
+        validate_slots = os.getenv("SPARSEVLLM_VALIDATE_DELTAKV_LATENT_SLOTS", "0") == "1"
+        if validate_slots and not self._is_stream_capturing():
             latent_cap = int(self.deltakv_latent_cache.shape[1])
             bad_latent = (latent_slots < 0) | (latent_slots >= latent_cap)
             if bool(bad_latent.any()):
@@ -1841,33 +1797,58 @@ class DeltaKVLessMemoryCacheManager(DeltaKVCacheTritonManagerV4):
         latent_slots: torch.Tensor,
         kv_block: torch.Tensor,
         base_kv: torch.Tensor,
-        to_compress_mask: torch.Tensor,
+        to_compress_mask: torch.Tensor | None = None,
         store_indices: torch.Tensor | None = None,
+        store_all: bool = False,
     ):
-        if store_indices is not None:
+        if store_all:
+            selected_count = int(kv_block.shape[1])
+            if int(latent_slots.numel()) != selected_count:
+                raise RuntimeError(
+                    "DeltaKV less-memory latent store_all mismatch: "
+                    f"kv_tokens={selected_count}, latent_slots={int(latent_slots.numel())}."
+                )
+            selected_indices = None
+        elif store_indices is not None:
             store_indices = store_indices.to(device=kv_block.device, dtype=torch.long)
             selected_indices = store_indices
         else:
+            if to_compress_mask is None:
+                raise RuntimeError("DeltaKV latent store requires to_compress_mask unless store_all=True.")
             selected_indices = torch.nonzero(
                 to_compress_mask.to(device=kv_block.device),
                 as_tuple=False,
             ).flatten().to(torch.long)
-        if int(selected_indices.numel()) != int(latent_slots.numel()):
+        selected_count = int(kv_block.shape[1]) if store_all else int(selected_indices.numel())
+        if selected_count != int(latent_slots.numel()):
             raise RuntimeError(
                 "DeltaKV less-memory latent store selected-token mismatch: "
-                f"selected={int(selected_indices.numel())}, latent_slots={int(latent_slots.numel())}."
+                f"selected={selected_count}, latent_slots={int(latent_slots.numel())}."
             )
-        if int(selected_indices.numel()) == 0:
+        if selected_count == 0:
             return
         chunk_size = self._deltakv_latent_store_chunk_size()
         down = self.compress_down[l_idx]
-        for start in range(0, int(selected_indices.numel()), chunk_size):
-            end = min(int(selected_indices.numel()), start + chunk_size)
-            chunk_indices = selected_indices[start:end]
+        for start in range(0, selected_count, chunk_size):
+            end = min(selected_count, start + chunk_size)
             chunk_latent_slots = latent_slots[start:end]
-            kv_to_store = kv_block.index_select(1, chunk_indices)
-            base_to_store = base_kv.index_select(1, chunk_indices)
-            residual = (down(kv_to_store) - down(base_to_store)).squeeze(0)
+            if store_all:
+                kv_to_store = kv_block[:, start:end]
+                base_to_store = base_kv[:, start:end]
+            else:
+                chunk_indices = selected_indices[start:end]
+                kv_to_store = kv_block.index_select(1, chunk_indices)
+                base_to_store = base_kv.index_select(1, chunk_indices)
+            pair_count = int(kv_to_store.shape[1])
+            # Pairing improves small eviction chunks but raises peak memory and slows large full-prefill chunks.
+            if pair_count <= 1024:
+                encoded = down(torch.cat((kv_to_store, base_to_store), dim=1))
+                residual = encoded[:, :pair_count]
+                residual.sub_(encoded[:, pair_count:])
+            else:
+                residual = down(kv_to_store)
+                residual.sub_(down(base_to_store))
+            residual = residual.squeeze(0)
             self._store_residual(l_idx, chunk_latent_slots, residual)
 
     def _deltakv_latent_store_chunk_size(self) -> int:
@@ -1975,9 +1956,9 @@ class DeltaKVLessMemoryCacheManager(DeltaKVCacheTritonManagerV4):
             self.deltakv_prefill_staging_pre_rope_k_cache.dtype
         )
 
-    def _stage_pre_rope_kv_by_pos(self, pos: torch.Tensor) -> torch.Tensor:
+    def _stage_pre_rope_kv_by_pos(self, pos: torch.Tensor, *, validate: bool = True) -> torch.Tensor:
         pos_i64 = pos.to(torch.long)
-        if not self._is_stream_capturing() and (
+        if validate and not self._is_stream_capturing() and (
             (pos_i64 < 0).any() or (pos_i64 >= int(self.deltakv_prefill_staging_num_slots)).any()
         ):
             raise RuntimeError("DeltaKV pre-RoPE staging position is outside staging cache.")
@@ -2082,14 +2063,18 @@ class DeltaKVLessMemoryCacheManager(DeltaKVCacheTritonManagerV4):
                 mask_new = cols <= rows
                 scores[:, :, m0:].masked_fill_(~mask_new.unsqueeze(0), float("-inf"))
 
-            topk_indices_chunk = scores.topk(k=k_eff, dim=-1).indices
+            topk_indices_chunk = scores.topk(k=k_eff, dim=-1, sorted=False).indices
             gather_idx = topk_indices_chunk.reshape(1, -1)[:, :, None].expand(-1, -1, kv_dim)
             base_chunk = all_centers.gather(1, gather_idx).view(1, end - start, k_eff, kv_dim).mean(dim=2)
             topk_chunks.append(topk_indices_chunk)
             base_chunks.append(base_chunk)
 
-        topk_indices = torch.cat(topk_chunks, dim=1)
-        base = torch.cat(base_chunks, dim=1)
+        if len(topk_chunks) == 1:
+            topk_indices = topk_chunks[0]
+            base = base_chunks[0]
+        else:
+            topk_indices = torch.cat(topk_chunks, dim=1)
+            base = torch.cat(base_chunks, dim=1)
         return topk_indices.squeeze(0).to(torch.int32), base
 
     def _deltakv_store_father_slots(
@@ -2132,37 +2117,44 @@ class DeltaKVLessMemoryCacheManager(DeltaKVCacheTritonManagerV4):
         latent_store_mask: torch.Tensor,
         latent_store_indices: torch.Tensor | None,
     ):
-        if latent_store_indices is None:
-            store_indices_all = torch.nonzero(latent_store_mask, as_tuple=False).flatten().to(device=evict_pos.device)
+        contiguous_store_indices = bool(plan.get("latent_store_indices_contiguous", False))
+        if contiguous_store_indices:
+            if int(latent_slots.numel()) != int(evict_pos.numel()):
+                raise RuntimeError(
+                    "DeltaKV full-prefill contiguous latent store mismatch: "
+                    f"evict_tokens={int(evict_pos.numel())}, latent_slots={int(latent_slots.numel())}."
+                )
+            store_indices_all = None
+            store_count = int(latent_slots.numel())
         else:
-            store_indices_all = latent_store_indices.to(device=evict_pos.device, dtype=torch.long)
-        if int(store_indices_all.numel()) != int(latent_slots.numel()):
-            raise RuntimeError(
-                "DeltaKV full-prefill latent store index mismatch: "
-                f"store_indices={int(store_indices_all.numel())}, latent_slots={int(latent_slots.numel())}."
-            )
-        if int(store_indices_all.numel()) == 0:
+            if latent_store_indices is None:
+                store_indices_all = torch.nonzero(latent_store_mask, as_tuple=False).flatten().to(device=evict_pos.device)
+            else:
+                store_indices_all = latent_store_indices.to(device=evict_pos.device, dtype=torch.long)
+            store_count = int(store_indices_all.numel())
+            if store_count != int(latent_slots.numel()):
+                raise RuntimeError(
+                    "DeltaKV full-prefill latent store index mismatch: "
+                    f"store_indices={store_count}, latent_slots={int(latent_slots.numel())}."
+                )
+        if store_count == 0:
             return
-        if not self._is_stream_capturing():
+        if not contiguous_store_indices and not self._is_stream_capturing():
             if bool((store_indices_all < 0).any()) or bool((store_indices_all >= int(evict_pos.numel())).any()):
                 raise RuntimeError("DeltaKV full-prefill store indices are outside the evict block.")
-            if int(store_indices_all.numel()) > 1 and bool((store_indices_all[1:] < store_indices_all[:-1]).any()):
+            if store_count > 1 and bool((store_indices_all[1:] < store_indices_all[:-1]).any()):
                 raise RuntimeError("DeltaKV full-prefill store indices must be sorted by evict position.")
 
         with profiler.record("deltakv_full_prefill_build_centers"):
             kv_dim = 2 * self.num_kv_heads * self.head_dim
+            sink_pos = plan["keep_pos"][: int(sink_slots.numel())].to(torch.int32)
             existing_centers = (
-                self._gather_sparse_ref_raw_kv_by_slots(l_idx, sink_slots).unsqueeze(0)
+                self._stage_pre_rope_kv_by_pos(sink_pos, validate=False).unsqueeze(0)
                 if sink_slots.numel() > 0
                 else evict_pos.new_zeros((1, 0, kv_dim), dtype=self.hf_config.torch_dtype)
             )
             new_centers = (
-                self._deltakv_gather_raw_kv_from_cache(
-                    slots=center_pos.to(torch.int32),
-                    pos=center_pos.to(torch.int32),
-                    k_cache=self.deltakv_prefill_staging_kv_cache[0],
-                    v_cache=self.deltakv_prefill_staging_kv_cache[1],
-                ).unsqueeze(0)
+                self._stage_pre_rope_kv_by_pos(center_pos.to(torch.int32), validate=False).unsqueeze(0)
                 if center_pos.numel() > 0
                 else existing_centers.new_zeros((1, 0, kv_dim))
             )
@@ -2175,19 +2167,11 @@ class DeltaKVLessMemoryCacheManager(DeltaKVCacheTritonManagerV4):
         new_center_rel = (center_pos - evict_start).to(device=evict_pos.device, dtype=torch.long)
         store_cursor = 0
         store_chunk_size = self._deltakv_latent_store_chunk_size()
-        contiguous_store_indices = bool(plan.get("latent_store_indices_contiguous", False)) and (
-            int(store_indices_all.numel()) == int(evict_pos.numel())
-        )
         for start in range(0, int(evict_pos.numel()), store_chunk_size):
             end = min(int(evict_pos.numel()), start + store_chunk_size)
             evict_chunk = evict_pos[start:end]
             with profiler.record("deltakv_full_prefill_gather_raw_chunk"):
-                kv_chunk = self._deltakv_gather_raw_kv_from_cache(
-                    slots=evict_chunk,
-                    pos=evict_chunk,
-                    k_cache=self.deltakv_prefill_staging_kv_cache[0],
-                    v_cache=self.deltakv_prefill_staging_kv_cache[1],
-                ).unsqueeze(0)
+                kv_chunk = self._stage_pre_rope_kv_by_pos(evict_chunk, validate=False).unsqueeze(0)
             with profiler.record("deltakv_full_prefill_cluster_chunk"):
                 topk_center_indices, base_kv = self._cluster_compress_against_centers(
                     kv_states=kv_chunk,
@@ -2199,6 +2183,7 @@ class DeltaKVLessMemoryCacheManager(DeltaKVCacheTritonManagerV4):
 
             if contiguous_store_indices:
                 next_cursor = end
+                selected_local = None
             else:
                 next_cursor = int(
                     torch.searchsorted(
@@ -2207,14 +2192,14 @@ class DeltaKVLessMemoryCacheManager(DeltaKVCacheTritonManagerV4):
                         right=False,
                     ).item()
                 )
+                selected_global = store_indices_all[store_cursor:next_cursor]
+                if not self._is_stream_capturing() and (
+                    bool((selected_global < start).any()) or bool((selected_global >= end).any())
+                ):
+                    raise RuntimeError("DeltaKV full-prefill store index fell outside its chunk.")
+                selected_local = selected_global - start
             if next_cursor == store_cursor:
                 continue
-            selected_global = store_indices_all[store_cursor:next_cursor]
-            if not self._is_stream_capturing() and (
-                bool((selected_global < start).any()) or bool((selected_global >= end).any())
-            ):
-                raise RuntimeError("DeltaKV full-prefill store index fell outside its chunk.")
-            selected_local = selected_global - start
             chunk_latent_slots = latent_slots[store_cursor:next_cursor]
 
             with profiler.record("deltakv_full_prefill_store_fathers_chunk"):
@@ -2231,15 +2216,16 @@ class DeltaKVLessMemoryCacheManager(DeltaKVCacheTritonManagerV4):
                     latent_slots=chunk_latent_slots,
                     kv_block=kv_chunk,
                     base_kv=base_kv,
-                    to_compress_mask=latent_store_mask[start:end],
+                    to_compress_mask=None if contiguous_store_indices else latent_store_mask[start:end],
                     store_indices=selected_local,
+                    store_all=bool(contiguous_store_indices),
                 )
             store_cursor = next_cursor
 
-        if store_cursor != int(store_indices_all.numel()):
+        if store_cursor != store_count:
             raise RuntimeError(
                 "DeltaKV full-prefill did not store all latent rows: "
-                f"stored={store_cursor}, expected={int(store_indices_all.numel())}."
+                f"stored={store_cursor}, expected={store_count}."
             )
 
     @torch.no_grad()
@@ -2298,7 +2284,13 @@ class DeltaKVLessMemoryCacheManager(DeltaKVCacheTritonManagerV4):
 
             self._deltakv_full_prefill_compressed_layers.add(layer_idx)
 
-    def _gather_sparse_ref_raw_kv_by_slots(self, l_idx: int, slots: torch.Tensor) -> torch.Tensor:
+    def _gather_sparse_ref_raw_kv_by_slots(
+        self,
+        l_idx: int,
+        slots: torch.Tensor,
+        *,
+        validate: bool = True,
+    ) -> torch.Tensor:
         if slots.numel() == 0:
             return torch.empty(
                 (0, 2 * self.num_kv_heads * self.head_dim),
@@ -2306,14 +2298,17 @@ class DeltaKVLessMemoryCacheManager(DeltaKVCacheTritonManagerV4):
                 device=self.device,
             )
         slots_i32 = slots.to(torch.int32)
-        pos = self.deltakv_slot_to_pos[slots_i32.to(torch.long)].to(torch.long)
         capturing = self._is_stream_capturing()
-        if not capturing and (pos < 0).any():
-            raise RuntimeError("DeltaKV less-memory: reference slot has unknown position.")
-        if self._prefill_pre_rope_stage_active() and (
-            capturing or (pos < int(self.deltakv_prefill_staging_num_slots)).all()
-        ):
-            return self._stage_pre_rope_kv_by_pos(pos)
+        if self._prefill_pre_rope_stage_active():
+            pos = self.deltakv_slot_to_pos[slots_i32.to(torch.long)].to(torch.long)
+            if validate and not capturing and (pos < 0).any():
+                raise RuntimeError("DeltaKV less-memory: reference slot has unknown position.")
+            if capturing or (pos < int(self.deltakv_prefill_staging_num_slots)).all():
+                return self._stage_pre_rope_kv_by_pos(pos, validate=validate)
+        elif validate and not capturing:
+            pos = self.deltakv_slot_to_pos[slots_i32.to(torch.long)]
+            if (pos < 0).any():
+                raise RuntimeError("DeltaKV less-memory: reference slot has unknown position.")
         k_raw = self.deltakv_full_kv_cache[0, l_idx, slots_i32.to(torch.long)]
         v = self.deltakv_full_kv_cache[1, l_idx, slots_i32.to(torch.long)]
         kv_dim_half = self.num_kv_heads * self.head_dim
@@ -2332,13 +2327,18 @@ class DeltaKVLessMemoryCacheManager(DeltaKVCacheTritonManagerV4):
         existing_center_slots: torch.Tensor,
         cluster_step: int,
         new_center_rel: torch.Tensor | None = None,
+        validate_centers: bool = True,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         assert kv_states.dim() == 3 and kv_states.shape[0] == 1
         _, n, kv_dim = kv_states.shape
         l_idx = self.deltakv_layer_to_idx[layer_idx]
         k_neighbors = int(self.config.deltakv_k_neighbors)
         existing_centers = (
-            self._gather_sparse_ref_raw_kv_by_slots(l_idx, existing_center_slots).unsqueeze(0)
+            self._gather_sparse_ref_raw_kv_by_slots(
+                l_idx,
+                existing_center_slots,
+                validate=validate_centers,
+            ).unsqueeze(0)
             if existing_center_slots.numel() > 0
             else kv_states.new_zeros((1, 0, kv_dim))
         )
@@ -2348,6 +2348,8 @@ class DeltaKVLessMemoryCacheManager(DeltaKVCacheTritonManagerV4):
             new_center_rel = new_center_rel.to(device=kv_states.device, dtype=torch.long)
         capturing = self._is_stream_capturing()
         if (
+            validate_centers
+            and
             not capturing
             and new_center_rel.numel() > 0
             and ((new_center_rel < 0).any() or (new_center_rel >= n).any())
@@ -2389,14 +2391,18 @@ class DeltaKVLessMemoryCacheManager(DeltaKVCacheTritonManagerV4):
                 mask_new = cols <= rows
                 scores[:, :, m0:].masked_fill_(~mask_new.unsqueeze(0), float("-inf"))
 
-            topk_indices_chunk = scores.topk(k=k_eff, dim=-1).indices
+            topk_indices_chunk = scores.topk(k=k_eff, dim=-1, sorted=False).indices
             gather_idx = topk_indices_chunk.reshape(1, -1)[:, :, None].expand(-1, -1, kv_dim)
             base_chunk = all_centers.gather(1, gather_idx).view(1, end - start, k_eff, kv_dim).mean(dim=2)
             topk_chunks.append(topk_indices_chunk)
             base_chunks.append(base_chunk)
 
-        topk_indices = torch.cat(topk_chunks, dim=1)
-        base = torch.cat(base_chunks, dim=1)
+        if len(topk_chunks) == 1:
+            topk_indices = topk_chunks[0]
+            base = base_chunks[0]
+        else:
+            topk_indices = torch.cat(topk_chunks, dim=1)
+            base = torch.cat(base_chunks, dim=1)
         return topk_indices.squeeze(0).to(torch.int32), base
 
     def _deltakv_reconstruct_writeback(
@@ -2749,7 +2755,7 @@ class DeltaKVLessMemoryCacheManager(DeltaKVCacheTritonManagerV4):
         k_eff = min(k_neighbors, all_centers.shape[1])
         if k_eff <= 0:
             raise RuntimeError("Full-layer residual quantization: no available centers to assign.")
-        topk_indices = scores.topk(k=k_eff, dim=-1).indices
+        topk_indices = scores.topk(k=k_eff, dim=-1, sorted=False).indices
         gather_idx = topk_indices.view(1, -1)[:, :, None].expand(-1, -1, kv_dim)
         base = all_centers.gather(1, gather_idx).view(1, n, k_eff, kv_dim).mean(dim=2)
         return topk_indices.squeeze(0).to(torch.int32), base
@@ -3103,28 +3109,28 @@ class DeltaKVLessMemoryCacheManager(DeltaKVCacheTritonManagerV4):
             with profiler.record("deltakv_less_memory_full_layer_kivi_alloc_blocks"):
                 block_slots = self._allocate_full_layer_kivi_blocks(num_blocks).to(torch.int32)
             with profiler.record("deltakv_less_memory_full_layer_kivi_store_blocks"):
-                for block_i in range(num_blocks):
-                    start = quant_start + block_i * group_size
-                    end = start + group_size
-                    block_slot = block_slots[block_i]
-                    block_raw_slots = self.full_layer_slots_map[row_idx, start:end].to(torch.int32)
-                    if (block_raw_slots < 0).any():
-                        raise RuntimeError("Full-layer KIVI block contains missing raw slots.")
-                    raw_i64 = block_raw_slots.to(torch.long)
-                    for layer_idx in self.full_layer_ids:
-                        l_idx = self.full_layer_to_idx[layer_idx]
-                        self._store_full_layer_kivi_block(
-                            l_idx=l_idx,
-                            block_slot=block_slot,
-                            key_post_rope=self.full_kv_cache[0, l_idx, raw_i64],
-                            value=self.full_kv_cache[1, l_idx, raw_i64],
-                        )
-                    pos = torch.arange(start, end, device=self.device, dtype=torch.long)
-                    self.full_layer_kivi_block_slots_map[row_idx, pos] = block_slot
-                    self.full_layer_kivi_block_start_pos[block_slot.to(torch.long)] = int(start)
+                block_starts = torch.arange(
+                    quant_start,
+                    quant_end,
+                    group_size,
+                    device=self.device,
+                    dtype=torch.long,
+                )
+                block_raw_slots = slots.reshape(num_blocks, group_size)
+                raw_i64 = block_raw_slots.to(torch.long)
+                for layer_idx in self.full_layer_ids:
+                    l_idx = self.full_layer_to_idx[layer_idx]
+                    self._store_full_layer_kivi_blocks(
+                        l_idx=l_idx,
+                        block_slots=block_slots,
+                        key_post_rope=self.full_kv_cache[0, l_idx, raw_i64],
+                        value=self.full_kv_cache[1, l_idx, raw_i64],
+                    )
+                self.full_layer_kivi_block_slots_map[row_idx, quant_start:quant_end] = block_slots.repeat_interleave(group_size)
+                self.full_layer_kivi_block_start_pos[block_slots.to(torch.long)] = block_starts.to(torch.int32)
 
             with profiler.record("deltakv_less_memory_full_layer_kivi_free_slots"):
-                free_slots = slots.to(torch.int32)
+                free_slots = slots
                 ptr = self._num_free_slots_full
                 self.free_slots_stack_full[ptr: ptr + free_slots.numel()] = free_slots
                 self._num_free_slots_full += free_slots.numel()
@@ -3132,6 +3138,47 @@ class DeltaKVLessMemoryCacheManager(DeltaKVCacheTritonManagerV4):
                 self.full_layer_slots_map[row_idx, quant_start:quant_end] = -1
                 self.row_full_layer_kivi_quantized_lens[row_idx] = int(quant_end)
                 self.row_full_layer_kivi_quantized_lens_gpu[row_idx] = int(quant_end)
+
+    def _validate_live_deltakv_center_slots(
+        self,
+        slots: torch.Tensor,
+        *,
+        row_idx: int,
+        total_len: int,
+        compressed_len: int,
+        evict_start: int,
+        evict_end: int,
+        label: str,
+        layer_idx: int | None = None,
+    ):
+        if slots.numel() == 0:
+            return
+        slot_to_pos_len = int(self.deltakv_slot_to_pos.numel())
+        out_of_range = (slots < 0) | (slots >= slot_to_pos_len)
+        layer_text = "" if layer_idx is None else f" layer={layer_idx}"
+        if out_of_range.any():
+            bad = slots[out_of_range][:16].detach().cpu().tolist()
+            raise RuntimeError(
+                f"DeltaKV less-memory eviction {label} center slots are out of range before slot_to_pos lookup: "
+                f"row={row_idx}{layer_text} total_len={total_len} compressed_len={compressed_len} "
+                f"evict=({evict_start},{evict_end}) slot_to_pos_len={slot_to_pos_len} bad_slots={bad}."
+            )
+        pos = self.deltakv_slot_to_pos[slots.to(torch.long)]
+        missing_pos = pos < 0
+        if missing_pos.any():
+            bad_slots = slots[missing_pos][:16]
+            bad = bad_slots.detach().cpu().tolist()
+            debug = self._describe_deltakv_full_slots_for_debug(
+                bad_slots,
+                row_idx=row_idx,
+                total_len=total_len,
+            )
+            raise RuntimeError(
+                f"DeltaKV less-memory eviction found {label} center slots without live positions: "
+                f"row={row_idx}{layer_text} total_len={total_len} compressed_len={compressed_len} "
+                f"evict=({evict_start},{evict_end}) num_slots={int(slots.numel())} "
+                f"num_invalid={int(missing_pos.sum().item())} bad_slots={bad}. {debug}"
+            )
 
     @torch.no_grad()
     def deltakv_evict(self, seqs: list[Sequence]):
@@ -3201,7 +3248,6 @@ class DeltaKVLessMemoryCacheManager(DeltaKVCacheTritonManagerV4):
 
                     is_center = torch.zeros((evict_len,), device=self.device, dtype=torch.bool)
                     is_center[center_rel] = True
-                    to_store_mask = torch.ones((evict_len,), device=self.device, dtype=torch.bool)
                     to_free_mask = ~is_center
 
                 with profiler.record("deltakv_less_memory_evict_alloc_latent"):
@@ -3210,85 +3256,46 @@ class DeltaKVLessMemoryCacheManager(DeltaKVCacheTritonManagerV4):
                     pos_to_free = pos_all[to_free_mask]
                     self.sparse_layer_latent_slots_map[row_idx, pos_all.to(torch.long)] = latent_slots
                     raw_slots_block_i32 = raw_slots_block.to(torch.int32)
+                    raw_slots_block_i64 = raw_slots_block_i32.to(torch.long)
 
+                with profiler.record("deltakv_less_memory_evict_validate_new_centers"):
+                    self._validate_live_deltakv_center_slots(
+                        new_center_slots,
+                        row_idx=row_idx,
+                        total_len=total_len,
+                        compressed_len=compressed_len,
+                        evict_start=evict_start,
+                        evict_end=evict_end,
+                        label="new",
+                    )
+                with profiler.record("deltakv_less_memory_evict_validate_centers"):
+                    existing_center_values = [slots for slots in prev_center_slots_by_layer.values() if slots.numel() > 0]
+                    if existing_center_values:
+                        self._validate_live_deltakv_center_slots(
+                            torch.cat(existing_center_values, dim=0),
+                            row_idx=row_idx,
+                            total_len=total_len,
+                            compressed_len=compressed_len,
+                            evict_start=evict_start,
+                            evict_end=evict_end,
+                            label="existing",
+                        )
+
+                shared_existing_center_slots = prev_center_slots_by_layer[self.deltakv_layer_ids[0]]
+                shared_all_center_slots = torch.cat([shared_existing_center_slots, new_center_slots], dim=0)
+                kv_dim_half = self.num_kv_heads * self.head_dim
                 for layer_idx in self.deltakv_layer_ids:
                     l_idx = self.deltakv_layer_to_idx[layer_idx]
                     k_cache = self.deltakv_full_kv_cache[0, l_idx]
                     v_cache = self.deltakv_full_kv_cache[1, l_idx]
                     existing_center_slots = prev_center_slots_by_layer[layer_idx]
-                    with profiler.record("deltakv_less_memory_evict_validate_centers"):
-                        if existing_center_slots.numel() > 0:
-                            min_slot = int(existing_center_slots.min().item())
-                            max_slot = int(existing_center_slots.max().item())
-                            if min_slot < 0 or max_slot >= int(self.deltakv_slot_to_pos.numel()):
-                                bad_mask = (existing_center_slots < 0) | (
-                                    existing_center_slots >= int(self.deltakv_slot_to_pos.numel())
-                                )
-                                bad = existing_center_slots[bad_mask][:16].detach().cpu().tolist()
-                                raise RuntimeError(
-                                    "DeltaKV less-memory eviction existing center slots are out of range before "
-                                    "slot_to_pos lookup: "
-                                    f"row={row_idx} layer={layer_idx} total_len={total_len} "
-                                    f"compressed_len={compressed_len} evict=({evict_start},{evict_end}) "
-                                    f"slot_range=({min_slot},{max_slot}) "
-                                    f"slot_to_pos_len={int(self.deltakv_slot_to_pos.numel())} "
-                                    f"bad_slots={bad}."
-                                )
-                            existing_pos = self.deltakv_slot_to_pos[existing_center_slots.to(torch.long)]
-                            invalid_existing = existing_pos < 0
-                            if invalid_existing.any():
-                                bad = existing_center_slots[invalid_existing][:16].detach().cpu().tolist()
-                                debug = self._describe_deltakv_full_slots_for_debug(
-                                    existing_center_slots[invalid_existing][:16],
-                                    row_idx=row_idx,
-                                    total_len=total_len,
-                                )
-                                raise RuntimeError(
-                                    "DeltaKV less-memory eviction found stale existing center slots: "
-                                    f"row={row_idx} layer={layer_idx} total_len={total_len} "
-                                    f"compressed_len={compressed_len} evict=({evict_start},{evict_end}) "
-                                    f"num_existing={int(existing_center_slots.numel())} "
-                                    f"num_invalid={int(invalid_existing.sum().item())} "
-                                    f"bad_slots={bad}. {debug}"
-                                )
-                        if new_center_slots.numel() > 0:
-                            min_slot = int(new_center_slots.min().item())
-                            max_slot = int(new_center_slots.max().item())
-                            if min_slot < 0 or max_slot >= int(self.deltakv_slot_to_pos.numel()):
-                                bad_mask = (new_center_slots < 0) | (
-                                    new_center_slots >= int(self.deltakv_slot_to_pos.numel())
-                                )
-                                bad = new_center_slots[bad_mask][:16].detach().cpu().tolist()
-                                raise RuntimeError(
-                                    "DeltaKV less-memory eviction selected out-of-range new center slots before "
-                                    "slot_to_pos lookup: "
-                                    f"row={row_idx} layer={layer_idx} total_len={total_len} "
-                                    f"compressed_len={compressed_len} evict=({evict_start},{evict_end}) "
-                                    f"slot_range=({min_slot},{max_slot}) "
-                                    f"slot_to_pos_len={int(self.deltakv_slot_to_pos.numel())} "
-                                    f"bad_slots={bad}."
-                                )
-                            new_pos = self.deltakv_slot_to_pos[new_center_slots.to(torch.long)]
-                            invalid_new = new_pos < 0
-                            if invalid_new.any():
-                                bad = new_center_slots[invalid_new][:16].detach().cpu().tolist()
-                                debug = self._describe_deltakv_full_slots_for_debug(
-                                    new_center_slots[invalid_new][:16],
-                                    row_idx=row_idx,
-                                    total_len=total_len,
-                                )
-                                raise RuntimeError(
-                                    "DeltaKV less-memory eviction selected new center slots without positions: "
-                                    f"row={row_idx} layer={layer_idx} total_len={total_len} "
-                                    f"compressed_len={compressed_len} evict=({evict_start},{evict_end}) "
-                                    f"bad_slots={bad}. {debug}"
-                                )
                     with profiler.record("deltakv_less_memory_evict_gather_raw"):
-                        kv_block = self._deltakv_gather_raw_kv_from_cache(
-                            slots=raw_slots_block_i32,
-                            pos=pos_all,
-                            k_cache=k_cache,
-                            v_cache=v_cache,
+                        kv_block = torch.cat(
+                            [
+                                k_cache[raw_slots_block_i64].reshape(-1, kv_dim_half),
+                                v_cache[raw_slots_block_i64].reshape(-1, kv_dim_half),
+                            ],
+                            dim=-1,
                         ).unsqueeze(0)
 
                     with profiler.record("deltakv_less_memory_evict_cluster"):
@@ -3298,11 +3305,11 @@ class DeltaKVLessMemoryCacheManager(DeltaKVCacheTritonManagerV4):
                             existing_center_slots=existing_center_slots,
                             cluster_step=cluster_step,
                             new_center_rel=center_rel,
+                            validate_centers=False,
                         )
 
                     with profiler.record("deltakv_less_memory_evict_store_fathers"):
-                        all_center_slots = torch.cat([existing_center_slots, new_center_slots], dim=0)
-                        father_slots_full = all_center_slots[topk_center_indices.to(torch.long)]
+                        father_slots_full = shared_all_center_slots[topk_center_indices.to(torch.long)]
                         father_slots = father_slots_full
                         K = self.deltakv_latent_to_full_slots.shape[-1]
                         k_eff = father_slots.shape[1]
@@ -3319,7 +3326,7 @@ class DeltaKVLessMemoryCacheManager(DeltaKVCacheTritonManagerV4):
                             latent_slots=latent_slots,
                             kv_block=kv_block,
                             base_kv=base_kv,
-                            to_compress_mask=to_store_mask,
+                            store_all=True,
                         )
 
                 for layer_idx in self.deltakv_layer_ids:
@@ -3328,11 +3335,7 @@ class DeltaKVLessMemoryCacheManager(DeltaKVCacheTritonManagerV4):
                     ).clone()
 
                 with profiler.record("deltakv_less_memory_evict_free_full_slots"):
-                    free_slots = self._filter_deltakv_center_slots_for_evict_free(
-                        row_idx,
-                        raw_slots_block_i32[to_free_mask],
-                        extra_center_slots=new_center_slots,
-                    )
+                    free_slots = raw_slots_block_i32[to_free_mask]
                     self._debug_track_deltakv_full_slots(
                         free_slots,
                         "evict_free_compressed",
@@ -3405,7 +3408,7 @@ class DeltaKVLessMemoryCacheManager(DeltaKVCacheTritonManagerV4):
             if center_rel.numel() > 0:
                 is_center[center_rel] = True
             to_compress_mask = ~is_center
-            num_to_compress = int(to_compress_mask.sum().item())
+            num_to_compress = int(evict_len) - int(center_rel.numel())
             if num_to_compress <= 0:
                 for layer_idx in self.full_layer_ids:
                     self.row_deltakv_center_slots[row_idx][layer_idx] = torch.cat(
@@ -3635,25 +3638,27 @@ class DeltaKVLessMemoryCacheManager(DeltaKVCacheTritonManagerV4):
                     raise RuntimeError("DeltaKV less-memory: missing father slots for reconstruction.")
 
                 cos_sin = self.cos_sin_cache[:, 0, :]
-                kv_delta = self._load_residual(l_idx, safe_recon_latent, kv_dim)
-                self._deltakv_reconstruct_writeback(
-                    kv_delta=kv_delta,
-                    father_slots=father_slots,
-                    slot_to_pos=self.deltakv_slot_to_pos,
-                    out_slots=recon_out_slot,
-                    out_pos=recon_pos,
-                    cos_sin=cos_sin,
-                    k_cache=k_cache,
-                    v_cache=v_cache,
-                    l_idx=l_idx,
-                )
+                with profiler.record("deltakv_less_memory_reconstruct_load_residual"):
+                    kv_delta = self._load_residual(l_idx, safe_recon_latent, kv_dim)
+                with profiler.record("deltakv_less_memory_reconstruct_writeback"):
+                    self._deltakv_reconstruct_writeback(
+                        kv_delta=kv_delta,
+                        father_slots=father_slots,
+                        slot_to_pos=self.deltakv_slot_to_pos,
+                        out_slots=recon_out_slot,
+                        out_pos=recon_pos,
+                        cos_sin=cos_sin,
+                        k_cache=k_cache,
+                        v_cache=v_cache,
+                        l_idx=l_idx,
+                    )
 
             static_decode = not get_context().is_prefill
             if static_decode:
                 attn_active_slots = active_slots
                 materialized_temp_slots = torch.empty((0,), device=active_slots.device, dtype=torch.int32)
             else:
-                self._set_postrope_slots(layer_idx, recon_out_slot)
+                self._set_postrope_slots(layer_idx, recon_out_slot, validate=False)
                 attn_active_slots = active_slots.clone()
                 attn_active_slots, materialized_temp_slots = self._materialize_deltakv_active_postrope_view(
                     layer_idx,
@@ -3661,15 +3666,12 @@ class DeltaKVLessMemoryCacheManager(DeltaKVCacheTritonManagerV4):
                     new_context_lens,
                     recon_out_slot,
                 )
-            postrope_slots = recon_out_slot
             if materialized_temp_slots.numel() > 0:
-                postrope_slots = torch.cat((postrope_slots, materialized_temp_slots.to(postrope_slots.device)), dim=0)
-            postrope_by_layer = getattr(self, "_deltakv_postrope_slots_by_layer", None)
-            if postrope_by_layer is None:
-                postrope_by_layer = {}
-                self._deltakv_postrope_slots_by_layer = postrope_by_layer
-            postrope_by_layer[int(layer_idx)] = postrope_slots
-            self._set_postrope_slots(layer_idx, postrope_slots)
+                postrope_slots = torch.cat((recon_out_slot, materialized_temp_slots.to(recon_out_slot.device)), dim=0)
+            else:
+                postrope_slots = recon_out_slot
+            with profiler.record("deltakv_less_memory_reconstruct_mark_postrope"):
+                self._set_postrope_slots(layer_idx, postrope_slots, validate=False)
             returned_temp_slots = []
             if materialized_temp_slots.numel() > 0:
                 returned_temp_slots.append(materialized_temp_slots.to(temp_slots.device))
