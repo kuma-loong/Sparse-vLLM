@@ -21,6 +21,7 @@ from deltakv.configs.default_paths import compressor_path, model_path, output_pa
 from deltakv.get_chat_api import get_generate_api
 from benchmark.long_bench.pred import build_chat
 from sparsevllm.config import Config
+from sparsevllm.engine.cache_manager.raw_kv_offload import resolve_long_prefill_offload_min_tokens
 from sparsevllm.engine.model_runner import ModelRunner
 from sparsevllm.engine.sequence import Sequence
 from sparsevllm.method_registry import (
@@ -2062,6 +2063,11 @@ def _sparse_prefill_chunk_size(config: Config, seq: Sequence) -> int:
     if config.prefill_schedule_policy == PREFILL_POLICY_LONG_BS1FULL_SHORT_BATCH:
         threshold = _sparse_long_text_threshold(config, is_prefill=True)
         if int(seq.num_prompt_tokens) > int(threshold):
+            if (
+                is_deltakv_method(config.vllm_sparse_method)
+                and int(seq.num_prompt_tokens) >= resolve_long_prefill_offload_min_tokens()
+            ):
+                return min(int(config.chunk_prefill_size), remaining)
             return remaining
         return min(int(config.chunk_prefill_size), remaining)
 
