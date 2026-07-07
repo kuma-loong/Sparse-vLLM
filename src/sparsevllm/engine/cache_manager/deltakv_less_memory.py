@@ -1951,10 +1951,8 @@ class DeltaKVLessMemoryCacheManager(DeltaKVCacheTritonManagerV4):
             k_hist = self.deltakv_prefill_staging_pre_rope_k_cache[:start]
             with profiler.record("deltakv_long_prefill_offload_restore_sparse_rerope"):
                 pos = torch.arange(start, dtype=torch.long, device=self.device)
-                cos_sin = self.cos_sin_cache[pos]
-                cos, sin = cos_sin.chunk(2, dim=-1)
                 k_normed = self._apply_sparse_k_norm_if_needed(l_idx, k_hist)
-                k_postrope = apply_rotary_emb(k_normed, cos, sin)
+                k_postrope = self._apply_sparse_rope_to_key(pos, k_normed)
                 self.deltakv_prefill_staging_kv_cache[0, :start] = k_postrope.to(
                     self.deltakv_prefill_staging_kv_cache.dtype
                 )

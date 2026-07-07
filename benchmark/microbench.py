@@ -415,6 +415,13 @@ def benchmark_task(method, length, bs, args, results_dict):
     resolved_engine_config: dict[str, Any] = {}
     try:
         m_len = length + args.output_len + 100
+        if args.max_model_len_override is not None:
+            if args.max_model_len_override < length + args.output_len:
+                raise ValueError(
+                    "max_model_len_override must be >= length + output_len; "
+                    f"got {args.max_model_len_override} < {length + args.output_len}."
+                )
+            m_len = int(args.max_model_len_override)
         # Note: max_model_len is derived from (length, bs, output_len, engine_prefill_chunk_size).
         # They can be passed in --hyper_params, but will be overwritten here to keep the benchmark consistent.
         hyper_params = dict(base_hyper_params)
@@ -685,6 +692,12 @@ def main():
         ),
     )
     parser.add_argument("--output_len", type=int, default=512, help="Output tokens per request")
+    parser.add_argument(
+        "--max_model_len_override",
+        type=int,
+        default=None,
+        help="Optional fixed max_model_len for diagnostic runs; defaults to length + output_len + 100.",
+    )
     parser.add_argument(
         "--temperature",
         type=float,

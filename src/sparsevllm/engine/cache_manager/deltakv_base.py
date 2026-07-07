@@ -648,6 +648,9 @@ class DeltaKVCacheManager(CacheManager):
         x = x * torch.rsqrt(var + float(getattr(self, "deltakv_k_norm_eps", 1e-6) or 1e-6))
         return x.to(orig_dtype) * weight[int(l_idx)].to(dtype=orig_dtype)
 
+    def _apply_sparse_rope_to_key(self, positions: torch.Tensor, key: torch.Tensor) -> torch.Tensor:
+        return self.rotary_emb(positions, key, key)[1]
+
     def get_layer_store_tensors(
         self,
         layer_idx: int,

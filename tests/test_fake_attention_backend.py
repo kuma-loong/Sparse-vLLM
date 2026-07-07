@@ -98,6 +98,41 @@ class FakeAttentionBackendTest(unittest.TestCase):
         self.assertTrue(torch.equal(out, q))
         self.assertTrue(torch.equal(attn_score, torch.zeros_like(attn_score)))
 
+    def test_fake_prefill_only_keeps_decode_kernels(self):
+        os.environ["SPARSEVLLM_FAKE_PREFILL_ATTENTION"] = "1"
+        os.environ.pop("SPARSEVLLM_FAKE_ATTENTION", None)
+        os.environ.pop("SPARSEVLLM_FAKE_DECODE_ATTENTION", None)
+        q = torch.arange(8, dtype=torch.float32).view(1, 2, 4)
+        attn_score = torch.full((1, 2, 3), -1e20)
+        view = self._make_decode_view(attn_score=attn_score)
+        calls = []
+
+        def stage1(*args, **kwargs):
+            calls.append("stage1")
+
+        def stage2(mid_o, mid_o_logexpsum, context_lens, out, block_seq):
+            calls.append("stage2")
+            out.zero_()
+
+        with (
+            patch("sparsevllm.layers.attention_backend.gqa_flash_decode_stage1_with_score", side_effect=stage1),
+            patch("sparsevllm.layers.attention_backend.flash_decode_stage2", side_effect=stage2),
+        ):
+            out = TritonAttentionBackend().run_decode(
+                q,
+                view,
+                mid_o=torch.empty(1, 2, 1, 4),
+                mid_o_logexpsum=torch.empty(1, 2, 1),
+                max_len_in_batch=3,
+                block_seq=256,
+                num_heads=2,
+                num_kv_heads=1,
+            )
+
+        self.assertEqual(calls, ["stage1", "stage2"])
+        self.assertTrue(torch.equal(out, torch.zeros_like(q)))
+        self.assertTrue(torch.equal(attn_score, torch.full_like(attn_score, -1e20)))
+
 
 if __name__ == "__main__":
     unittest.main()

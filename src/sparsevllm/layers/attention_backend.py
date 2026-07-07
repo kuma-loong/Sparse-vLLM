@@ -23,6 +23,16 @@ def _fake_attention_enabled() -> bool:
     return value.lower() in {"1", "true", "yes", "on"}
 
 
+def _fake_prefill_attention_enabled() -> bool:
+    value = os.environ.get("SPARSEVLLM_FAKE_PREFILL_ATTENTION", "")
+    return value.lower() in {"1", "true", "yes", "on"} or _fake_attention_enabled()
+
+
+def _fake_decode_attention_enabled() -> bool:
+    value = os.environ.get("SPARSEVLLM_FAKE_DECODE_ATTENTION", "")
+    return value.lower() in {"1", "true", "yes", "on"} or _fake_attention_enabled()
+
+
 def _fake_attention_output(q: torch.Tensor) -> torch.Tensor:
     mode = os.environ.get("SPARSEVLLM_FAKE_ATTENTION_MODE", "zero").strip().lower()
     if mode in {"zero", "zeros"}:
@@ -57,7 +67,7 @@ class TritonAttentionBackend:
         b_seq_len = view.context_lens
         b_prompt_cache_len = b_seq_len - chunk_lens
         self._debug_check_prefill_bounds(q, view, chunk_lens=chunk_lens)
-        if _fake_attention_enabled():
+        if _fake_prefill_attention_enabled():
             _fill_fake_attention_score(view.attn_score)
             return _fake_attention_output(q)
         o = torch.empty_like(q)
@@ -148,7 +158,7 @@ class TritonAttentionBackend:
         num_heads: int,
         num_kv_heads: int,
     ) -> torch.Tensor:
-        if _fake_attention_enabled():
+        if _fake_decode_attention_enabled():
             _fill_fake_attention_score(view.attn_score)
             return _fake_attention_output(q)
         if view.backend == "full_layer_kivi":

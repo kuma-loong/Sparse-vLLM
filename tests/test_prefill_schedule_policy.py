@@ -1925,6 +1925,78 @@ class DeltaKVFullPrefillStagingTest(unittest.TestCase):
 
 
 class DeltaKVLessMemoryStorageContractTest(unittest.TestCase):
+    def test_sparse_rope_to_key_uses_rotary_embedding_forward(self):
+        manager = object.__new__(DeltaKVLessMemoryCacheManager)
+        key = torch.arange(8, dtype=torch.float32).view(2, 1, 4)
+        positions = torch.tensor([0, 1], dtype=torch.long)
+        calls = []
+
+        class FakeRotaryEmbedding:
+            def __call__(self, pos, query, key_arg):
+                calls.append((pos, query, key_arg))
+                return query + 1, key_arg + 7
+
+        manager.rotary_emb = FakeRotaryEmbedding()
+        out = DeltaKVLessMemoryCacheManager._apply_sparse_rope_to_key(manager, positions, key)
+
+        self.assertEqual(len(calls), 1)
+        self.assertIs(calls[0][0], positions)
+        self.assertIs(calls[0][1], key)
+        self.assertIs(calls[0][2], key)
+        torch.testing.assert_close(out, key + 7)
+
+    def test_rotary_embedding_forward_uses_single_eager_path(self):
+        from sparsevllm.layers.rotary_embedding import RotaryEmbedding
+
+        rotary_emb = RotaryEmbedding(head_size=4, rotary_dim=4, max_position_embeddings=2, base=10000.0)
+        positions = torch.tensor([0, 1], dtype=torch.long)
+        query = torch.zeros((2, 1, 4), dtype=torch.float32)
+        key = torch.ones((2, 1, 4), dtype=torch.float32)
+        calls = []
+
+        def fake_apply_rotary_emb(x, cos, sin):
+            calls.append((x, cos, sin))
+            return x + len(calls)
+
+        with patch("sparsevllm.layers.rotary_embedding.apply_rotary_emb", fake_apply_rotary_emb):
+            query_out, key_out = rotary_emb(positions, query, key)
+
+        self.assertFalse(hasattr(rotary_emb, "compiled_forward"))
+        self.assertEqual(len(calls), 2)
+        self.assertIs(calls[0][0], query)
+        self.assertIs(calls[1][0], key)
+        torch.testing.assert_close(query_out, query + 1)
+        torch.testing.assert_close(key_out, key + 2)
+
+    def test_long_prefill_offload_sparse_restore_applies_rope_helper(self):
+        manager = object.__new__(DeltaKVLessMemoryCacheManager)
+        manager.device = "cpu"
+        manager._deltakv_long_prefill_offload_step_active = True
+        manager._deltakv_long_prefill_offload_start = 2
+        manager._deltakv_long_prefill_offload_row_idx = 0
+        manager.has_prefill_staging_view = lambda layer_idx: True
+        manager._deltakv_long_prefill_offload_kind = lambda layer_idx: "sparse_pre_rope"
+        manager._deltakv_consume_long_prefill_offload_staged_prefetch = lambda **kwargs: True
+        manager.deltakv_layer_to_idx = {1: 0}
+        manager.deltakv_prefill_staging_pre_rope_k_cache = torch.arange(16, dtype=torch.float32).view(4, 1, 4)
+        manager.deltakv_prefill_staging_kv_cache = torch.zeros((2, 4, 1, 4), dtype=torch.float32)
+        manager._apply_sparse_k_norm_if_needed = lambda l_idx, k: k + 1
+        rope_calls = []
+
+        def fake_apply_sparse_rope_to_key(pos, key):
+            rope_calls.append((pos, key.clone()))
+            return key + 100
+
+        manager._apply_sparse_rope_to_key = fake_apply_sparse_rope_to_key
+
+        DeltaKVLessMemoryCacheManager.before_prefill_layer_attention(manager, 1, None)
+
+        self.assertEqual(len(rope_calls), 1)
+        torch.testing.assert_close(rope_calls[0][0], torch.tensor([0, 1], dtype=torch.long))
+        expected_normed = manager.deltakv_prefill_staging_pre_rope_k_cache[:2] + 1
+        torch.testing.assert_close(rope_calls[0][1], expected_normed)
+        torch.testing.assert_close(manager.deltakv_prefill_staging_kv_cache[0, :2], expected_normed + 100)
+
     def test_long_prefill_offload_prefetch_waits_for_current_stream_before_staging_write(self):
         manager = object.__new__(DeltaKVLessMemoryCacheManager)
         manager.device = "cuda:0"
