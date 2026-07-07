@@ -293,6 +293,17 @@ class DeltaKVLessMemoryCacheManager(DeltaKVCacheTritonManagerV4):
             and layer_idx in self.full_layer_to_idx
         )
 
+    def prefill_step_free_slots_for(self, seq: Sequence) -> int:
+        if self.should_schedule_full_prefill(seq):
+            staging_slots = int(getattr(self, "deltakv_prefill_staging_num_slots", 0) or 0)
+            return max(0, staging_slots - int(seq.num_prefilled_tokens))
+        return super().prefill_step_free_slots_for(seq)
+
+    def prefill_step_reservation_cost(self, seq: Sequence, scheduled_tokens: int) -> int:
+        if self.should_schedule_full_prefill(seq):
+            return 0
+        return super().prefill_step_reservation_cost(seq, scheduled_tokens)
+
     def prepare_step(self, seqs: list[Sequence], is_prefill: bool):
         self._deltakv_less_memory_prepare_seqs = seqs
         self._deltakv_less_memory_prepare_full_prefill_staging = bool(

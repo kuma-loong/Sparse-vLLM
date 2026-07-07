@@ -330,7 +330,13 @@ class Scheduler:
                     self.memory_oracle.refresh_prefix_cache_hit(seq)
                 remaining_prefill_tokens = self.memory_oracle.remaining_prefill_tokens(seq)
                 candidate_step_free_count = int(self.memory_oracle.prefill_step_free_slots_for(seq))
-                if not self._requires_long_prefill_offload(seq):
+                uses_full_prefill_staging = bool(
+                    self.memory_oracle.should_schedule_full_prefill(seq)
+                )
+                if (
+                    not self._requires_long_prefill_offload(seq)
+                    and not uses_full_prefill_staging
+                ):
                     candidate_step_free_count = min(int(step_free_count), int(candidate_step_free_count))
 
                 # 异常处理：如果由于某种原因已经 prefill 完却还在 waiting 队列

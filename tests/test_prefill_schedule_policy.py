@@ -1620,6 +1620,44 @@ class SchedulerPrefillPolicyTest(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "No prefill candidate can use"):
             scheduler.schedule()
 
+    def test_full_prefill_staging_candidate_uses_candidate_budget(self):
+        class StagingOracle(FakeMemoryOracle):
+            def __init__(self):
+                super().__init__(
+                    free_slots=73,
+                    step_free_slots=73,
+                    force_full_prefill=True,
+                    force_whole_prefill=True,
+                )
+
+            def prefill_step_free_slots_for(self, seq):
+                return 32768
+
+            def prefill_step_reservation_cost(self, seq, scheduled_tokens):
+                return 0
+
+            def prompt_admission_costs(self, seq):
+                return {"slots": 0}
+
+            def prompt_logical_reservation_cost(self, seq):
+                return 0
+
+        scheduler = make_scheduler_with_oracle(
+            PREFILL_POLICY_LONG_BS1FULL_SHORT_BATCH,
+            StagingOracle(),
+            method="deltakv",
+            chunk=32768,
+            max_tokens=65536,
+        )
+        scheduler.add(seq_with_len(16000))
+
+        scheduled, is_prefill, preempted = scheduler.schedule()
+
+        self.assertTrue(is_prefill)
+        self.assertEqual(preempted, [])
+        self.assertEqual(len(scheduled), 1)
+        self.assertEqual(scheduled[0].current_chunk_size, 16000)
+
     def test_sequence_setstate_round_trips_prefix_cache_block_metadata(self):
         seq = seq_with_len(4)
         seq.current_chunk_size = 4
@@ -2047,6 +2085,14 @@ class DeltaKVLessMemoryStorageContractTest(unittest.TestCase):
 
         seq = seq_with_len(11766)
         self.assertTrue(DeltaKVLessMemoryCacheManager.should_schedule_full_prefill(manager, seq))
+        self.assertEqual(
+            DeltaKVLessMemoryCacheManager.prefill_step_free_slots_for(manager, seq),
+            32768,
+        )
+        self.assertEqual(
+            DeltaKVLessMemoryCacheManager.prefill_step_reservation_cost(manager, seq, 11766),
+            0,
+        )
 
         tiny = seq_with_len(16)
         self.assertFalse(DeltaKVLessMemoryCacheManager.should_schedule_full_prefill(manager, tiny))
