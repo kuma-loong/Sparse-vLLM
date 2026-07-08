@@ -1,6 +1,6 @@
 ---
 name: code-review
-description: Review Sparse-vLLM diffs for correctness, sparse-runtime architecture, scheduling semantics, reproducibility, performance, and tests. Use when reviewing PRs, git diffs, sparse method integrations, cache-manager or scheduler changes, benchmark/evaluation scripts, or when the user asks for a code review; if no range is specified, diff the current branch against main.
+description: Review Sparse-vLLM diffs for correctness, sparse-runtime architecture, scheduling semantics, reproducibility, public documentation hygiene, performance, and tests. Use when reviewing PRs, git diffs, sparse method integrations, cache-manager or scheduler changes, benchmark/evaluation scripts, docs changes, or when the user asks for a code review; if no range is specified, diff the current branch against main.
 ---
 
 # Code Review
@@ -37,6 +37,7 @@ Prioritize:
 - prefill policy, long/short split, and `long_bs1full_short_batch`
 - OpenAI-compatible request lifecycle, streaming, cancellation, and sampling contracts
 - research reproducibility and fail-fast behavior
+- public docs hygiene: stable user-facing docs must not contain local experiment ledgers, internal development notes, private paths, GPU occupancy notes, `scripts/tmp` launchers, uncommitted-worktree details, or agent/Codex workflow instructions
 - hot-path performance and tests
 
 ### Step 4: Report

@@ -63,6 +63,29 @@ Evaluation and benchmark code must not hide failures.
 - Keep retries, loops, API calls, parsing, and benchmark runs bounded.
 - Do not silently change metric definitions or sample inclusion.
 
+## Public Documentation Hygiene
+
+Public repo docs should read like stable user-facing project documentation, not
+developer scratch notes or private experiment ledgers.
+
+For docs changes, inspect `README.md`, `docs/`, `benchmark/*/README.md`, and
+`scripts/README.md` when they are in scope. Flag public-facing Markdown that:
+
+- Records chronological local runs, failed attempts, dated campaign notes, GPU
+  occupancy, or "worktree had uncommitted changes" details.
+- Embeds host-specific paths such as `/root/...`, `/home/<user>/...`,
+  `/data2/<user>/...`, AutoDL-specific defaults, or private artifact/log paths
+  instead of placeholders like `<MODEL_ROOT>`, `<DATA_ROOT>`, `<OUTPUT_ROOT>`,
+  and `<CHECKPOINT_ROOT>`.
+- Points users to `scripts/tmp`, personal launchers, private notes, Codex/agent
+  workflows, or repo-local skills from public README/docs.
+- Stores raw experiment result history in `docs/` instead of a stable runbook,
+  reproducibility checklist, methodology summary, or cited artifact output.
+
+It is acceptable for `AGENTS.md`, `.agents/`, and `skills/` to contain
+agent-facing instructions. The issue is exposing those details through public
+project docs.
+
 ## Performance and Validation
 
 Hot paths should avoid unnecessary CPU/GPU sync, host transfers, broad logging, repeated allocation, large tensor copies, and Python per-token loops. Kernel changes must preserve masks, bounds, block sizes, GQA/MHA behavior, and score collection.
