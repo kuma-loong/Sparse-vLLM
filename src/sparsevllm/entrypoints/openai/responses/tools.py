@@ -121,4 +121,3 @@ def _parse_tool_call_object(data: Any) -> ParsedToolCall:
     else:
         raise ToolCallParseError("tool call arguments must be a JSON object or JSON string.")
     return ParsedToolCall(name=name, arguments=arguments_text)
-

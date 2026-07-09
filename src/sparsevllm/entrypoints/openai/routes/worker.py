@@ -19,4 +19,3 @@ def worker_info(request: Request):
 @router.get("/v1/worker/load")
 async def worker_load(request: Request):
     return await serve_worker_load(request.app.state.dispatcher)
-

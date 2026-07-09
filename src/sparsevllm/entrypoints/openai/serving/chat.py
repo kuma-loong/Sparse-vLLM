@@ -359,4 +359,3 @@ async def _chat_completion_stream(
             time.perf_counter() - started if started is not None else 0.0,
         )
         raise
-

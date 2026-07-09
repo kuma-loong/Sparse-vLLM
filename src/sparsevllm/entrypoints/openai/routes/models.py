@@ -27,4 +27,3 @@ def models(request: Request):
             }
         ],
     }
-

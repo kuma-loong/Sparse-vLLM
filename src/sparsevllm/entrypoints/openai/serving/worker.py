@@ -24,4 +24,3 @@ async def serve_worker_load(dispatcher: AsyncEngineDispatcher):
 def _worker_tags() -> list[str]:
     raw = os.getenv("SPARSEVLLM_WORKER_TAGS", "")
     return [tag.strip() for tag in raw.split(",") if tag.strip()]
-

@@ -36,4 +36,3 @@ class PrefixCacheSetEvictionPriorityRequest(BaseModel):
     token_ids: list[int] | None = None
     text: str | None = None
     priority: int
-

@@ -48,4 +48,3 @@ async def prefix_cache_set_eviction_priority(body: PrefixCacheSetEvictionPriorit
         request.app.state.dispatcher,
         request.app.state.engine.tokenizer,
     )
-

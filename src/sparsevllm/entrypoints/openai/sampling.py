@@ -99,4 +99,3 @@ def _coerce_cli_value(value: str) -> Any:
         return float(value)
     except ValueError:
         return value
-

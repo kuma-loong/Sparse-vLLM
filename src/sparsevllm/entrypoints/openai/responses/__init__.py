@@ -1,2 +1,1 @@
 """Responses API helpers."""
-

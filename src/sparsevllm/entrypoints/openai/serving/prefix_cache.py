@@ -139,4 +139,3 @@ async def _run_prefix_cache_control(
     if not isinstance(result, dict):
         raise HTTPException(status_code=500, detail=f"Prefix cache control returned non-object result: {type(result).__name__}.")
     return result
-

@@ -17,4 +17,3 @@ class CompletionRequest(BaseModel):
     ignore_eos: bool = False
     stop: str | list[str] | None = None
     logprobs: int | None = Field(default=None, ge=0, le=5)
-

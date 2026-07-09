@@ -1178,6 +1178,19 @@ class OpenAIAPIServerTest(unittest.IsolatedAsyncioTestCase):
                 ),
             )
 
+    def test_response_prompt_rejects_tool_history_without_template(self):
+        from sparsevllm.entrypoints.openai.api_server import ResponseRequest, _response_prompt
+
+        class Tokenizer:
+            chat_template = None
+
+        for item in [
+            {"type": "function_call", "call_id": "call_1", "name": "tool", "arguments": "{}"},
+            {"type": "function_call_output", "call_id": "call_1", "output": "{}"},
+        ]:
+            with self.assertRaisesRegex(ValueError, "tool-call history requires"):
+                _response_prompt(Tokenizer(), ResponseRequest(model="model", input=[item]))
+
     def test_response_reasoning_effort_conflicts_fail_fast(self):
         from fastapi import HTTPException
 

@@ -17,4 +17,3 @@ async def completions(body: CompletionRequest, request: Request):
         request.app.state.served_model_name,
         request.app.state.request_log_dir,
     )
-

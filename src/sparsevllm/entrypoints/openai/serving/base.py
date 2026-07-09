@@ -91,4 +91,3 @@ def _tokens_per_second(tokens: int, elapsed_s: float) -> float:
     if elapsed_s <= 0:
         return 0.0
     return tokens / elapsed_s
-

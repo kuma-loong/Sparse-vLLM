@@ -100,6 +100,8 @@ def _response_prompt(tokenizer: Any, request: ResponseRequest) -> str:
         raise ValueError("chat_template_kwargs requires a tokenizer chat_template.")
     if tools:
         raise ValueError("tools requires a tokenizer chat_template with tools support.")
+    if _messages_require_chat_template(messages):
+        raise ValueError("Responses tool-call history requires a tokenizer chat_template.")
     rendered = []
     for message in messages:
         rendered.append(f"{message['role']}: {message.get('content', '')}")
@@ -196,6 +198,10 @@ def _response_content_text(content: Any) -> str:
     raise ValueError("message.content must be a string or a text-only content part list.")
 
 
+def _messages_require_chat_template(messages: list[dict[str, Any]]) -> bool:
+    return any(message.get("role") == "tool" or message.get("tool_calls") for message in messages)
+
+
 def _supports_chat_template_kwarg(tokenizer: Any, name: str) -> bool:
     try:
         signature = inspect.signature(tokenizer.apply_chat_template)
@@ -205,4 +211,3 @@ def _supports_chat_template_kwarg(tokenizer: Any, name: str) -> bool:
         if parameter.kind == inspect.Parameter.VAR_KEYWORD:
             return True
     return name in signature.parameters
-

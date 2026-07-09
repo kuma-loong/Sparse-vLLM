@@ -29,4 +29,3 @@ class ResponseRequest(BaseModel):
     parallel_tool_calls: bool | None = None
     reasoning: ResponseReasoning | None = None
     chat_template_kwargs: Any = None
-
