@@ -1001,12 +1001,12 @@ markers such as `/think` or `/no_think` themselves if needed.
 `/v1/responses` is exposed as a separate endpoint for item-based input and
 output. The first implementation supports text input, text-only message items,
 `function_call_output` input items, function tool schemas, `reasoning.effort`,
-and non-streaming responses. `max_output_tokens` maps to
+non-streaming responses, and Responses SSE streaming. `max_output_tokens` maps to
 `SamplingParams.max_tokens`; `temperature`, `top_p`, and `top_k` map directly
 to sampling parameters. `tool_choice` is limited to `null` or `"auto"`;
 `parallel_tool_calls=false` and `reasoning.summary` fail explicitly until those
-semantics are implemented. `stream=true` fails explicitly until Responses SSE
-events are implemented.
+semantics are implemented. `stream=true` returns Responses semantic SSE events
+instead of Chat Completions chunks.
 
 When `--reasoning-parser qwen3` is enabled, `/v1/responses` parses model output
 that starts with `<think>` into a Sparse-vLLM extension reasoning item followed
@@ -1016,14 +1016,18 @@ OpenAI-hosted reasoning tokens, which are not exposed as raw text. If the
 parser is not enabled, generated text is returned unchanged as `output_text`.
 `reasoning.effort="none"` maps to `enable_thinking=false`; other effort values
 map to `enable_thinking=true`. Conflicts with explicit
-`chat_template_kwargs.enable_thinking` fail fast.
+`chat_template_kwargs.enable_thinking` fail fast. In streaming mode,
+`response.reasoning_text.delta` is a Sparse-vLLM extension event for local raw
+reasoning text, not an OpenAI-hosted raw reasoning token field.
 
 Function tools are passed to tokenizer chat templates through the `tools`
 kwarg when supported. The server normalizes OpenAI function tool schemas and
 parses explicit `<tool_call>...</tool_call>` or `<tool_calls>...</tool_calls>`
 model output into Responses `function_call` items. It does not execute tools;
 applications must execute tools and send results back as
-`function_call_output` input items.
+`function_call_output` input items. Streaming tool calls emit a
+`function_call` output item plus `response.function_call_arguments.delta` and
+`response.function_call_arguments.done` events.
 
 Prefix-cache matching accepts a `response` selector. The worker renders that
 selector with the same Responses prompt renderer used for real generation, so
