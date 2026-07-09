@@ -153,10 +153,7 @@ class Qwen3ReasoningStreamParser:
             events.append(ReasoningStreamEvent("reasoning_done"))
             return events + self._answer_delta(answer_text)
 
-        answer_text = self._buffer
-        self._buffer = ""
-        self._state = "answer"
-        return self._answer_delta(answer_text)
+        return []
 
     def _feed_reasoning(self, text_delta: str) -> list[ReasoningStreamEvent]:
         combined = self._buffer + text_delta

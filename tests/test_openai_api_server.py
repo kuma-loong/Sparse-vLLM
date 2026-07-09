@@ -1748,6 +1748,21 @@ class OpenAIAPIServerTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(answer, "answer")
         self.assertIn("reasoning_done", [event.kind for event in events])
 
+    def test_qwen3_reasoning_stream_parser_handles_template_opened_think(self):
+        from sparsevllm.entrypoints.openai.responses.reasoning import get_reasoning_stream_parser
+
+        parser = get_reasoning_stream_parser("qwen3")
+        events = []
+        for delta in ["reason", "</thi", "nk>\n\nanswer"]:
+            events.extend(parser.feed(delta))
+        events.extend(parser.finish("stop"))
+
+        reasoning = "".join(event.text for event in events if event.kind == "reasoning_delta")
+        answer = "".join(event.text for event in events if event.kind == "answer_delta")
+
+        self.assertEqual(reasoning, "reason")
+        self.assertEqual(answer, "answer")
+
     def test_qwen3_reasoning_stream_parser_rejects_unclosed_stop(self):
         from sparsevllm.entrypoints.openai.responses.reasoning import ReasoningParseError
         from sparsevllm.entrypoints.openai.responses.reasoning import get_reasoning_stream_parser
