@@ -865,6 +865,7 @@ The serving entrypoint has dedicated server flags:
 | `--port` | `8000` | Uvicorn bind port. |
 | `--engine-kwargs` | unset | JSON object or path to a JSON object with Sparse-vLLM engine kwargs. |
 | `--request-log-dir` | unset | Optional directory for per-request JSON logs. |
+| `--reasoning-parser` | unset | Optional Responses API parser. The first supported value is `qwen3`, which parses `<think>...</think>` output into a Sparse-vLLM reasoning item. |
 
 Additional `--kebab-case` flags are parsed as Sparse-vLLM engine kwargs. Use
 the canonical semantic keys accepted by
@@ -989,6 +990,43 @@ template, the server renders messages with
 `apply_chat_template(..., add_generation_prompt=True)`; otherwise it uses a
 simple role-prefixed prompt. Chat `logprobs=true` enables sampled-token
 logprobs, and `top_logprobs` controls the number of top alternatives up to 20.
+Chat requests may set
+`"chat_template_kwargs": {"enable_thinking": false}` for Qwen3-style tokenizer
+templates that support explicit thinking control. Unknown keys, non-boolean
+`enable_thinking`, and using `chat_template_kwargs` without a tokenizer chat
+template fail fast. `/v1/completions` remains a raw prompt endpoint and does
+not add a server-side thinking switch; clients can include prompt-level
+markers such as `/think` or `/no_think` themselves if needed.
+
+`/v1/responses` is exposed as a separate endpoint for item-based input and
+output. The first implementation supports text input, text-only message items,
+`function_call_output` input items, function tool schemas, `reasoning.effort`,
+and non-streaming responses. `max_output_tokens` maps to
+`SamplingParams.max_tokens`; `temperature`, `top_p`, and `top_k` map directly
+to sampling parameters. `stream=true` fails explicitly until Responses SSE
+events are implemented.
+
+When `--reasoning-parser qwen3` is enabled, `/v1/responses` parses model output
+that starts with `<think>` into a Sparse-vLLM extension reasoning item followed
+by the assistant message or function call item. This extension exposes local
+model reasoning text for reproducibility; it is not claiming equivalence with
+OpenAI-hosted reasoning tokens, which are not exposed as raw text. If the
+parser is not enabled, generated text is returned unchanged as `output_text`.
+`reasoning.effort="none"` maps to `enable_thinking=false`; other effort values
+map to `enable_thinking=true`. Conflicts with explicit
+`chat_template_kwargs.enable_thinking` fail fast.
+
+Function tools are passed to tokenizer chat templates through the `tools`
+kwarg when supported. The server normalizes OpenAI function tool schemas and
+parses explicit `<tool_call>...</tool_call>` or `<tool_calls>...</tool_calls>`
+model output into Responses `function_call` items. It does not execute tools;
+applications must execute tools and send results back as
+`function_call_output` input items.
+
+Prefix-cache matching accepts a `response` selector. The worker renders that
+selector with the same Responses prompt renderer used for real generation, so
+instructions, input items, tools, reasoning controls, and chat template kwargs
+participate in the cache-match key consistently.
 
 The server logs one request-start line and one request-finish or request-cancel
 line per `/v1/completions` request. It does not log every generated token.
