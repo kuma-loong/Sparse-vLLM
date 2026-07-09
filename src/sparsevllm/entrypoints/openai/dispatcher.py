@@ -287,12 +287,14 @@ class AsyncEngineDispatcher:
             if stop_index is not None:
                 active.pop(seq_id, None)
                 self.engine.abort_request(seq_id)
+                raw_text = self.engine.tokenizer.decode(request.completion_token_ids, skip_special_tokens=False)
                 self._put(
                     request,
                     {
                         "type": "final",
                         "index": request.index,
                         "text": visible_text,
+                        "raw_text": raw_text,
                         "text_delta": visible_text[request.emitted_text_len:],
                         "finish_reason": "stop",
                         "prompt_tokens": len(request.prompt_token_ids),
@@ -350,6 +352,7 @@ class AsyncEngineDispatcher:
             request.completion_token_logprobs = list(token_logprobs)
             request.completion_top_logprobs = list(top_logprobs)
             finish_reason = "length" if len(completion_token_ids) >= request.max_tokens else "stop"
+            raw_text = self.engine.tokenizer.decode(completion_token_ids, skip_special_tokens=False)
             text = self.engine.tokenizer.decode(completion_token_ids, skip_special_tokens=True)
             stop_index = _find_stop_index(text, request.stop)
             if stop_index is not None:
@@ -361,6 +364,7 @@ class AsyncEngineDispatcher:
                     "type": "final",
                     "index": request.index,
                     "text": text,
+                    "raw_text": raw_text,
                     "text_delta": text[request.emitted_text_len:],
                     "finish_reason": finish_reason,
                     "prompt_tokens": len(request.prompt_token_ids),
@@ -370,4 +374,3 @@ class AsyncEngineDispatcher:
                     "top_logprobs": top_logprobs,
                 },
             )
-

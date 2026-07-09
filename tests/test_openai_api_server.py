@@ -1231,6 +1231,34 @@ class OpenAIAPIServerTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(response["output"][0]["content"][0]["text"], "hello")
         self.assertEqual(response["usage"], {"input_tokens": 4, "output_tokens": 2, "total_tokens": 6})
 
+    async def test_response_reasoning_parser_uses_raw_text(self):
+        from sparsevllm.entrypoints.openai.api_server import RequestHandle, _response_response
+
+        queue = asyncio.Queue()
+        await queue.put(
+            {
+                "type": "final",
+                "index": 0,
+                "text": "answer",
+                "raw_text": "<think>reason</think>answer",
+                "finish_reason": "stop",
+                "prompt_tokens": 4,
+                "completion_tokens": 3,
+            }
+        )
+
+        response = await _response_response(
+            "resp_test",
+            123,
+            "model",
+            RequestHandle(output_queue=queue, cancelled=threading.Event()),
+            reasoning_parser_name="qwen3",
+        )
+
+        self.assertEqual(response["output"][0]["type"], "reasoning")
+        self.assertEqual(response["output"][0]["text"], "reason")
+        self.assertEqual(response["output"][1]["content"][0]["text"], "answer")
+
     async def test_response_stream_true_fails_explicitly(self):
         from fastapi import HTTPException
 

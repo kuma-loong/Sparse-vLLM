@@ -129,9 +129,10 @@ async def _response_response(
     reasoning_parser_name: str | None,
 ) -> dict[str, Any]:
     final = await _wait_final(handle.output_queue)
+    parser_input = final.get("raw_text", final["text"]) if reasoning_parser_name else final["text"]
     try:
         output, incomplete_reasoning = _response_output_items(
-            final["text"],
+            parser_input,
             final["finish_reason"],
             reasoning_parser_name=reasoning_parser_name,
         )
@@ -208,4 +209,3 @@ def _message_output_item(text: str) -> dict[str, Any]:
             }
         ],
     }
-
