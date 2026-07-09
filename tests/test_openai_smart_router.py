@@ -1,6 +1,7 @@
 import asyncio
 import importlib.util
 import unittest
+from unittest.mock import AsyncMock
 from unittest.mock import patch
 
 
@@ -146,6 +147,80 @@ class OpenAISmartRouterTest(unittest.TestCase):
             match_payload_for_request("/v1/completions", {"prompt": ["a", "b"]}),
             {"text": "a"},
         )
+        response_payload = {"model": "model", "input": "hello", "reasoning": {"effort": "none"}}
+        self.assertEqual(
+            match_payload_for_request("/v1/responses", response_payload),
+            {"response": response_payload},
+        )
+
+    def test_responses_route_profile_inference_stays_default(self):
+        from sparsevllm.entrypoints.openai.smart_router import infer_route_profile
+
+        self.assertEqual(
+            infer_route_profile(
+                "/v1/responses",
+                {"input": [{"role": "user", "content": "a"}, {"role": "assistant", "content": "b"}]},
+            ),
+            "default",
+        )
+
+    def test_responses_route_forwards_through_router(self):
+        from sparsevllm.entrypoints.openai import smart_router
+
+        class JsonRequest:
+            async def json(self):
+                return {"model": "model", "input": "hello"}
+
+        app = smart_router.create_app(["http://worker-a"])
+        endpoint = next(route.endpoint for route in app.routes if getattr(route, "path", None) == "/v1/responses")
+        app.state.router.route_openai_request = AsyncMock(return_value="ok")
+
+        response = asyncio.run(endpoint(JsonRequest()))
+
+        self.assertEqual(response, "ok")
+        app.state.router.route_openai_request.assert_awaited_once_with(
+            "/v1/responses",
+            {"model": "model", "input": "hello"},
+        )
+
+    def test_responses_route_hints_are_stripped_before_forwarding(self):
+        from fastapi.responses import Response
+        from sparsevllm.entrypoints.openai import smart_router
+
+        router = smart_router.SmartRouter(
+            worker_urls=["http://worker-a"],
+            request_timeout_s=1.0,
+            overload_load_factor=1.5,
+            load_abs_threshold=1,
+            profiles={},
+            route_log_dir=None,
+        )
+        router.workers[0].info = {"served_model_name": "model", "sparse_method": "omnikv"}
+
+        async def refresh_worker_info():
+            return None
+
+        router.refresh_worker_info = refresh_worker_info
+
+        async def forward_json(_worker, _endpoint, payload):
+            self.assertEqual(payload, {"model": "model", "input": "hello"})
+            return Response(content=b"{}", media_type="application/json")
+
+        router.forward_json = forward_json
+        response = asyncio.run(
+            router.route_openai_request(
+                "/v1/responses",
+                {
+                    "model": "model",
+                    "input": "hello",
+                    "svllm_target_worker": "0",
+                    "svllm_method_preference": ["omnikv"],
+                },
+            )
+        )
+
+        self.assertEqual(response.headers["x-sparsevllm-worker"], "http://worker-a")
+        self.assertEqual(response.headers["x-sparsevllm-route-reason"], "target_worker")
 
     def test_streaming_upstream_http_error_is_returned_before_sse_response(self):
         from sparsevllm.entrypoints.openai import smart_router

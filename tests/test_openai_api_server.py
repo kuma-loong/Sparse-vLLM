@@ -10,6 +10,23 @@ from unittest.mock import patch
 from unittest.mock import AsyncMock
 
 
+class _TestRequest:
+    def __init__(self, app):
+        self.app = app
+
+
+def _route_endpoint(app, path):
+    for route in app.routes:
+        if getattr(route, "path", None) == path:
+            return route.endpoint
+        if hasattr(route, "effective_route_contexts"):
+            for context in route.effective_route_contexts():
+                original_route = context.original_route
+                if getattr(original_route, "path", None) == path:
+                    return original_route.endpoint
+    raise AssertionError(f"route not found: {path}")
+
+
 @unittest.skipIf(
     importlib.util.find_spec("fastapi") is None or importlib.util.find_spec("pydantic") is None,
     "OpenAI API server dependencies are not installed",
@@ -203,6 +220,76 @@ class OpenAIAPIServerTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(prompt, "rendered")
         self.assertEqual(tokenizer.chat, [{"role": "system", "content": "policy\ndetails"}])
 
+    def test_chat_template_kwargs_enable_thinking_passes_to_tokenizer(self):
+        from sparsevllm.entrypoints.openai.api_server import ChatMessage, _chat_prompt
+
+        class Tokenizer:
+            chat_template = "template"
+
+            def __init__(self):
+                self.kwargs = None
+
+            def apply_chat_template(self, _chat, **kwargs):
+                self.kwargs = kwargs
+                return "rendered"
+
+        tokenizer = Tokenizer()
+        prompt = _chat_prompt(
+            tokenizer,
+            [ChatMessage(role="user", content="hello")],
+            {"enable_thinking": False},
+        )
+
+        self.assertEqual(prompt, "rendered")
+        self.assertIs(tokenizer.kwargs["enable_thinking"], False)
+
+    def test_chat_template_kwargs_validation_is_explicit(self):
+        from fastapi import HTTPException
+
+        from sparsevllm.entrypoints.openai.api_server import ChatCompletionRequest, _validate_chat_request
+
+        class Tokenizer:
+            chat_template = "template"
+
+        with self.assertRaises(HTTPException) as unknown_ctx:
+            _validate_chat_request(
+                ChatCompletionRequest(
+                    model="m",
+                    messages=[{"role": "user", "content": "p"}],
+                    chat_template_kwargs={"unknown": True},
+                ),
+                "m",
+                Tokenizer(),
+            )
+        self.assertEqual(unknown_ctx.exception.status_code, 400)
+
+        with self.assertRaises(HTTPException) as type_ctx:
+            _validate_chat_request(
+                ChatCompletionRequest(
+                    model="m",
+                    messages=[{"role": "user", "content": "p"}],
+                    chat_template_kwargs={"enable_thinking": "false"},
+                ),
+                "m",
+                Tokenizer(),
+            )
+        self.assertEqual(type_ctx.exception.status_code, 400)
+
+        class NoTemplateTokenizer:
+            chat_template = None
+
+        with self.assertRaises(HTTPException) as template_ctx:
+            _validate_chat_request(
+                ChatCompletionRequest(
+                    model="m",
+                    messages=[{"role": "user", "content": "p"}],
+                    chat_template_kwargs={"enable_thinking": False},
+                ),
+                "m",
+                NoTemplateTokenizer(),
+            )
+        self.assertEqual(template_ctx.exception.status_code, 400)
+
     def test_chat_max_completion_tokens_maps_to_sampling_params(self):
         from fastapi import HTTPException
 
@@ -344,9 +431,12 @@ class OpenAIAPIServerTest(unittest.IsolatedAsyncioTestCase):
                 pass
 
         app = api_server.create_app("/tmp/model", served_model_name="model", engine=Engine())
-        endpoint = next(route.endpoint for route in app.routes if getattr(route, "path", None) == "/v1/prefix_cache/inspect")
+        endpoint = _route_endpoint(app, "/v1/prefix_cache/inspect")
         try:
-            response = await endpoint(api_server.PrefixCacheInspectRequest(token_ids=[7, 8], include_subtree=True))
+            response = await endpoint(
+                api_server.PrefixCacheInspectRequest(token_ids=[7, 8], include_subtree=True),
+                _TestRequest(app),
+            )
         finally:
             app.state.dispatcher.close()
 
@@ -385,10 +475,11 @@ class OpenAIAPIServerTest(unittest.IsolatedAsyncioTestCase):
                 pass
 
         app = api_server.create_app("/tmp/model", served_model_name="model", engine=Engine())
-        endpoint = next(route.endpoint for route in app.routes if getattr(route, "path", None) == "/v1/prefix_cache/match")
+        endpoint = _route_endpoint(app, "/v1/prefix_cache/match")
         try:
             response = await endpoint(
-                api_server.PrefixCacheMatchRequest(messages=[{"role": "user", "content": "hello"}])
+                api_server.PrefixCacheMatchRequest(messages=[{"role": "user", "content": "hello"}]),
+                _TestRequest(app),
             )
         finally:
             app.state.dispatcher.close()
@@ -414,12 +505,12 @@ class OpenAIAPIServerTest(unittest.IsolatedAsyncioTestCase):
                 pass
 
         app = api_server.create_app("/tmp/model", served_model_name="model", engine=Engine())
-        info_endpoint = next(route.endpoint for route in app.routes if getattr(route, "path", None) == "/v1/worker/info")
-        load_endpoint = next(route.endpoint for route in app.routes if getattr(route, "path", None) == "/v1/worker/load")
+        info_endpoint = _route_endpoint(app, "/v1/worker/info")
+        load_endpoint = _route_endpoint(app, "/v1/worker/load")
         try:
             with patch.dict(os.environ, {"SPARSEVLLM_WORKER_TAGS": "dialog, omnikv"}):
-                info_response = info_endpoint()
-            load_response = await load_endpoint()
+                info_response = info_endpoint(_TestRequest(app))
+            load_response = await load_endpoint(_TestRequest(app))
         finally:
             app.state.dispatcher.close()
 
@@ -454,9 +545,9 @@ class OpenAIAPIServerTest(unittest.IsolatedAsyncioTestCase):
 
         engine = Engine()
         app = api_server.create_app("/tmp/model", served_model_name="model", engine=engine)
-        endpoint = next(route.endpoint for route in app.routes if getattr(route, "path", None) == "/v1/prefix_cache/inspect")
+        endpoint = _route_endpoint(app, "/v1/prefix_cache/inspect")
         try:
-            response = await endpoint(api_server.PrefixCacheInspectRequest(text="hello"))
+            response = await endpoint(api_server.PrefixCacheInspectRequest(text="hello"), _TestRequest(app))
         finally:
             app.state.dispatcher.close()
 
@@ -476,12 +567,12 @@ class OpenAIAPIServerTest(unittest.IsolatedAsyncioTestCase):
                 pass
 
         app = api_server.create_app("/tmp/model", served_model_name="model", engine=Engine())
-        endpoint = next(route.endpoint for route in app.routes if getattr(route, "path", None) == "/v1/prefix_cache/inspect")
+        endpoint = _route_endpoint(app, "/v1/prefix_cache/inspect")
         try:
             with self.assertRaises(HTTPException):
-                await endpoint(api_server.PrefixCacheInspectRequest())
+                await endpoint(api_server.PrefixCacheInspectRequest(), _TestRequest(app))
             with self.assertRaises(HTTPException):
-                await endpoint(api_server.PrefixCacheInspectRequest(token_ids=[1], text="x"))
+                await endpoint(api_server.PrefixCacheInspectRequest(token_ids=[1], text="x"), _TestRequest(app))
         finally:
             app.state.dispatcher.close()
 
@@ -508,10 +599,10 @@ class OpenAIAPIServerTest(unittest.IsolatedAsyncioTestCase):
                 pass
 
         app = api_server.create_app("/tmp/model", served_model_name="model", engine=Engine())
-        endpoint = next(route.endpoint for route in app.routes if getattr(route, "path", None) == "/v1/prefix_cache/inspect")
+        endpoint = _route_endpoint(app, "/v1/prefix_cache/inspect")
         try:
             with self.assertRaises(HTTPException) as ctx:
-                await endpoint(api_server.PrefixCacheInspectRequest(token_ids=[1]))
+                await endpoint(api_server.PrefixCacheInspectRequest(token_ids=[1]), _TestRequest(app))
         finally:
             app.state.dispatcher.close()
 
@@ -557,16 +648,16 @@ class OpenAIAPIServerTest(unittest.IsolatedAsyncioTestCase):
 
         engine = Engine()
         app = api_server.create_app("/tmp/model", served_model_name="model", engine=engine)
-        delete_endpoint = next(
-            route.endpoint for route in app.routes if getattr(route, "path", None) == "/v1/prefix_cache/delete_subtree"
-        )
-        priority_endpoint = next(
-            route.endpoint for route in app.routes if getattr(route, "path", None) == "/v1/prefix_cache/set_eviction_priority"
-        )
+        delete_endpoint = _route_endpoint(app, "/v1/prefix_cache/delete_subtree")
+        priority_endpoint = _route_endpoint(app, "/v1/prefix_cache/set_eviction_priority")
         try:
-            delete_response = await delete_endpoint(api_server.PrefixCacheDeleteSubtreeRequest(text="ab"))
+            delete_response = await delete_endpoint(
+                api_server.PrefixCacheDeleteSubtreeRequest(text="ab"),
+                _TestRequest(app),
+            )
             priority_response = await priority_endpoint(
-                api_server.PrefixCacheSetEvictionPriorityRequest(token_ids=[7, 8], priority=-5)
+                api_server.PrefixCacheSetEvictionPriorityRequest(token_ids=[7, 8], priority=-5),
+                _TestRequest(app),
             )
         finally:
             app.state.dispatcher.close()
@@ -727,16 +818,18 @@ class OpenAIAPIServerTest(unittest.IsolatedAsyncioTestCase):
                 pass
 
         app = api_server.create_app("/tmp/model", served_model_name="model", engine=Engine())
-        endpoint = next(route.endpoint for route in app.routes if getattr(route, "path", None) == "/v1/completions")
+        endpoint = _route_endpoint(app, "/v1/completions")
         request = api_server.CompletionRequest(model="model", prompt="p")
         try:
+            from sparsevllm.entrypoints.openai.serving import completion as completion_serving
+
             with patch.object(
-                api_server,
+                completion_serving,
                 "_completion_response",
                 AsyncMock(side_effect=asyncio.CancelledError),
-            ), patch.object(api_server.logger, "info") as log_info:
+            ), patch.object(completion_serving.logger, "info") as log_info:
                 with self.assertRaises(asyncio.CancelledError):
-                    await endpoint(request)
+                    await endpoint(request, _TestRequest(app))
         finally:
             app.state.dispatcher.close()
 
@@ -984,6 +1077,356 @@ class OpenAIAPIServerTest(unittest.IsolatedAsyncioTestCase):
         )
 
         self.assertEqual(_sampling_params_from_request(request).logprobs, 0)
+
+    def test_response_prompt_renders_string_input_and_instructions(self):
+        from sparsevllm.entrypoints.openai.api_server import ResponseRequest, _response_prompt
+
+        class Tokenizer:
+            chat_template = "template"
+
+            def __init__(self):
+                self.chat = None
+                self.kwargs = None
+
+            def apply_chat_template(self, chat, **kwargs):
+                self.chat = chat
+                self.kwargs = kwargs
+                return "rendered"
+
+        tokenizer = Tokenizer()
+        request = ResponseRequest(
+            model="model",
+            instructions="policy",
+            input="hello",
+            chat_template_kwargs={"enable_thinking": False},
+        )
+
+        self.assertEqual(_response_prompt(tokenizer, request), "rendered")
+        self.assertEqual(
+            tokenizer.chat,
+            [
+                {"role": "system", "content": "policy"},
+                {"role": "user", "content": "hello"},
+            ],
+        )
+        self.assertIs(tokenizer.kwargs["enable_thinking"], False)
+
+    def test_response_prompt_rejects_unsupported_item_type(self):
+        from sparsevllm.entrypoints.openai.api_server import ResponseRequest, _response_prompt
+
+        class Tokenizer:
+            chat_template = None
+
+        with self.assertRaisesRegex(ValueError, "Unsupported responses input item type"):
+            _response_prompt(
+                Tokenizer(),
+                ResponseRequest(model="model", input=[{"type": "image", "image_url": "x"}]),
+            )
+
+    def test_response_prompt_passes_tools_and_tool_outputs(self):
+        from sparsevllm.entrypoints.openai.api_server import ResponseRequest, _response_prompt
+
+        class Tokenizer:
+            chat_template = "template"
+
+            def __init__(self):
+                self.chat = None
+                self.tools = None
+
+            def apply_chat_template(self, chat, tools=None, **_kwargs):
+                self.chat = chat
+                self.tools = tools
+                return "rendered"
+
+        tokenizer = Tokenizer()
+        request = ResponseRequest(
+            model="model",
+            input=[{"type": "function_call_output", "call_id": "call_1", "output": '{"ok":true}'}],
+            tools=[
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "get_weather",
+                        "description": "Weather",
+                        "parameters": {"type": "object", "properties": {}},
+                    },
+                }
+            ],
+        )
+
+        self.assertEqual(_response_prompt(tokenizer, request), "rendered")
+        self.assertEqual(tokenizer.chat, [{"role": "tool", "content": '{"ok":true}', "tool_call_id": "call_1"}])
+        self.assertEqual(tokenizer.tools[0]["name"], "get_weather")
+
+    def test_response_prompt_rejects_tools_without_template_support(self):
+        from sparsevllm.entrypoints.openai.api_server import ResponseRequest, _response_prompt
+
+        class Tokenizer:
+            chat_template = "template"
+
+            def apply_chat_template(self, chat, tokenize=False, add_generation_prompt=True):
+                del chat, tokenize, add_generation_prompt
+                return "rendered"
+
+        with self.assertRaisesRegex(ValueError, "does not support tools"):
+            _response_prompt(
+                Tokenizer(),
+                ResponseRequest(
+                    model="model",
+                    input="hello",
+                    tools=[{"type": "function", "name": "tool", "parameters": {}}],
+                ),
+            )
+
+    def test_response_reasoning_effort_conflicts_fail_fast(self):
+        from fastapi import HTTPException
+
+        from sparsevllm.entrypoints.openai.api_server import ResponseRequest, _validate_response_request
+
+        with self.assertRaises(HTTPException) as ctx:
+            _validate_response_request(
+                ResponseRequest(
+                    model="model",
+                    input="hello",
+                    reasoning={"effort": "none"},
+                    chat_template_kwargs={"enable_thinking": True},
+                ),
+                "model",
+            )
+        self.assertEqual(ctx.exception.status_code, 400)
+
+    def test_response_max_output_tokens_maps_to_sampling_params(self):
+        from sparsevllm.entrypoints.openai.api_server import ResponseRequest, _sampling_params_from_response_request
+
+        request = ResponseRequest(model="model", input="hello", max_output_tokens=7)
+
+        self.assertEqual(_sampling_params_from_response_request(request).max_tokens, 7)
+
+    async def test_response_response_shape_and_usage(self):
+        from sparsevllm.entrypoints.openai.api_server import RequestHandle, _response_response
+
+        queue = asyncio.Queue()
+        await queue.put(
+            {
+                "type": "final",
+                "index": 0,
+                "text": "hello",
+                "finish_reason": "stop",
+                "prompt_tokens": 4,
+                "completion_tokens": 2,
+            }
+        )
+
+        response = await _response_response(
+            "resp_test",
+            123,
+            "model",
+            RequestHandle(output_queue=queue, cancelled=threading.Event()),
+            reasoning_parser_name=None,
+        )
+
+        self.assertEqual(response["object"], "response")
+        self.assertEqual(response["status"], "completed")
+        self.assertEqual(response["output"][0]["type"], "message")
+        self.assertEqual(response["output"][0]["content"][0]["text"], "hello")
+        self.assertEqual(response["usage"], {"input_tokens": 4, "output_tokens": 2, "total_tokens": 6})
+
+    async def test_response_stream_true_fails_explicitly(self):
+        from fastapi import HTTPException
+
+        from sparsevllm.entrypoints.openai.api_server import ResponseRequest
+        from sparsevllm.entrypoints.openai.serving.responses import serve_response
+
+        with self.assertRaises(HTTPException) as ctx:
+            await serve_response(
+                ResponseRequest(model="model", input="hello", stream=True),
+                dispatcher=object(),
+                tokenizer=object(),
+                served_model_name="model",
+                request_log_path=None,
+                reasoning_parser_name=None,
+            )
+        self.assertEqual(ctx.exception.status_code, 400)
+
+    def test_response_route_returns_non_streaming_response(self):
+        from fastapi.testclient import TestClient
+        from sparsevllm.entrypoints.openai import api_server
+
+        class Tokenizer:
+            chat_template = None
+
+            def encode(self, text, add_special_tokens=False):
+                del add_special_tokens
+                return [ord(ch) for ch in text]
+
+            def decode(self, token_ids, skip_special_tokens=True):
+                del skip_special_tokens
+                return {1: "hello"}[token_ids[0]]
+
+        class Engine:
+            tokenizer = Tokenizer()
+            config = type("Config", (), {"vllm_sparse_method": ""})()
+            last_step_token_outputs = []
+            last_step_logprob_outputs = []
+
+            def add_request(self, prompt, sampling_params):
+                self.prompt = prompt
+                self.sampling_params = sampling_params
+                return 1
+
+            def step(self):
+                return [(1, [1], [None], [None])], 0
+
+            def abort_request(self, _seq_id):
+                pass
+
+            def exit(self):
+                pass
+
+        engine = Engine()
+        app = api_server.create_app("/tmp/model", served_model_name="model", engine=engine)
+        try:
+            response = TestClient(app).post(
+                "/v1/responses",
+                json={"model": "model", "input": "hello", "max_output_tokens": 4},
+            )
+        finally:
+            app.state.dispatcher.close()
+
+        payload = response.json()
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(payload["object"], "response")
+        self.assertEqual(payload["output"][0]["content"][0]["text"], "hello")
+        self.assertEqual(engine.sampling_params.max_tokens, 4)
+
+    def test_qwen3_reasoning_parser_builds_reasoning_item(self):
+        from sparsevllm.entrypoints.openai.api_server import _response_output_items
+
+        output, incomplete = _response_output_items(
+            "<think>reason</think>answer",
+            "stop",
+            reasoning_parser_name="qwen3",
+        )
+
+        self.assertFalse(incomplete)
+        self.assertEqual(output[0]["type"], "reasoning")
+        self.assertEqual(output[0]["text"], "reason")
+        self.assertEqual(output[1]["content"][0]["text"], "answer")
+
+    def test_qwen3_reasoning_parser_handles_incomplete_length(self):
+        from sparsevllm.entrypoints.openai.api_server import _response_output_items
+
+        output, incomplete = _response_output_items(
+            "<think>partial",
+            "length",
+            reasoning_parser_name="qwen3",
+        )
+
+        self.assertTrue(incomplete)
+        self.assertEqual(output, [{"id": output[0]["id"], "type": "reasoning", "text": "partial", "summary": []}])
+
+    def test_qwen3_reasoning_parser_rejects_unclosed_stop(self):
+        from sparsevllm.entrypoints.openai.responses.reasoning import ReasoningParseError
+        from sparsevllm.entrypoints.openai.api_server import _response_output_items
+
+        with self.assertRaises(ReasoningParseError):
+            _response_output_items("<think>partial", "stop", reasoning_parser_name="qwen3")
+
+    def test_reasoning_parser_disabled_returns_raw_text(self):
+        from sparsevllm.entrypoints.openai.api_server import _response_output_items
+
+        output, incomplete = _response_output_items(
+            "<think>reason</think>answer",
+            "stop",
+            reasoning_parser_name=None,
+        )
+
+        self.assertFalse(incomplete)
+        self.assertEqual(output[0]["content"][0]["text"], "<think>reason</think>answer")
+
+    def test_tool_call_output_item_is_parsed(self):
+        from sparsevllm.entrypoints.openai.api_server import _response_output_items
+
+        output, incomplete = _response_output_items(
+            '<tool_call>{"name":"get_weather","arguments":{"city":"Paris"}}</tool_call>',
+            "stop",
+            reasoning_parser_name=None,
+        )
+
+        self.assertFalse(incomplete)
+        self.assertEqual(output[0]["type"], "function_call")
+        self.assertEqual(output[0]["name"], "get_weather")
+        self.assertEqual(output[0]["arguments"], '{"city":"Paris"}')
+
+    def test_malformed_tool_call_json_fails_fast(self):
+        from sparsevllm.entrypoints.openai.responses.tools import ToolCallParseError
+        from sparsevllm.entrypoints.openai.api_server import _response_output_items
+
+        with self.assertRaises(ToolCallParseError):
+            _response_output_items('<tool_call>{"name":</tool_call>', "stop", reasoning_parser_name=None)
+
+    async def test_prefix_cache_match_accepts_response_selector(self):
+        from sparsevllm.entrypoints.openai import api_server
+
+        class Tokenizer:
+            bos_token = None
+            chat_template = "template"
+
+            def apply_chat_template(self, chat, **_kwargs):
+                return "|".join(f"{item['role']}:{item['content']}" for item in chat)
+
+            def encode(self, text, add_special_tokens=False):
+                del add_special_tokens
+                return [ord(ch) for ch in text]
+
+        class Engine:
+            tokenizer = Tokenizer()
+            config = type("Config", (), {"vllm_sparse_method": ""})()
+
+            def prefix_cache_match(self, token_ids):
+                return {"token_ids": list(token_ids), "supported": True, "enabled": True}
+
+            def exit(self):
+                pass
+
+        app = api_server.create_app("/tmp/model", served_model_name="model", engine=Engine())
+        endpoint = _route_endpoint(app, "/v1/prefix_cache/match")
+        try:
+            response = await endpoint(
+                api_server.PrefixCacheMatchRequest(
+                    response={"model": "model", "instructions": "policy", "input": "hello"}
+                ),
+                _TestRequest(app),
+            )
+        finally:
+            app.state.dispatcher.close()
+
+        self.assertEqual(
+            json.loads(response.body)["token_ids"],
+            [ord(ch) for ch in "system:policy|user:hello"],
+        )
+
+    async def test_prefix_cache_match_rejects_multiple_selectors_with_response(self):
+        from fastapi import HTTPException
+        from sparsevllm.entrypoints.openai import api_server
+
+        class Engine:
+            tokenizer = object()
+            config = type("Config", (), {"vllm_sparse_method": ""})()
+
+            def exit(self):
+                pass
+
+        app = api_server.create_app("/tmp/model", served_model_name="model", engine=Engine())
+        endpoint = _route_endpoint(app, "/v1/prefix_cache/match")
+        try:
+            with self.assertRaises(HTTPException):
+                await endpoint(
+                    api_server.PrefixCacheMatchRequest(text="hello", response={"model": "model", "input": "hello"}),
+                    _TestRequest(app),
+                )
+        finally:
+            app.state.dispatcher.close()
 
 
 class OpenAIClientTest(unittest.TestCase):
