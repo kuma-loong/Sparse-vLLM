@@ -324,6 +324,9 @@ class Config:
     kv_quant_bits: int = 4
     kv_quant_group_size: int = 0
     enable_sparse_ref_fp8: bool = False
+    # Default split size for dense GQA decode. It remains configurable because
+    # the best value depends on the GPU generation and workload distribution.
+    gqa_decode_block_seq: int = 512
     # Optional residual quantization for layers listed in full_attn_layers.
     # 0 keeps the previous BF16/FP16 full-layer KV behavior. 2/4 store old
     # full-layer tokens as DeltaKV-style residuals and reconstruct a dense view
@@ -463,6 +466,12 @@ class Config:
             raise ValueError(
                 "sparse_attn_score_dtype must be 'float32', 'bfloat16', or 'float16', "
                 f"got {self.sparse_attn_score_dtype!r}."
+            )
+        self.gqa_decode_block_seq = int(self.gqa_decode_block_seq)
+        if self.gqa_decode_block_seq <= 0 or self.gqa_decode_block_seq % 16 != 0:
+            raise ValueError(
+                "gqa_decode_block_seq must be a positive multiple of 16, "
+                f"got {self.gqa_decode_block_seq}."
             )
         self.full_layer_kv_quant_bits = int(self.full_layer_kv_quant_bits or 0)
         if self.full_layer_kv_quant_bits not in (0, 2, 4):

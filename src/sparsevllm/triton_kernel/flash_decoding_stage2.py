@@ -5,7 +5,8 @@ import triton
 import triton.language as tl
 
 
-_SUPPORTED_HEAD_DIMS = {16, 32, 64, 128, 256}
+_MIN_HEAD_DIM = 16
+_MAX_HEAD_DIM = 256
 _VARIANT_WARPS = {"unified_s2_w4": 4, "unified_s2_w8": 8}
 
 
@@ -26,11 +27,13 @@ def _fwd_kernel_flash_decode_stage2(
     stride_oh,
     stride_od,
     BLOCK_SEQ: tl.constexpr,
+    HEAD_DIM: tl.constexpr,
     BLOCK_DMODEL: tl.constexpr,
 ):
     cur_batch = tl.program_id(0)
     cur_head = tl.program_id(1)
     offs_d = tl.arange(0, BLOCK_DMODEL)
+    dim_mask = offs_d < HEAD_DIM
     cur_batch_seq_len = tl.load(B_Seqlen + cur_batch)
     block_n_size = tl.where(cur_batch_seq_len > 0, cur_batch_seq_len + BLOCK_SEQ - 1, 0) // BLOCK_SEQ
 
@@ -44,7 +47,11 @@ def _fwd_kernel_flash_decode_stage2(
     )
     offs_logic = cur_batch * stride_mid_o_eb + cur_head * stride_mid_o_eh
     for block_seq_n in range(0, block_n_size, 1):
-        block_o = tl.load(Mid_O + offs_v + block_seq_n * stride_mid_os)
+        block_o = tl.load(
+            Mid_O + offs_v + block_seq_n * stride_mid_os,
+            mask=dim_mask,
+            other=0.0,
+        )
         block_lse = tl.load(Mid_O_LogExpSum + offs_logic + block_seq_n * stride_mid_o_es)
         new_max_logic = tl.maximum(block_lse, max_logic)
         old_scale = tl.exp(max_logic - new_max_logic)
@@ -57,7 +64,7 @@ def _fwd_kernel_flash_decode_stage2(
     tl.store(
         O + cur_batch * stride_obs + cur_head * stride_oh + offs_d * stride_od,
         acc / sum_exp,
-        mask=block_n_size > 0,
+        mask=(block_n_size > 0) & dim_mask,
     )
 
 
@@ -73,8 +80,8 @@ def _validate_inputs(mid_out, mid_out_logexpsum, b_seqlen, output, block_seq):
             f"{mid_out.shape}/{mid_out_logexpsum.shape}/{output.shape}."
         )
     batch, heads, blocks, head_dim = map(int, mid_out.shape)
-    if head_dim not in _SUPPORTED_HEAD_DIMS:
-        raise ValueError(f"stage 2 head_dim must be one of {sorted(_SUPPORTED_HEAD_DIMS)}, got {head_dim}.")
+    if not (_MIN_HEAD_DIM <= head_dim <= _MAX_HEAD_DIM):
+        raise ValueError(f"stage 2 head_dim must be in [{_MIN_HEAD_DIM}, {_MAX_HEAD_DIM}], got {head_dim}.")
     if mid_out.dtype != torch.float32 or mid_out_logexpsum.dtype != torch.float32:
         raise ValueError(
             f"stage 2 workspace must be FP32, got {mid_out.dtype}/{mid_out_logexpsum.dtype}."
@@ -142,7 +149,8 @@ def flash_decode_stage2_variant(
         output.stride(1),
         output.stride(2),
         BLOCK_SEQ=block_seq,
-        BLOCK_DMODEL=mid_out.shape[-1],
+        HEAD_DIM=mid_out.shape[-1],
+        BLOCK_DMODEL=triton.next_power_of_2(mid_out.shape[-1]),
         num_warps=num_warps,
         num_stages=2,
     )
@@ -150,7 +158,8 @@ def flash_decode_stage2_variant(
 
 @torch.no_grad()
 def flash_decode_stage2(mid_out, mid_out_logexpsum, b_seqlen, output, block_seq):
-    variant_id = "unified_s2_w8" if mid_out.shape[-1] == 256 else "unified_s2_w4"
+    padded_head_dim = triton.next_power_of_2(mid_out.shape[-1])
+    variant_id = "unified_s2_w8" if padded_head_dim >= 256 else "unified_s2_w4"
     flash_decode_stage2_variant(
         mid_out,
         mid_out_logexpsum,

@@ -1,4 +1,5 @@
 import math
+import os
 
 import pytest
 import torch
@@ -7,7 +8,8 @@ from sparsevllm.engine.cache_manager import DecodeComputeView
 from sparsevllm.layers.attention_backend import TritonAttentionBackend
 from sparsevllm.triton_kernel.flash_decoding_stage2 import flash_decode_stage2
 from sparsevllm.triton_kernel.gqa_flash_decoding_stage1 import (
-    _production_variant_id,
+    _PRODUCTION_VARIANT_ID,
+    _requires_64bit_cache_offsets,
     flash_decode_stage1,
     flash_decode_stage1_variant,
     flash_decode_stage1_with_score,
@@ -277,18 +279,23 @@ def test_d256_ragged_length_boundaries(dtype, score_mode):
     _assert_case(case, variant_id="grouped_s1_allow256_w2")
 
 
-@pytest.mark.parametrize(
-    "batch,max_len,expected",
-    [
-        (1, 128, "per_q_s1_w8"),
-        (8, 128, "per_q_s1_w8"),
-        (32, 128, "grouped_s1_allow256_w2"),
-        (1, 129, "grouped_s1_allow256_w2"),
-    ],
-)
-def test_production_variant_crossover(batch, max_len, expected):
-    q = torch.empty((batch, 16, 256), device="cuda", dtype=torch.bfloat16)
-    assert _production_variant_id(q, max_len) == expected
+def test_production_variant_is_shape_independent():
+    assert _PRODUCTION_VARIANT_ID == "grouped_s1_bn16_w2_s2"
+
+
+def test_cache_offset_width_is_derived_from_tensor_geometry():
+    class TensorGeometry:
+        def __init__(self, shape, stride):
+            self.shape = shape
+            self._stride = stride
+
+        def stride(self):
+            return self._stride
+
+    int32_safe = TensorGeometry((2097152, 4, 256), (1024, 256, 1))
+    needs_int64 = TensorGeometry((2097153, 4, 256), (1024, 256, 1))
+    assert not _requires_64bit_cache_offsets(int32_safe)
+    assert _requires_64bit_cache_offsets(needs_int64)
 
 
 @pytest.mark.parametrize("block_seq", [128, 512])
@@ -306,7 +313,78 @@ def test_d256_block_seq_boundaries(block_seq):
     _assert_case(case)
 
 
-@pytest.mark.parametrize("head_dim", [16, 32, 64, 128])
+@pytest.mark.parametrize(
+    "variant_id",
+    [
+        "grouped_s1_bn16_w2_s1",
+        "grouped_s1_bn16_w2_s3",
+        "grouped_s1_bn32_w2_s2",
+        "grouped_s1_bn64_w2_s2",
+        "grouped_s1_bn128_w2_s2",
+    ],
+)
+def test_d256_tuning_variants_match_fp32_oracle(variant_id):
+    case = _make_case(
+        context_lens=[17, 63, 129, 257],
+        hq=16,
+        hkv=4,
+        head_dim=256,
+        dtype=torch.bfloat16,
+        max_len=512,
+        block_seq=256,
+        score_mode="none",
+    )
+    _assert_case(case, variant_id=variant_id)
+
+
+@pytest.mark.skipif(
+    os.environ.get("SVLLM_RUN_LONG_GPU_TESTS") != "1",
+    reason="set SVLLM_RUN_LONG_GPU_TESTS=1 for the 256K baseline/candidate cross-check",
+)
+def test_d256_256k_baseline_matches_grouped_output():
+    torch.manual_seed(SEED)
+    batch, hq, hkv, head_dim, context_len, block_seq = 9, 16, 4, 256, 262144, 256
+    q = torch.randn((batch, hq, head_dim), dtype=torch.bfloat16, device="cuda")
+    k = torch.randn((batch * context_len, hkv, head_dim), dtype=torch.bfloat16, device="cuda")
+    v = torch.randn_like(k)
+    slots = torch.arange(batch * context_len, dtype=torch.int32, device="cuda").view(batch, context_len)
+    req_indices = torch.arange(batch, dtype=torch.int32, device="cuda")
+    context_lens = torch.full((batch,), context_len, dtype=torch.int32, device="cuda")
+    blocks = math.ceil(context_len / block_seq)
+
+    outputs = {}
+    for variant_id in ("per_q_s1_w8", "grouped_s1_allow256_w2"):
+        mid_o = torch.empty((batch, hq, blocks, head_dim), dtype=torch.float32, device="cuda")
+        mid_lse = torch.empty((batch, hq, blocks), dtype=torch.float32, device="cuda")
+        output = torch.empty_like(q)
+        flash_decode_stage1_variant(
+            q,
+            k,
+            v,
+            slots,
+            req_indices,
+            context_lens,
+            context_len,
+            mid_o,
+            mid_lse,
+            block_seq,
+            variant_id=variant_id,
+        )
+        flash_decode_stage2(mid_o, mid_lse, context_lens, output, block_seq)
+        torch.cuda.synchronize()
+        assert torch.isfinite(mid_o).all()
+        assert torch.isfinite(mid_lse).all()
+        assert torch.isfinite(output).all()
+        outputs[variant_id] = output.float()
+    torch.testing.assert_close(
+        outputs["grouped_s1_allow256_w2"],
+        outputs["per_q_s1_w8"],
+        rtol=2e-2,
+        atol=2e-2,
+    )
+
+
+@pytest.mark.parametrize("head_dim", [16, 17, 24, 31, 40, 65, 80, 127, 160, 192, 224, 255, 256])
 def test_grouped_regression_head_dims(head_dim):
     case = _make_case(
         context_lens=[17, 129],

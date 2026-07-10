@@ -5,15 +5,46 @@ import triton
 import triton.language as tl
 
 
-_SUPPORTED_HEAD_DIMS = {16, 32, 64, 128, 256}
+_MIN_HEAD_DIM = 16
+_MAX_HEAD_DIM = 256
 _SUPPORTED_DTYPES = {torch.float16, torch.bfloat16}
-_VARIANT_WARPS = {
-    "grouped_s1_allow256_w2": ("grouped", 2),
-    "grouped_s1_allow256_w4": ("grouped", 4),
-    "grouped_s1_allow256_w8": ("grouped", 8),
-    "per_q_s1_w4": ("per_q", 4),
-    "per_q_s1_w8": ("per_q", 8),
+_VARIANT_CONFIGS = {
+    "grouped_s1_allow256_w2": ("grouped", 2, 16, 2),
+    "grouped_s1_allow256_w4": ("grouped", 4, 16, 2),
+    "grouped_s1_allow256_w8": ("grouped", 8, 16, 2),
+    "grouped_s1_bn16_w2_s1": ("grouped", 2, 16, 1),
+    "grouped_s1_bn16_w2_s2": ("grouped", 2, 16, 2),
+    "grouped_s1_bn16_w2_s3": ("grouped", 2, 16, 3),
+    "grouped_s1_bn32_w2_s2": ("grouped", 2, 32, 2),
+    "grouped_s1_bn64_w2_s2": ("grouped", 2, 64, 2),
+    "grouped_s1_bn128_w2_s2": ("grouped", 2, 128, 2),
+    "per_q_s1_w4": ("per_q", 4, 16, 2),
+    "per_q_s1_w8": ("per_q", 8, 16, 2),
 }
+
+
+def get_stage1_variant_config(variant_id):
+    try:
+        schedule, num_warps, block_n, num_stages = _VARIANT_CONFIGS[variant_id]
+    except KeyError as exc:
+        raise ValueError(
+            f"Unknown GQA stage 1 variant_id={variant_id!r}; expected one of {sorted(_VARIANT_CONFIGS)}."
+        ) from exc
+    return {
+        "schedule": schedule,
+        "num_warps": num_warps,
+        "block_n": block_n,
+        "num_stages": num_stages,
+    }
+
+
+def _requires_64bit_cache_offsets(*tensors):
+    int32_max = torch.iinfo(torch.int32).max
+    for tensor in tensors:
+        max_offset = sum((size - 1) * abs(stride) for size, stride in zip(tensor.shape, tensor.stride()))
+        if max_offset > int32_max:
+            return True
+    return False
 
 
 @triton.jit
@@ -52,8 +83,10 @@ def _fwd_kernel_gqa_flash_decode_stage1_grouped(
     gqa_group_size,
     STORE_SCORE_3D: tl.constexpr,
     STORE_SCORE_2D: tl.constexpr,
+    USE_64BIT_OFFSETS: tl.constexpr,
     Q_HEAD_NUM: tl.constexpr,
     BLOCK_SEQ: tl.constexpr,
+    HEAD_DIM: tl.constexpr,
     BLOCK_DMODEL: tl.constexpr,
     BLOCK_N: tl.constexpr,
 ):
@@ -82,7 +115,8 @@ def _fwd_kernel_gqa_flash_decode_stage1_grouped(
         + cur_q_head_range[:, None] * stride_qh
         + offs_d[None, :] * stride_qd
     )
-    q = tl.load(Q + off_q, mask=head_mask[:, None], other=0.0)
+    dim_mask = offs_d < HEAD_DIM
+    q = tl.load(Q + off_q, mask=head_mask[:, None] & dim_mask[None, :], other=0.0)
     offs_n = cur_batch_start_index + tl.arange(0, BLOCK_N)
 
     sum_exp = tl.zeros([Q_HEAD_NUM], dtype=tl.float32)
@@ -99,12 +133,14 @@ def _fwd_kernel_gqa_flash_decode_stage1_grouped(
             mask=token_mask,
             other=0,
         )
+        if USE_64BIT_OFFSETS:
+            k_loc = k_loc.to(tl.int64)
         off_k = (
             k_loc[None, :] * stride_kbs
             + cur_kv_head * stride_kh
             + offs_d[:, None] * stride_kd
         )
-        k = tl.load(K + off_k, mask=token_mask[None, :], other=0.0)
+        k = tl.load(K + off_k, mask=token_mask[None, :] & dim_mask[:, None], other=0.0)
         raw_qk = tl.dot(q, k)
         raw_qk = tl.where(head_mask[:, None] & token_mask[None, :], raw_qk, -float("inf"))
 
@@ -129,7 +165,7 @@ def _fwd_kernel_gqa_flash_decode_stage1_grouped(
             + cur_kv_head * stride_vh
             + offs_d[None, :] * stride_vd
         )
-        v = tl.load(V + off_v, mask=token_mask[:, None], other=0.0)
+        v = tl.load(V + off_v, mask=token_mask[:, None] & dim_mask[None, :], other=0.0)
         cur_max_logic = tl.max(logits, axis=1)
         new_max_logic = tl.maximum(cur_max_logic, max_logic)
         exp_logic = tl.exp(logits - new_max_logic[:, None])
@@ -155,7 +191,7 @@ def _fwd_kernel_gqa_flash_decode_stage1_grouped(
     tl.store(
         Mid_O + off_mid_o,
         acc / sum_exp[:, None],
-        mask=valid_block & head_mask[:, None],
+        mask=valid_block & head_mask[:, None] & dim_mask[None, :],
     )
     tl.store(
         Mid_O_LogExpSum + off_mid_lse,
@@ -200,7 +236,9 @@ def _fwd_kernel_gqa_flash_decode_stage1_per_q(
     gqa_group_size,
     STORE_SCORE_3D: tl.constexpr,
     STORE_SCORE_2D: tl.constexpr,
+    USE_64BIT_OFFSETS: tl.constexpr,
     BLOCK_SEQ: tl.constexpr,
+    HEAD_DIM: tl.constexpr,
     BLOCK_DMODEL: tl.constexpr,
     BLOCK_N: tl.constexpr,
 ):
@@ -222,7 +260,12 @@ def _fwd_kernel_gqa_flash_decode_stage1_per_q(
         // BLOCK_N
     )
 
-    q = tl.load(Q + cur_batch * stride_qbs + cur_head * stride_qh + offs_d * stride_qd)
+    dim_mask = offs_d < HEAD_DIM
+    q = tl.load(
+        Q + cur_batch * stride_qbs + cur_head * stride_qh + offs_d * stride_qd,
+        mask=dim_mask,
+        other=0.0,
+    )
     offs_n = cur_batch_start_index + tl.arange(0, BLOCK_N)
     sum_exp = 0.0
     max_logic = -float("inf")
@@ -238,12 +281,14 @@ def _fwd_kernel_gqa_flash_decode_stage1_per_q(
             mask=token_mask,
             other=0,
         )
+        if USE_64BIT_OFFSETS:
+            k_loc = k_loc.to(tl.int64)
         off_k = (
             k_loc[:, None] * stride_kbs
             + cur_kv_head * stride_kh
             + offs_d[None, :] * stride_kd
         )
-        k = tl.load(K + off_k, mask=token_mask[:, None], other=0.0)
+        k = tl.load(K + off_k, mask=token_mask[:, None] & dim_mask[None, :], other=0.0)
         raw_qk = tl.sum(q[None, :].to(tl.float32) * k.to(tl.float32), axis=1)
         raw_qk = tl.where(token_mask, raw_qk, -float("inf"))
         if STORE_SCORE_3D:
@@ -265,7 +310,7 @@ def _fwd_kernel_gqa_flash_decode_stage1_per_q(
             + cur_kv_head * stride_vh
             + offs_d[None, :] * stride_vd
         )
-        v = tl.load(V + off_v, mask=token_mask[:, None], other=0.0)
+        v = tl.load(V + off_v, mask=token_mask[:, None] & dim_mask[None, :], other=0.0)
         cur_max_logic = tl.max(logits, axis=0)
         new_max_logic = tl.maximum(cur_max_logic, max_logic)
         exp_logic = tl.exp(logits - new_max_logic)
@@ -287,7 +332,7 @@ def _fwd_kernel_gqa_flash_decode_stage1_per_q(
         + cur_head * stride_mid_o_eh
         + seq_start_block * stride_mid_o_es
     )
-    tl.store(Mid_O + off_mid_o, acc / sum_exp, mask=valid_block)
+    tl.store(Mid_O + off_mid_o, acc / sum_exp, mask=valid_block & dim_mask)
     tl.store(Mid_O_LogExpSum + off_mid_lse, max_logic + tl.log(sum_exp), mask=valid_block)
 
 
@@ -352,8 +397,10 @@ def _validate_inputs(
             f"Q/K/V head dimensions must match, got {q.shape[-1]}/{k.shape[-1]}/{v.shape[-1]}."
         )
     head_dim = int(q.shape[-1])
-    if head_dim not in _SUPPORTED_HEAD_DIMS:
-        raise ValueError(f"GQA decode head_dim must be one of {sorted(_SUPPORTED_HEAD_DIMS)}, got {head_dim}.")
+    if not (_MIN_HEAD_DIM <= head_dim <= _MAX_HEAD_DIM):
+        raise ValueError(
+            f"GQA decode head_dim must be in [{_MIN_HEAD_DIM}, {_MAX_HEAD_DIM}], got {head_dim}."
+        )
     if q.dtype != k.dtype or q.dtype != v.dtype or q.dtype not in _SUPPORTED_DTYPES:
         raise ValueError(f"Q/K/V must share FP16 or BF16 dtype, got {q.dtype}/{k.dtype}/{v.dtype}.")
     if k.shape[0] != v.shape[0] or k.shape[1] != v.shape[1]:
@@ -457,10 +504,8 @@ def _launch_stage1(
         block_seq,
         attn_score,
     )
-    try:
-        schedule, num_warps = _VARIANT_WARPS[variant_id]
-    except KeyError as exc:
-        raise ValueError(f"Unknown GQA stage 1 variant_id={variant_id!r}; expected one of {sorted(_VARIANT_WARPS)}.") from exc
+    config = get_stage1_variant_config(variant_id)
+    schedule = config["schedule"]
 
     store_score_3d = attn_score is not None and attn_score.dim() == 3
     store_score_2d = attn_score is not None and attn_score.dim() == 2
@@ -482,11 +527,13 @@ def _launch_stage1(
     meta = {
         "STORE_SCORE_3D": store_score_3d,
         "STORE_SCORE_2D": store_score_2d,
+        "USE_64BIT_OFFSETS": _requires_64bit_cache_offsets(k, v),
         "BLOCK_SEQ": block_seq,
-        "BLOCK_DMODEL": q.shape[-1],
-        "BLOCK_N": 16,
-        "num_warps": num_warps,
-        "num_stages": 2,
+        "HEAD_DIM": q.shape[-1],
+        "BLOCK_DMODEL": triton.next_power_of_2(q.shape[-1]),
+        "BLOCK_N": config["block_n"],
+        "num_warps": config["num_warps"],
+        "num_stages": config["num_stages"],
     }
     if schedule == "grouped":
         meta["Q_HEAD_NUM"] = max(16, triton.next_power_of_2(group_size))
@@ -560,10 +607,7 @@ def flash_decode_stage1_variant(
     )
 
 
-def _production_variant_id(q, max_len_in_batch):
-    if q.shape[-1] == 256 and q.shape[0] <= 8 and int(max_len_in_batch) <= 128:
-        return "per_q_s1_w8"
-    return "grouped_s1_allow256_w2"
+_PRODUCTION_VARIANT_ID = "grouped_s1_bn16_w2_s2"
 
 
 @torch.no_grad()
@@ -579,7 +623,6 @@ def flash_decode_stage1(
     mid_out_logsumexp,
     block_seq,
 ):
-    variant_id = _production_variant_id(q, max_len_in_batch)
     _launch_stage1(
         q,
         k,
@@ -592,7 +635,7 @@ def flash_decode_stage1(
         mid_out_logsumexp,
         block_seq,
         attn_score=None,
-        variant_id=variant_id,
+        variant_id=_PRODUCTION_VARIANT_ID,
     )
 
 
@@ -610,7 +653,6 @@ def flash_decode_stage1_with_score(
     attn_score,
     block_seq,
 ):
-    variant_id = _production_variant_id(q, max_len_in_batch)
     _launch_stage1(
         q,
         k,
@@ -623,5 +665,5 @@ def flash_decode_stage1_with_score(
         mid_out_logsumexp,
         block_seq,
         attn_score=attn_score,
-        variant_id=variant_id,
+        variant_id=_PRODUCTION_VARIANT_ID,
     )

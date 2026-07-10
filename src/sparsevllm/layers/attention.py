@@ -166,7 +166,10 @@ class Attention(nn.Module):
                         raise RuntimeError(
                             f"decode requires a positive context length, got {max_len_in_batch} at layer={layer_idx}"
                         )
-                BLOCK_SEQ = cache_manager.get_decode_block_seq(layer_idx, 256)
+                default_block_seq = 256
+                if self.num_heads > self.num_kv_heads:
+                    default_block_seq = cache_manager.config.gqa_decode_block_seq
+                BLOCK_SEQ = cache_manager.get_decode_block_seq(layer_idx, default_block_seq)
                 num_seq_blocks = (max_len_in_batch + BLOCK_SEQ - 1) // BLOCK_SEQ
 
                 mid_o, mid_o_logexpsum = get_decode_workspace(

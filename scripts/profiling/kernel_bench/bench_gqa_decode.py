@@ -23,7 +23,10 @@ from sparsevllm.triton_kernel.flash_decoding_stage2 import (
     flash_decode_stage2,
     flash_decode_stage2_variant,
 )
-from sparsevllm.triton_kernel.gqa_flash_decoding_stage1 import flash_decode_stage1_variant
+from sparsevllm.triton_kernel.gqa_flash_decoding_stage1 import (
+    flash_decode_stage1_variant,
+    get_stage1_variant_config,
+)
 
 
 VALID_STATUSES = {
@@ -48,6 +51,12 @@ STAGE1_VARIANTS = (
     "grouped_s1_allow256_w2",
     "grouped_s1_allow256_w4",
     "grouped_s1_allow256_w8",
+    "grouped_s1_bn16_w2_s1",
+    "grouped_s1_bn16_w2_s2",
+    "grouped_s1_bn16_w2_s3",
+    "grouped_s1_bn32_w2_s2",
+    "grouped_s1_bn64_w2_s2",
+    "grouped_s1_bn128_w2_s2",
     "per_q_s1_w4",
     "per_q_s1_w8",
 )
@@ -59,6 +68,10 @@ DEFAULT_SEED = 20260710
 
 def _csv(value, cast=str):
     return [cast(item.strip()) for item in value.split(",") if item.strip()]
+
+
+def _next_power_of_two(value):
+    return 1 << (int(value) - 1).bit_length()
 
 
 def _json_hash(value):
@@ -200,8 +213,14 @@ class ArtifactWriter:
             handle.write(json.dumps(value, sort_keys=True, ensure_ascii=False) + "\n")
 
 
-def _variant_warps(variant):
-    return int(variant.rsplit("w", 1)[1])
+def _variant_config(variant):
+    if variant in STAGE1_VARIANTS:
+        return get_stage1_variant_config(variant)
+    return {
+        "num_warps": int(variant.rsplit("w", 1)[1]),
+        "block_n": 16,
+        "num_stages": 2,
+    }
 
 
 def build_manifest(args):
@@ -226,11 +245,13 @@ def build_manifest(args):
                                     elif stage == "stage2":
                                         stage_variants = [v for v in variants if v in STAGE2_VARIANTS]
                                     elif stage == "combined":
-                                        suffix = "unified_s2_w8" if head_dim == 256 else "unified_s2_w4"
+                                        suffix = "unified_s2_w8" if _next_power_of_two(head_dim) >= 256 else "unified_s2_w4"
                                         stage_variants = [f"{v}+{suffix}" for v in variants if v in STAGE1_VARIANTS]
                                     else:
                                         raise ValueError(f"Unknown stage {stage!r}")
                                     for variant in stage_variants:
+                                        stage1_or_stage2_variant = variant.split("+", 1)[0]
+                                        config = _variant_config(stage1_or_stage2_variant)
                                         canonical = {
                                             "variant_id": variant,
                                             "stage": stage,
@@ -263,12 +284,12 @@ def build_manifest(args):
                                                 context_len=seq_len,
                                                 max_len_in_batch=seq_len,
                                                 block_seq=block_seq,
-                                                block_n=16,
+                                                block_n=config["block_n"],
                                                 slot_case=slot_case,
                                                 layout_case="contiguous",
                                                 seed=args.seed,
-                                                num_warps=_variant_warps(variant.split("+", 1)[0]),
-                                                num_stages=2,
+                                                num_warps=config["num_warps"],
+                                                num_stages=config["num_stages"],
                                                 warmup=args.warmup,
                                                 rounds=args.rounds,
                                                 iterations=args.iterations,
@@ -427,7 +448,6 @@ def run_case(case, writer, profile_only=False):
     base["context_lens"] = [case.context_len] * case.B
     compile_row = {
         **base,
-        "block_n": 16,
         "resource_metadata_status": "unavailable",
         "resource_metadata_reason": "Triton 3.4 launcher does not expose stable register/spill metadata; use NCU reports.",
         "triton_cache_dir": os.environ.get("TRITON_CACHE_DIR"),
@@ -540,9 +560,9 @@ def aggregate_results(results):
             if row["stage"] == "stage1":
                 baseline = "per_q_s1_w8" if row["head_dim"] == 256 else "grouped_s1_allow256_w2"
             elif row["stage"] == "stage2":
-                baseline = "unified_s2_w8" if row["head_dim"] == 256 else "unified_s2_w4"
+                baseline = "unified_s2_w8" if _next_power_of_two(row["head_dim"]) >= 256 else "unified_s2_w4"
             else:
-                suffix = "unified_s2_w8" if row["head_dim"] == 256 else "unified_s2_w4"
+                suffix = "unified_s2_w8" if _next_power_of_two(row["head_dim"]) >= 256 else "unified_s2_w4"
                 baseline = ("per_q_s1_w8" if row["head_dim"] == 256 else "grouped_s1_allow256_w2") + "+" + suffix
             baseline_row = variants.get(baseline)
             if baseline_row and baseline_row.get("status") == "success":
@@ -660,7 +680,7 @@ def _report(run_info, aggregate):
             "",
             "grouped schedule 每个 CTA 同时处理一个 KV head 对应的 query-head group，以 `tl.dot` 复用 K/V；"
             "per-Q baseline 每个 CTA 处理一个 query head，FP32 显式 reduction 会重复读取共享 K/V。"
-            "第一轮固定 `BLOCK_N=16`、`num_stages=2`，只扫描 `num_warps={2,4,8}`。",
+            "variant_id 明确记录 schedule、BLOCK_N、num_warps 和 num_stages；每轮候选只改变一个主要变量。",
             "Triton 3.4 launcher 未提供稳定的 register/spill 元数据，相关字段明确记为 unavailable；实际资源证据保存在 `ncu/`。",
             "",
             "## 限制",
@@ -680,10 +700,10 @@ def parse_args():
     parser.add_argument("--num-kv-heads", type=int, default=4)
     parser.add_argument("--head-dims", default="128,256")
     parser.add_argument("--batch-sizes", default="1,8")
-    parser.add_argument("--seq-lens", default="256,1024,8192,32768")
+    parser.add_argument("--seq-lens", default="256,1024,8192,32768,131072,262144")
     parser.add_argument("--dtypes", default="bf16")
     parser.add_argument("--score-modes", default="none,2d,3d")
-    parser.add_argument("--block-seqs", default="256")
+    parser.add_argument("--block-seqs", default="512")
     parser.add_argument("--slot-orders", default="ordered,shuffled")
     parser.add_argument("--seed", type=int, default=DEFAULT_SEED)
     parser.add_argument("--warmup", type=int, default=25)

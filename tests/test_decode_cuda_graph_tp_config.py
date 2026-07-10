@@ -62,6 +62,14 @@ class DecodeCudaGraphTPConfigTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "capture_sampling is disabled"):
             self._config("snapkv", decode_cuda_graph_capture_sampling=True)
 
+    def test_gqa_decode_block_seq_is_configurable_and_validated(self):
+        self.assertEqual(self._config("vanilla").gqa_decode_block_seq, 512)
+        self.assertEqual(self._config("vanilla", gqa_decode_block_seq=1024).gqa_decode_block_seq, 1024)
+        for value in (0, -16, 17):
+            with self.subTest(value=value):
+                with self.assertRaisesRegex(ValueError, "gqa_decode_block_seq"):
+                    self._config("vanilla", gqa_decode_block_seq=value)
+
 
 if __name__ == "__main__":
     unittest.main()
