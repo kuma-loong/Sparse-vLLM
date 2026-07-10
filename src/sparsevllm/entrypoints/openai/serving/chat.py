@@ -249,7 +249,17 @@ async def _chat_completion_stream(
                     continue
                 if item["type"] == "token":
                     completion_tokens += len(item["token_ids"])
-                    if not item["text"]:
+                    logprobs = (
+                        _chat_logprobs(
+                            tokenizer,
+                            item.get("token_ids", []),
+                            item.get("token_logprobs", []),
+                            item.get("top_logprobs", []),
+                        )
+                        if tokenizer is not None
+                        else None
+                    )
+                    if not item["text"] and logprobs is None:
                         continue
                     delta: dict[str, Any] = {"content": item["text"]}
                     if first_chunk:
@@ -265,14 +275,7 @@ async def _chat_completion_stream(
                                 {
                                     "index": item["index"],
                                     "delta": delta,
-                                    "logprobs": _chat_logprobs(
-                                        tokenizer,
-                                        item.get("token_ids", []),
-                                        item.get("token_logprobs", []),
-                                        item.get("top_logprobs", []),
-                                    )
-                                    if tokenizer is not None
-                                    else None,
+                                    "logprobs": logprobs,
                                     "finish_reason": None,
                                 }
                             ],

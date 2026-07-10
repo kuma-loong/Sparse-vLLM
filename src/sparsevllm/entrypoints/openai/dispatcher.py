@@ -286,24 +286,7 @@ class AsyncEngineDispatcher:
             text = visible_text[request.emitted_text_len:emit_len]
             request.emitted_text_len = emit_len
             if text or (stop_index is None and raw_text_delta):
-                pending_token_ids = list(request.pending_token_ids)
-                pending_token_logprobs = list(request.pending_token_logprobs)
-                pending_top_logprobs = list(request.pending_top_logprobs)
-                request.pending_token_ids.clear()
-                request.pending_token_logprobs.clear()
-                request.pending_top_logprobs.clear()
-                self._put(
-                    request,
-                    {
-                        "type": "token",
-                        "index": request.index,
-                        "text": text,
-                        "raw_text_delta": raw_text_delta,
-                        "token_ids": pending_token_ids,
-                        "token_logprobs": pending_token_logprobs,
-                        "top_logprobs": pending_top_logprobs,
-                    },
-                )
+                self._publish_pending_token_event(request, text, raw_text_delta)
             if stop_index is not None:
                 final = request.detokenizer.finish(request.completion_token_ids)
                 active.pop(seq_id, None)
@@ -324,6 +307,28 @@ class AsyncEngineDispatcher:
                         "top_logprobs": request.completion_top_logprobs,
                     },
                 )
+
+    def _publish_pending_token_event(
+        self,
+        request: _ActiveRequest,
+        text: str,
+        raw_text_delta: str,
+    ):
+        self._put(
+            request,
+            {
+                "type": "token",
+                "index": request.index,
+                "text": text,
+                "raw_text_delta": raw_text_delta,
+                "token_ids": list(request.pending_token_ids),
+                "token_logprobs": list(request.pending_token_logprobs),
+                "top_logprobs": list(request.pending_top_logprobs),
+            },
+        )
+        request.pending_token_ids.clear()
+        request.pending_token_logprobs.clear()
+        request.pending_top_logprobs.clear()
 
     def _drain_aborts(self, active: dict[int, _ActiveRequest]):
         while True:
@@ -368,7 +373,11 @@ class AsyncEngineDispatcher:
             request = active.get(seq_id)
             if request is None:
                 continue
+            observed = len(request.completion_token_ids)
             final = request.detokenizer.finish(completion_token_ids)
+            request.pending_token_ids.extend(completion_token_ids[observed:])
+            request.pending_token_logprobs.extend(token_logprobs[observed:])
+            request.pending_top_logprobs.extend(top_logprobs[observed:])
             active.pop(seq_id, None)
             request.completion_token_ids = list(completion_token_ids)
             request.completion_token_logprobs = list(token_logprobs)
@@ -379,6 +388,15 @@ class AsyncEngineDispatcher:
             if stop_index is not None:
                 text = text[:stop_index]
                 finish_reason = "stop"
+            text_delta = text[request.emitted_text_len:]
+            has_pending_logprobs = any(
+                value is not None for value in request.pending_token_logprobs
+            ) or any(value is not None for value in request.pending_top_logprobs)
+            if request.pending_token_ids and (
+                text_delta or final.raw_text_delta or has_pending_logprobs
+            ):
+                self._publish_pending_token_event(request, text_delta, final.raw_text_delta)
+                request.emitted_text_len = len(text)
             self._put(
                 request,
                 {

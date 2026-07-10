@@ -199,7 +199,17 @@ async def _completion_stream(
                     continue
                 if item["type"] == "token":
                     completion_tokens += len(item["token_ids"])
-                    if not item["text"]:
+                    logprobs = (
+                        _completion_logprobs(
+                            tokenizer,
+                            item.get("token_ids", []),
+                            item.get("token_logprobs", []),
+                            item.get("top_logprobs", []),
+                        )
+                        if tokenizer is not None
+                        else None
+                    )
+                    if not item["text"] and logprobs is None:
                         continue
                     yield _sse(
                         {
@@ -211,14 +221,7 @@ async def _completion_stream(
                                 {
                                     "text": item["text"],
                                     "index": item["index"],
-                                    "logprobs": _completion_logprobs(
-                                        tokenizer,
-                                        item.get("token_ids", []),
-                                        item.get("token_logprobs", []),
-                                        item.get("top_logprobs", []),
-                                    )
-                                    if tokenizer is not None
-                                    else None,
+                                    "logprobs": logprobs,
                                     "finish_reason": None,
                                 }
                             ],

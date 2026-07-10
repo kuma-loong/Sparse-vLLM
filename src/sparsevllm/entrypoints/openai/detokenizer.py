@@ -68,8 +68,12 @@ class IncrementalDetokenizer:
                 "Incremental detokenization token history mismatch: "
                 f"observed={self.token_ids!r} final={final_token_ids!r}."
             )
+        pushed_text_delta = ""
+        pushed_raw_text_delta = ""
         if len(final_token_ids) > observed:
-            self.push(final_token_ids[observed:])
+            pushed = self.push(final_token_ids[observed:])
+            pushed_text_delta = pushed.text
+            pushed_raw_text_delta = pushed.raw_text
 
         final_text = self.tokenizer.decode(final_token_ids, skip_special_tokens=True)
         final_raw_text = self.tokenizer.decode(final_token_ids, skip_special_tokens=False)
@@ -84,8 +88,8 @@ class IncrementalDetokenizer:
                 f"incremental={self.raw_text!r} final={final_raw_text!r}."
             )
 
-        text_delta = final_text[len(self.text):]
-        raw_text_delta = final_raw_text[len(self.raw_text):]
+        text_delta = pushed_text_delta + final_text[len(self.text):]
+        raw_text_delta = pushed_raw_text_delta + final_raw_text[len(self.raw_text):]
         self.text = final_text
         self.raw_text = final_raw_text
         self.finished = True
