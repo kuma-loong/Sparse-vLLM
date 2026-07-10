@@ -945,6 +945,15 @@ The raw HTTP stream remains standard SSE (`data: {...}` frames ending with
 `data: [DONE]`). The helper client parses those frames and prints only the
 incremental text.
 
+Online serving requires a Hugging Face fast tokenizer backend with
+`DecodeStream` support. Sparse-vLLM keeps independent request-local visible and
+raw incremental decoders, so byte-level tokens that split a multi-byte Unicode
+character are buffered until the character is complete. This applies uniformly
+to Completions, Chat Completions, and Responses streaming; the concatenated
+text deltas match the corresponding non-streaming final text. Unsupported slow
+tokenizers fail explicitly instead of falling back to unsafe per-token decoding
+or replacement-character filtering.
+
 Chat completions are also exposed:
 
 ```bash
