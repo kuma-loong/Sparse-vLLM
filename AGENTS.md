@@ -6,11 +6,17 @@ This repository includes a repo-local Codex skill.
 
 - `add-sparse-method`: Add or refactor a first-class Sparse-vLLM sparse method following this repo's architecture. Use when Codex needs to introduce a new `vllm_sparse_method`, move method logic out of `attention.py` or `utils/`, add method-specific cache metadata or decode-time view building, and preserve the cache-manager-first design. File: `.agents/skills/add-sparse-method/SKILL.md`
 - `code-review`: Review Sparse-vLLM diffs for correctness, sparse-runtime architecture, scheduling semantics, reproducibility, performance, and tests. Use when reviewing PRs, git diffs, sparse method integrations, cache-manager or scheduler changes, benchmark/evaluation scripts, OpenAI serving changes, or when the user asks for a code review. File: `.agents/skills/code-review/SKILL.md`
+- `optimize-triton-block-parameters`: Choose and tune Triton block sizes, warps, stages, and autotuning search spaces for an existing correct kernel. File: `.agents/skills/optimize-triton-block-parameters/SKILL.md`
+- `write-triton-attention-kernel`: Implement fused Flash Attention 2-style and custom attention kernels in Triton. File: `.agents/skills/write-triton-attention-kernel/SKILL.md`
+- `write-triton-gemm-kernel`: Implement correct, performant blocked GEMM and fused-epilogue kernels in Triton. File: `.agents/skills/write-triton-gemm-kernel/SKILL.md`
+- `write-triton-layernorm-kernel`: Implement numerically stable LayerNorm and RMSNorm kernels in Triton. File: `.agents/skills/write-triton-layernorm-kernel/SKILL.md`
+- `write-triton-softmax-kernel`: Implement numerically stable row-wise and masked softmax kernels in Triton. File: `.agents/skills/write-triton-softmax-kernel/SKILL.md`
 
 ## How to use
 
 - In this repo, invoke the sparse-method skill as `$add-sparse-method`.
 - In this repo, invoke the review skill as `$code-review`.
+- Invoke an installed Triton skill by its directory name, for example `$write-triton-gemm-kernel`.
 - Keep method-specific runtime state in `src/sparsevllm/engine/cache_manager/`.
 - Keep `src/sparsevllm/layers/attention.py` generic and hook new methods through shared cache-manager interfaces when possible.
 
