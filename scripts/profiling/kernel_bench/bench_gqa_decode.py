@@ -64,6 +64,30 @@ STAGE2_VARIANTS = ("unified_s2_w4", "unified_s2_w8")
 H100_BF16_PEAK_TFLOPS = 989.0
 H100_HBM_TBPS = 3.35
 DEFAULT_SEED = 20260710
+STANDARD_SEQ_LENS = (256, 1024, 8192, 32768, 131072, 262144)
+BROAD_SEQ_LENS = (
+    15,
+    16,
+    17,
+    127,
+    128,
+    129,
+    511,
+    512,
+    513,
+    997,
+    2535,
+    4093,
+    4096,
+    6872,
+    15437,
+    32749,
+    65521,
+    65536,
+    79439,
+    131071,
+    262143,
+)
 
 
 def _csv(value, cast=str):
@@ -77,6 +101,17 @@ def _next_power_of_two(value):
 def _json_hash(value):
     encoded = json.dumps(value, sort_keys=True, separators=(",", ":")).encode()
     return hashlib.sha256(encoded).hexdigest()
+
+
+def _resolve_seq_lens(args):
+    if args.seq_lens:
+        return _csv(args.seq_lens, int)
+    profile = getattr(args, "seq_profile", "standard")
+    if profile == "standard":
+        return list(STANDARD_SEQ_LENS)
+    if profile == "broad":
+        return list(BROAD_SEQ_LENS)
+    raise ValueError(f"Unknown seq_profile {profile!r}.")
 
 
 def _git(*args):
@@ -233,7 +268,7 @@ def build_manifest(args):
     score_modes = _csv(args.score_modes)
     cases = []
     for batch in _csv(args.batch_sizes, int):
-        for seq_len in _csv(args.seq_lens, int):
+        for seq_len in _resolve_seq_lens(args):
             for head_dim in _csv(args.head_dims, int):
                 for dtype in dtypes:
                     for block_seq in _csv(args.block_seqs, int):
@@ -700,7 +735,13 @@ def parse_args():
     parser.add_argument("--num-kv-heads", type=int, default=4)
     parser.add_argument("--head-dims", default="128,256")
     parser.add_argument("--batch-sizes", default="1,8")
-    parser.add_argument("--seq-lens", default="256,1024,8192,32768,131072,262144")
+    parser.add_argument("--seq-lens", help="Explicit comma-separated lengths; overrides --seq-profile.")
+    parser.add_argument(
+        "--seq-profile",
+        choices=("standard", "broad"),
+        default="standard",
+        help="Use regular standard lengths or deterministic boundary/irregular broad lengths.",
+    )
     parser.add_argument("--dtypes", default="bf16")
     parser.add_argument("--score-modes", default="none,2d,3d")
     parser.add_argument("--block-seqs", default="512")

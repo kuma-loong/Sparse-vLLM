@@ -79,6 +79,38 @@ def test_long_context_manifest_contains_baseline_and_optimized_data():
     assert all(case.block_n == 16 and case.num_stages == 2 for case in manifest)
 
 
+def test_broad_profile_covers_boundaries_and_realistic_irregular_lengths():
+    module = _load_module()
+    args = SimpleNamespace(
+        variants="per_q_s1_w8,grouped_s1_bn16_w2_s2",
+        stages="combined",
+        dtypes="bf16",
+        score_modes="none",
+        batch_sizes="1",
+        seq_lens=None,
+        seq_profile="broad",
+        head_dims="256",
+        block_seqs="512",
+        slot_orders="ordered",
+        num_heads=16,
+        num_kv_heads=4,
+        seed=20260710,
+        warmup=25,
+        rounds=5,
+        iterations=100,
+    )
+    manifest = module.build_manifest(args)
+    lengths = {case.context_len for case in manifest}
+    assert {2535, 6872, 79439} <= lengths
+    assert {15, 16, 17, 127, 128, 129, 511, 512, 513} <= lengths
+    assert {4093, 4096, 32749, 65521, 65536, 131071, 262143} <= lengths
+    assert len(manifest) == len(module.BROAD_SEQ_LENS) * 2
+    assert {case.variant_id for case in manifest} == {
+        "per_q_s1_w8+unified_s2_w8",
+        "grouped_s1_bn16_w2_s2+unified_s2_w8",
+    }
+
+
 def test_tuning_variant_metadata_records_actual_block_and_stages():
     module = _load_module()
     args = SimpleNamespace(

@@ -279,6 +279,93 @@ def test_d256_ragged_length_boundaries(dtype, score_mode):
     _assert_case(case, variant_id="grouped_s1_allow256_w2")
 
 
+@pytest.mark.parametrize(
+    "context_lens,hq,hkv,head_dim,dtype,max_len,block_seq,score_mode,strided,shuffled",
+    [
+        pytest.param(
+            [37, 997, 2535],
+            16,
+            4,
+            256,
+            torch.bfloat16,
+            2603,
+            512,
+            "none",
+            False,
+            True,
+            id="bf16-d256-ragged-shuffled",
+        ),
+        pytest.param(
+            [509, 1009, 2535],
+            12,
+            4,
+            160,
+            torch.float16,
+            2603,
+            128,
+            "3d",
+            True,
+            True,
+            id="fp16-ratio3-d160-strided-score",
+        ),
+        pytest.param(
+            [255, 4093, 6872],
+            28,
+            4,
+            127,
+            torch.bfloat16,
+            7001,
+            512,
+            "2d",
+            False,
+            True,
+            id="bf16-ratio7-d127-negative-score",
+        ),
+    ],
+)
+def test_realistic_irregular_ragged_lengths_match_fp32_oracle(
+    context_lens,
+    hq,
+    hkv,
+    head_dim,
+    dtype,
+    max_len,
+    block_seq,
+    score_mode,
+    strided,
+    shuffled,
+):
+    case = _make_case(
+        context_lens=context_lens,
+        hq=hq,
+        hkv=hkv,
+        head_dim=head_dim,
+        dtype=dtype,
+        max_len=max_len,
+        block_seq=block_seq,
+        score_mode=score_mode,
+        strided=strided,
+        shuffled=shuffled,
+        all_negative_qk=score_mode == "2d",
+    )
+    _assert_case(case)
+
+
+def test_long_irregular_79439_matches_fp32_oracle():
+    case = _make_case(
+        context_lens=[79439],
+        hq=8,
+        hkv=4,
+        head_dim=64,
+        dtype=torch.bfloat16,
+        max_len=79457,
+        block_seq=512,
+        score_mode="none",
+        shuffled=True,
+    )
+    _assert_case(case)
+
+
 def test_production_variant_is_shape_independent():
     assert _PRODUCTION_VARIANT_ID == "grouped_s1_bn16_w2_s2"
 
@@ -342,20 +429,30 @@ def test_d256_tuning_variants_match_fp32_oracle(variant_id):
     reason="set SVLLM_RUN_LONG_GPU_TESTS=1 for the 256K baseline/candidate cross-check",
 )
 def test_d256_256k_baseline_matches_grouped_output():
+    _assert_d256_baseline_matches_grouped([262144] * 9, max_len=262144, block_seq=256)
+
+
+def _assert_d256_baseline_matches_grouped(context_lens, *, max_len, block_seq, shuffled=False):
     torch.manual_seed(SEED)
-    batch, hq, hkv, head_dim, context_len, block_seq = 9, 16, 4, 256, 262144, 256
+    batch, hq, hkv, head_dim = len(context_lens), 16, 4, 256
     q = torch.randn((batch, hq, head_dim), dtype=torch.bfloat16, device="cuda")
-    k = torch.randn((batch * context_len, hkv, head_dim), dtype=torch.bfloat16, device="cuda")
+    k = torch.randn((batch * max_len, hkv, head_dim), dtype=torch.bfloat16, device="cuda")
     v = torch.randn_like(k)
-    slots = torch.arange(batch * context_len, dtype=torch.int32, device="cuda").view(batch, context_len)
+    slots = torch.arange(batch * max_len, dtype=torch.int32, device="cuda").view(batch, max_len)
+    if shuffled:
+        slots = torch.stack(
+            [row[torch.randperm(max_len, device="cuda")] for row in slots]
+        )
     req_indices = torch.arange(batch, dtype=torch.int32, device="cuda")
-    context_lens = torch.full((batch,), context_len, dtype=torch.int32, device="cuda")
-    blocks = math.ceil(context_len / block_seq)
+    context_lens = torch.tensor(context_lens, dtype=torch.int32, device="cuda")
+    blocks = math.ceil(max_len / block_seq)
 
     outputs = {}
-    for variant_id in ("per_q_s1_w8", "grouped_s1_allow256_w2"):
-        mid_o = torch.empty((batch, hq, blocks, head_dim), dtype=torch.float32, device="cuda")
-        mid_lse = torch.empty((batch, hq, blocks), dtype=torch.float32, device="cuda")
+    for variant_id in ("per_q_s1_w8", "grouped_s1_bn16_w2_s2"):
+        mid_o = torch.full(
+            (batch, hq, blocks, head_dim), SENTINEL, dtype=torch.float32, device="cuda"
+        )
+        mid_lse = torch.full((batch, hq, blocks), SENTINEL, dtype=torch.float32, device="cuda")
         output = torch.empty_like(q)
         flash_decode_stage1_variant(
             q,
@@ -364,7 +461,7 @@ def test_d256_256k_baseline_matches_grouped_output():
             slots,
             req_indices,
             context_lens,
-            context_len,
+            max_len,
             mid_o,
             mid_lse,
             block_seq,
@@ -372,15 +469,39 @@ def test_d256_256k_baseline_matches_grouped_output():
         )
         flash_decode_stage2(mid_o, mid_lse, context_lens, output, block_seq)
         torch.cuda.synchronize()
-        assert torch.isfinite(mid_o).all()
-        assert torch.isfinite(mid_lse).all()
+        for batch_idx, context_len in enumerate(context_lens.tolist()):
+            valid_blocks = math.ceil(context_len / block_seq)
+            assert torch.isfinite(mid_o[batch_idx, :, :valid_blocks]).all()
+            assert torch.isfinite(mid_lse[batch_idx, :, :valid_blocks]).all()
+            if valid_blocks < blocks:
+                assert torch.equal(
+                    mid_o[batch_idx, :, valid_blocks:],
+                    torch.full_like(mid_o[batch_idx, :, valid_blocks:], SENTINEL),
+                )
+                assert torch.equal(
+                    mid_lse[batch_idx, :, valid_blocks:],
+                    torch.full_like(mid_lse[batch_idx, :, valid_blocks:], SENTINEL),
+                )
         assert torch.isfinite(output).all()
         outputs[variant_id] = output.float()
     torch.testing.assert_close(
-        outputs["grouped_s1_allow256_w2"],
+        outputs["grouped_s1_bn16_w2_s2"],
         outputs["per_q_s1_w8"],
         rtol=2e-2,
         atol=2e-2,
+    )
+
+
+@pytest.mark.skipif(
+    os.environ.get("SVLLM_RUN_LONG_GPU_TESTS") != "1",
+    reason="set SVLLM_RUN_LONG_GPU_TESTS=1 for irregular D256 baseline/candidate cross-check",
+)
+def test_d256_irregular_ragged_baseline_matches_grouped_output():
+    _assert_d256_baseline_matches_grouped(
+        [2535, 6872, 79439],
+        max_len=79457,
+        block_seq=512,
+        shuffled=True,
     )
 
 
