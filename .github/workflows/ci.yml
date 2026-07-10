@@ -48,6 +48,8 @@ jobs:
     name: Full test suite
     runs-on: ubuntu-latest
     timeout-minutes: 60
+    env:
+      SPARSEVLLM_PLATFORM: cpu
 
     steps:
       - name: Check out repository
