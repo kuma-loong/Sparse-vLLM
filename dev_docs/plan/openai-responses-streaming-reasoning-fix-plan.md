@@ -18,6 +18,11 @@
 - streaming 取消会调用 dispatcher cancel。
 - smart router 对 `/v1/responses` streaming 继续透明转发 upstream bytes。
 - 过时的 `stream=true` 失败测试和文档描述已改写。
+- Chat Completions 已复用相同的 reasoning -> tool-call parser 顺序，并映射为
+  `delta.reasoning_content` 与标准 `delta.tool_calls`；没有复用 Responses SSE
+  event schema。
+- Chat 流式工具调用支持跨 chunk 标签/JSON、多调用 index、稳定 call id、
+  `finish_reason="tool_calls"`、显式 parse error 和客户端取消释放。
 
 ## 背景
 
@@ -498,6 +503,12 @@ CUDA_VISIBLE_DEVICES=<idle_gpu> sparsevllm-openai-server \
 特别是关闭 Responses reasoning parser 后的工具请求，模型仍生成思考正文、
 `</think>` 和 `<tool_call>`，服务端按 fail-visible 原则将其保留为 message；真实
 tool-call 事件验收使用该模型支持的默认 thinking mode 完成。
+
+同日新增的 Chat Completions 复用路径已使用空闲 GPU 0 和
+`/data2/pretrain_models/Qwen3-8B` 完成真实验证：thinking on/off、非流式工具
+调用、tool result 回填、reasoning + tool-call SSE、usage、smart router headers
+和 SSE 透明转发均通过。完整请求形状与 token 统计见
+`openai-responses-reasoning-plan.md` 的“Chat Completions 真实模型验证记录”。
 
 ## 完成标准
 

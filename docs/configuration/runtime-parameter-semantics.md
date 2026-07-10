@@ -865,7 +865,7 @@ The serving entrypoint has dedicated server flags:
 | `--port` | `8000` | Uvicorn bind port. |
 | `--engine-kwargs` | unset | JSON object or path to a JSON object with Sparse-vLLM engine kwargs. |
 | `--request-log-dir` | unset | Optional directory for per-request JSON logs. |
-| `--reasoning-parser` | unset | Optional Responses API parser. The first supported value is `qwen3`, which parses `<think>...</think>` output into a Sparse-vLLM reasoning item. |
+| `--reasoning-parser` | unset | Optional Chat Completions and Responses parser. The first supported value is `qwen3`, which parses `<think>...</think>` output into endpoint-specific Sparse-vLLM reasoning fields. |
 
 Additional `--kebab-case` flags are parsed as Sparse-vLLM engine kwargs. Use
 the canonical semantic keys accepted by
@@ -993,20 +993,48 @@ disagree with the visible output.
 Messages must use `developer`, `system`, `user`, `assistant`, or `tool` roles.
 String content and text-only content-part lists are supported; unknown nested
 message fields are rejected. Assistant messages may include the compatible
-`reasoning_content` extension; it is passed through to the Hugging Face chat
-template so the model template controls how historical reasoning is rendered.
+`reasoning_content` extension and OpenAI function `tool_calls`; tool result
+messages must use the `tool` role and a matching `tool_call_id`. These fields
+are passed through to the Hugging Face chat template so historical reasoning,
+calls, and results round-trip into the next prompt. Role-specific fields and
+malformed function call objects fail validation instead of being ignored.
 The `developer` role is rendered as `system` for Hugging Face chat templates
 because most local tokenizer templates do not define a separate developer
-role. When the loaded tokenizer exposes a chat template, the server renders messages with
-`apply_chat_template(..., add_generation_prompt=True)`; otherwise it uses a
-simple role-prefixed prompt. Chat `logprobs=true` enables sampled-token
-logprobs, and `top_logprobs` controls the number of top alternatives up to 20.
-Chat requests may set
-`"enable_thinking": false` or
-`"chat_template_kwargs": {"enable_thinking": false}` for Qwen3-style tokenizer
-templates that support explicit thinking control. If both forms are present,
-their values must agree. Unknown keys, non-boolean `enable_thinking`, conflicting
-values, and using either form without a tokenizer chat template fail fast.
+role. When the loaded tokenizer exposes a chat template, the server renders
+messages with `apply_chat_template(..., add_generation_prompt=True)`;
+otherwise it uses a simple role-prefixed prompt.
+
+Chat requests may set `reasoning_effort` to `none`, `minimal`, `low`,
+`medium`, `high`, or `xhigh`; `none` maps to `enable_thinking=false` and every
+other value maps to `true`. The direct `enable_thinking` field and
+`"chat_template_kwargs": {"enable_thinking": false}` remain available for
+Qwen3-style templates. Conflicting values, unknown template kwargs,
+non-boolean `enable_thinking`, or thinking controls without a tokenizer chat
+template fail fast.
+
+Chat function tools accept OpenAI nested function schemas and the compatible
+flat Responses form. Effective tools are passed through the tokenizer's
+`tools` kwarg. `tool_choice` supports `null`, `"auto"`, and `"none"`; `none`
+omits tools from the generation prompt. Named/required choices and
+`parallel_tool_calls=false` fail explicitly because their generation
+constraints are not implemented. The server parses Qwen-style
+`<tool_call>`/`<tool_calls>` output only when tools are effective and never
+executes tools itself.
+
+With `--reasoning-parser qwen3`, non-streaming Chat responses split local raw
+reasoning into the Sparse-vLLM `message.reasoning_content` extension and place
+the visible answer in `message.content`. Function calls use OpenAI
+`message.tool_calls` and `finish_reason="tool_calls"`. Streaming uses
+`delta.reasoning_content` for local raw reasoning and standard indexed
+`delta.tool_calls` chunks for function name and argument deltas. Cross-chunk
+reasoning tags and tool JSON are parsed by state machines; malformed or
+unclosed output is reported explicitly. Without the reasoning parser, raw
+reasoning text remains in `content`, preserving the previous behavior.
+
+Chat `logprobs=true` enables sampled-token logprobs, and `top_logprobs`
+controls the number of top alternatives up to 20. Logprobs are rejected when
+reasoning or tool output parsing is active because raw generated token
+positions cannot be represented truthfully against split/hidden Chat fields.
 `/v1/completions` remains a raw prompt endpoint and does not add a server-side
 thinking switch; clients can include prompt-level markers such as `/think` or
 `/no_think` themselves if needed.
@@ -1042,10 +1070,11 @@ applications must execute tools and send results back as
 `function_call` output item plus `response.function_call_arguments.delta` and
 `response.function_call_arguments.done` events.
 
-Prefix-cache matching accepts a `response` selector. The worker renders that
-selector with the same Responses prompt renderer used for real generation, so
-instructions, input items, tools, reasoning controls, and chat template kwargs
-participate in the cache-match key consistently.
+Prefix-cache matching accepts full `chat` and `response` selectors. The worker
+renders them with the same endpoint prompt helpers used for real generation,
+so messages, instructions, tools, reasoning controls, and chat template kwargs
+participate in the cache-match key consistently. The smart router uses these
+full selectors rather than approximating Chat requests from messages alone.
 
 The server logs one request-start line and one request-finish or request-cancel
 line per `/v1/completions` request. It does not log every generated token.
