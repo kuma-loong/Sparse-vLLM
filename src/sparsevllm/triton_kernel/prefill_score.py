@@ -3,6 +3,84 @@ import triton
 import triton.language as tl
 
 
+PREFILL_SCORE_VARIANTS = (
+    "three_pass_current",
+    "three_pass_host_bounds",
+    "three_pass_bn32",
+    "three_pass_bn64",
+    "three_pass_bn128",
+    "three_pass_bn256",
+    "three_pass_bh1",
+    "three_pass_bh2",
+    "three_pass_bh4",
+    "three_pass_bh8",
+    "three_pass_warps4",
+    "three_pass_warps8",
+    "three_pass_stages1",
+    "three_pass_stages2",
+    "three_pass_stages3",
+    "three_pass_stages4",
+    "three_pass_reduce_rows1",
+    "three_pass_reduce_rows4",
+    "three_pass_reduce_rows8",
+    "three_pass_reduce_rows16",
+    "three_pass_reduce_rows32",
+)
+
+
+def get_prefill_score_variant_config(
+    variant_id: str,
+    *,
+    head_dim: int,
+    max_score_len: int,
+    kv_group_num: int,
+    candidate_blocks: int,
+) -> dict[str, int | bool]:
+    if variant_id not in PREFILL_SCORE_VARIANTS:
+        raise ValueError(f"unknown prefill score variant: {variant_id!r}")
+
+    block_m = max(16, triton.next_power_of_2(max_score_len))
+    block_n = 64 if head_dim >= 128 else 128
+    block_h_limit = max(1, min(8, 256 // block_m))
+    block_h = min(triton.next_power_of_2(kv_group_num), block_h_limit)
+    dot_stages = 3
+    reduce_rows = 16
+
+    if variant_id.startswith("three_pass_bn"):
+        block_n = int(variant_id.removeprefix("three_pass_bn"))
+    elif variant_id.startswith("three_pass_bh"):
+        requested_block_h = int(variant_id.removeprefix("three_pass_bh"))
+        block_h = min(requested_block_h, triton.next_power_of_2(kv_group_num))
+    elif variant_id.startswith("three_pass_stages"):
+        dot_stages = int(variant_id.removeprefix("three_pass_stages"))
+    elif variant_id.startswith("three_pass_reduce_rows"):
+        reduce_rows = int(variant_id.removeprefix("three_pass_reduce_rows"))
+
+    block_rows = block_h * block_m
+    dot_warps = 8 if block_rows >= 128 or block_n >= 128 else 4
+    if variant_id == "three_pass_warps4":
+        dot_warps = 4
+    elif variant_id == "three_pass_warps8":
+        dot_warps = 8
+
+    reduce_blocks = triton.next_power_of_2(candidate_blocks)
+    while reduce_rows > 1 and reduce_rows * reduce_blocks > 32768:
+        reduce_rows //= 2
+    return {
+        "block_m": block_m,
+        "block_n": block_n,
+        "block_h": block_h,
+        "block_rows": block_rows,
+        "dot_warps": dot_warps,
+        "dot_stages": dot_stages,
+        "reduce_blocks": reduce_blocks,
+        "reduce_rows": reduce_rows,
+        "reduce_warps": 8 if reduce_blocks >= 1024 else 4,
+        "reduce_stages": 4,
+        "use_host_bounds": variant_id == "three_pass_host_bounds",
+    }
+
+
 @triton.jit
 def _prefill_score_partial_stats_kernel(
     Q,
@@ -85,7 +163,7 @@ def _prefill_score_partial_stats_kernel(
     off_k = kv_loc[None, :] * stride_ks + cur_kv_head * stride_kh + offs_d[:, None] * stride_kd
     k = tl.load(K + off_k, mask=kv_in_candidate[None, :], other=0.0)
 
-    qk = tl.dot(q, k) * sm_scale
+    qk = tl.dot(q, k, input_precision="ieee") * sm_scale
     causal_mask = q_abs_pos[:, None] >= kv_pos[None, :]
     valid = q_row_valid[:, None] & kv_in_candidate[None, :] & causal_mask
     qk = tl.where(valid, qk, -1.0e20)
@@ -218,7 +296,7 @@ def _prefill_score_final_kernel(
     off_k = kv_loc[None, :] * stride_ks + cur_kv_head * stride_kh + offs_d[:, None] * stride_kd
     k = tl.load(K + off_k, mask=kv_in_candidate[None, :], other=0.0)
 
-    qk = tl.dot(q, k) * sm_scale
+    qk = tl.dot(q, k, input_precision="ieee") * sm_scale
     causal_mask = q_abs_pos[:, None] >= kv_pos[None, :]
     valid = q_row_valid[:, None] & kv_in_candidate[None, :] & causal_mask
     qk = tl.where(valid, qk, -1.0e20)
@@ -244,6 +322,196 @@ def _prefill_score_final_kernel(
 
 
 @torch.no_grad()
+def prefill_score_fwd_variant(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    attn_score: torch.Tensor,
+    b_req_idx: torch.Tensor,
+    b_start_loc: torch.Tensor,
+    b_seq_len: torch.Tensor,
+    b_prompt_cache_len: torch.Tensor,
+    max_query_len: int,
+    req_to_token_indexs: torch.Tensor,
+    score_q_start: torch.Tensor,
+    score_q_end: torch.Tensor,
+    *,
+    candidate_start: int = 0,
+    num_recent_tokens: int = 0,
+    variant_id: str = "three_pass_current",
+    stage: str = "combined",
+    workspace: tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor] | None = None,
+    host_max_score_len: int | None = None,
+    host_max_candidate_end: int | None = None,
+    use_provided_bounds: bool = False,
+):
+    head_dim = q.shape[-1]
+    assert k.shape[-1] == head_dim
+    assert q.dtype == k.dtype
+    assert q.stride(-1) == 1 and k.stride(-1) == 1
+    assert attn_score.dim() == 2
+    if attn_score.dtype not in {torch.float16, torch.bfloat16, torch.float32}:
+        raise ValueError(f"prefill score output must be fp16, bf16, or fp32, got {attn_score.dtype}")
+    assert head_dim in {16, 32, 64, 128, 256}
+    batch, head = b_seq_len.shape[0], q.shape[1]
+    kv_head = k.shape[1]
+    kv_group_num = head // kv_head
+    if kv_group_num <= 0 or head % kv_head != 0:
+        raise ValueError(f"num query heads must be divisible by num kv heads: q={head} k={kv_head}")
+    if stage not in {"partial", "reduce", "final", "combined"}:
+        raise ValueError(f"unknown prefill score stage: {stage!r}")
+    use_host_bounds = variant_id == "three_pass_host_bounds" or use_provided_bounds
+    if use_host_bounds:
+        if host_max_score_len is None or host_max_candidate_end is None:
+            raise ValueError("three_pass_host_bounds requires both host bounds")
+        max_score_len = int(host_max_score_len)
+    else:
+        max_score_len = int((score_q_end - score_q_start).max().item())
+    if max_score_len <= 0:
+        return None
+    if max_score_len > 128:
+        raise ValueError(f"prefill score query range is too large for this kernel: {max_score_len} > 128")
+
+    if use_host_bounds:
+        max_candidate_end = max(int(candidate_start), int(host_max_candidate_end))
+    else:
+        candidate_ends = torch.clamp(b_seq_len - int(num_recent_tokens), min=int(candidate_start))
+        max_candidate_end = int(candidate_ends.max().item()) if batch > 0 else 0
+    if max_candidate_end <= int(candidate_start):
+        return None
+
+    initial_block_n = 64 if head_dim >= 128 else 128
+    initial_candidate_blocks = triton.cdiv(max_candidate_end, initial_block_n)
+    initial_config = get_prefill_score_variant_config(
+        variant_id,
+        head_dim=head_dim,
+        max_score_len=max_score_len,
+        kv_group_num=kv_group_num,
+        candidate_blocks=initial_candidate_blocks,
+    )
+    block_m = int(initial_config["block_m"])
+    block_n = int(initial_config["block_n"])
+    candidate_blocks = triton.cdiv(max_candidate_end, block_n)
+    if candidate_blocks <= 0:
+        return None
+
+    config = get_prefill_score_variant_config(
+        variant_id,
+        head_dim=head_dim,
+        max_score_len=max_score_len,
+        kv_group_num=kv_group_num,
+        candidate_blocks=candidate_blocks,
+    )
+    block_h = int(config["block_h"])
+    head_blocks = triton.cdiv(kv_group_num, block_h)
+    block_rows = int(config["block_rows"])
+    group_count = batch * kv_head * head_blocks
+    if group_count <= 0:
+        return None
+
+    expected_shapes = (
+        (group_count, candidate_blocks, block_rows),
+        (group_count, candidate_blocks, block_rows),
+        (group_count, block_rows),
+        (group_count, block_rows),
+    )
+    if workspace is None:
+        partial_m = torch.empty(expected_shapes[0], device=q.device, dtype=torch.float32)
+        partial_l = torch.empty_like(partial_m)
+        global_m = torch.empty(expected_shapes[2], device=q.device, dtype=torch.float32)
+        global_l = torch.empty_like(global_m)
+        workspace = (partial_m, partial_l, global_m, global_l)
+    else:
+        if len(workspace) != 4:
+            raise ValueError(f"prefill score workspace must contain four tensors, got {len(workspace)}")
+        for index, (tensor, expected_shape) in enumerate(zip(workspace, expected_shapes)):
+            if tensor.device != q.device or tensor.dtype != torch.float32 or tuple(tensor.shape) != expected_shape:
+                raise ValueError(
+                    f"invalid prefill score workspace[{index}]: expected shape={expected_shape}, "
+                    f"dtype=float32, device={q.device}; got shape={tuple(tensor.shape)}, "
+                    f"dtype={tensor.dtype}, device={tensor.device}"
+                )
+        partial_m, partial_l, global_m, global_l = workspace
+
+    common = (
+        q,
+        k,
+        b_seq_len,
+        req_to_token_indexs,
+        b_req_idx,
+        score_q_start,
+        score_q_end,
+        b_start_loc,
+        b_prompt_cache_len,
+        q.stride(0),
+        q.stride(1),
+        q.stride(2),
+        k.stride(0),
+        k.stride(1),
+        k.stride(2),
+        req_to_token_indexs.stride(0),
+        req_to_token_indexs.stride(1),
+    )
+    common_meta = {
+        "H_PER_KV": kv_group_num,
+        "H_KV": kv_head,
+        "HEAD_BLOCKS": head_blocks,
+        "candidate_start": int(candidate_start),
+        "num_recent_tokens": int(num_recent_tokens),
+        "sm_scale": float(head_dim) ** -0.5,
+        "NUM_BLOCKS": candidate_blocks,
+        "BLOCK_H": block_h,
+        "BLOCK_ROWS": block_rows,
+        "BLOCK_DMODEL": head_dim,
+        "BLOCK_M": block_m,
+        "BLOCK_N": block_n,
+        "num_warps": int(config["dot_warps"]),
+        "num_stages": int(config["dot_stages"]),
+    }
+    if stage in {"partial", "combined"}:
+        _prefill_score_partial_stats_kernel[(group_count, candidate_blocks)](
+            common[0],
+            common[1],
+            partial_m,
+            partial_l,
+            *common[2:],
+            **common_meta,
+        )
+    if stage in {"reduce", "combined"}:
+        reduce_grid = (group_count, triton.cdiv(block_rows, int(config["reduce_rows"])))
+        _prefill_score_reduce_stats_kernel[reduce_grid](
+            partial_m,
+            partial_l,
+            global_m,
+            global_l,
+            NUM_BLOCKS=candidate_blocks,
+            BLOCK_ROWS=block_rows,
+            REDUCE_BLOCKS=int(config["reduce_blocks"]),
+            REDUCE_ROWS=int(config["reduce_rows"]),
+            num_warps=int(config["reduce_warps"]),
+            num_stages=int(config["reduce_stages"]),
+        )
+    if stage in {"final", "combined"}:
+        # Triton 3.4 does not support atomic_max on fp16/bf16 pointers. Preserve
+        # cross-step max accumulation in FP32, then cast the complete result.
+        atomic_score = attn_score if attn_score.dtype == torch.float32 else attn_score.float()
+        _prefill_score_final_kernel[(group_count, candidate_blocks)](
+            common[0],
+            common[1],
+            atomic_score,
+            global_m,
+            global_l,
+            *common[2:15],
+            atomic_score.stride(0),
+            atomic_score.stride(1),
+            *common[15:],
+            **common_meta,
+        )
+        if atomic_score is not attn_score:
+            attn_score.copy_(atomic_score)
+    return workspace
+
+
+@torch.no_grad()
 def prefill_score_fwd(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -260,139 +528,19 @@ def prefill_score_fwd(
     candidate_start: int = 0,
     num_recent_tokens: int = 0,
 ):
-    head_dim = q.shape[-1]
-    assert k.shape[-1] == head_dim
-    assert q.dtype == k.dtype
-    assert q.stride(-1) == 1 and k.stride(-1) == 1
-    assert attn_score.dim() == 2
-    assert head_dim in {16, 32, 64, 128, 256}
-    batch, head = b_seq_len.shape[0], q.shape[1]
-    kv_head = k.shape[1]
-    kv_group_num = head // kv_head
-    if kv_group_num <= 0 or head % kv_head != 0:
-        raise ValueError(f"num query heads must be divisible by num kv heads: q={head} k={kv_head}")
-    max_score_len = int((score_q_end - score_q_start).max().item())
-    if max_score_len <= 0:
-        return
-    block_m = max(16, triton.next_power_of_2(max_score_len))
-    if block_m > 128:
-        raise ValueError(f"prefill score query range is too large for this kernel: {max_score_len} > 128")
-
-    candidate_ends = torch.clamp(b_seq_len - int(num_recent_tokens), min=int(candidate_start))
-    max_candidate_end = int(candidate_ends.max().item()) if batch > 0 else 0
-    if max_candidate_end <= 0:
-        return
-
-    block_n = 64 if head_dim >= 128 else 128
-    candidate_blocks = triton.cdiv(max_candidate_end, block_n)
-    if candidate_blocks <= 0:
-        return
-
-    # Keep the dot tile bounded. Common GQA (7 heads per KV, W=32) fits in one
-    # head block; larger query windows or MQA split heads across multiple blocks.
-    max_rows = 256
-    block_h_limit = max(1, min(8, max_rows // block_m))
-    block_h = min(triton.next_power_of_2(kv_group_num), block_h_limit)
-    head_blocks = triton.cdiv(kv_group_num, block_h)
-    block_rows = block_h * block_m
-    group_count = batch * kv_head * head_blocks
-    if group_count <= 0:
-        return
-
-    reduce_blocks = triton.next_power_of_2(candidate_blocks)
-    reduce_rows = 16
-    while reduce_rows > 1 and reduce_rows * reduce_blocks > 32768:
-        reduce_rows //= 2
-
-    partial_m = torch.empty((group_count, candidate_blocks, block_rows), device=q.device, dtype=torch.float32)
-    partial_l = torch.empty_like(partial_m)
-    global_m = torch.empty((group_count, block_rows), device=q.device, dtype=torch.float32)
-    global_l = torch.empty_like(global_m)
-
-    dot_warps = 8 if block_rows >= 128 or block_n >= 128 else 4
-    _prefill_score_partial_stats_kernel[(group_count, candidate_blocks)](
-        q,
-        k,
-        partial_m,
-        partial_l,
-        b_seq_len,
-        req_to_token_indexs,
-        b_req_idx,
-        score_q_start,
-        score_q_end,
-        b_start_loc,
-        b_prompt_cache_len,
-        q.stride(0),
-        q.stride(1),
-        q.stride(2),
-        k.stride(0),
-        k.stride(1),
-        k.stride(2),
-        req_to_token_indexs.stride(0),
-        req_to_token_indexs.stride(1),
-        H_PER_KV=kv_group_num,
-        H_KV=kv_head,
-        HEAD_BLOCKS=head_blocks,
-        candidate_start=int(candidate_start),
-        num_recent_tokens=int(num_recent_tokens),
-        sm_scale=float(head_dim) ** -0.5,
-        NUM_BLOCKS=candidate_blocks,
-        BLOCK_H=block_h,
-        BLOCK_ROWS=block_rows,
-        BLOCK_DMODEL=head_dim,
-        BLOCK_M=block_m,
-        BLOCK_N=block_n,
-        num_warps=dot_warps,
-        num_stages=3,
-    )
-    reduce_grid = (group_count, triton.cdiv(block_rows, reduce_rows))
-    _prefill_score_reduce_stats_kernel[reduce_grid](
-        partial_m,
-        partial_l,
-        global_m,
-        global_l,
-        NUM_BLOCKS=candidate_blocks,
-        BLOCK_ROWS=block_rows,
-        REDUCE_BLOCKS=reduce_blocks,
-        REDUCE_ROWS=reduce_rows,
-        num_warps=8 if reduce_blocks >= 1024 else 4,
-        num_stages=4,
-    )
-    _prefill_score_final_kernel[(group_count, candidate_blocks)](
+    prefill_score_fwd_variant(
         q,
         k,
         attn_score,
-        global_m,
-        global_l,
-        b_seq_len,
-        req_to_token_indexs,
         b_req_idx,
+        b_start_loc,
+        b_seq_len,
+        b_prompt_cache_len,
+        max_query_len,
+        req_to_token_indexs,
         score_q_start,
         score_q_end,
-        b_start_loc,
-        b_prompt_cache_len,
-        q.stride(0),
-        q.stride(1),
-        q.stride(2),
-        k.stride(0),
-        k.stride(1),
-        k.stride(2),
-        attn_score.stride(0),
-        attn_score.stride(1),
-        req_to_token_indexs.stride(0),
-        req_to_token_indexs.stride(1),
-        H_PER_KV=kv_group_num,
-        H_KV=kv_head,
-        HEAD_BLOCKS=head_blocks,
-        candidate_start=int(candidate_start),
-        num_recent_tokens=int(num_recent_tokens),
-        sm_scale=float(head_dim) ** -0.5,
-        NUM_BLOCKS=candidate_blocks,
-        BLOCK_H=block_h,
-        BLOCK_ROWS=block_rows,
-        BLOCK_DMODEL=head_dim,
-        BLOCK_M=block_m,
-        BLOCK_N=block_n,
-        num_warps=dot_warps,
-        num_stages=3,
+        candidate_start=candidate_start,
+        num_recent_tokens=num_recent_tokens,
+        variant_id="three_pass_current",
     )
