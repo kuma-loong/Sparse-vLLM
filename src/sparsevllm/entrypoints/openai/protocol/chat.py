@@ -62,6 +62,7 @@ class ChatCompletionRequest(BaseModel):
     parallel_tool_calls: bool | None = None
     reasoning_effort: Literal["none", "minimal", "low", "medium", "high", "xhigh"] | None = None
     enable_thinking: bool | None = None
+    preserve_thinking: bool | None = None
     chat_template_kwargs: Any = None
 
 

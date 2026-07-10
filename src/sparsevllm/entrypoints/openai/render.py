@@ -8,7 +8,7 @@ from sparsevllm.entrypoints.openai.protocol.responses import ResponseRequest
 from sparsevllm.entrypoints.openai.responses.tools import normalize_tools
 
 
-SUPPORTED_CHAT_TEMPLATE_KWARGS = {"enable_thinking"}
+BOOLEAN_CHAT_TEMPLATE_KWARGS = {"enable_thinking", "preserve_thinking"}
 
 
 def _chat_template_role(role: str) -> str:
@@ -28,28 +28,31 @@ def validate_chat_template_kwargs(value: Any) -> dict[str, Any] | None:
         return None
     if not isinstance(value, dict):
         raise ValueError("chat_template_kwargs must be a JSON object.")
-    unknown = sorted(set(value) - SUPPORTED_CHAT_TEMPLATE_KWARGS)
-    if unknown:
-        raise ValueError(f"Unsupported chat_template_kwargs keys: {unknown}.")
-    if "enable_thinking" in value and not isinstance(value["enable_thinking"], bool):
-        raise ValueError("chat_template_kwargs.enable_thinking must be a bool.")
+    for name in BOOLEAN_CHAT_TEMPLATE_KWARGS:
+        if name in value and not isinstance(value[name], bool):
+            raise ValueError(f"chat_template_kwargs.{name} must be a bool.")
     return dict(value)
 
 
 def resolve_chat_template_kwargs(request: ChatCompletionRequest) -> dict[str, Any] | None:
     kwargs = validate_chat_template_kwargs(request.chat_template_kwargs) or {}
+    _merge_chat_template_kwarg(kwargs, "preserve_thinking", request.preserve_thinking)
     enable_thinking = request.enable_thinking
     if request.reasoning_effort is not None:
         effort_enable_thinking = request.reasoning_effort != "none"
         if enable_thinking is not None and enable_thinking != effort_enable_thinking:
             raise ValueError("reasoning_effort conflicts with enable_thinking.")
         enable_thinking = effort_enable_thinking
-    if enable_thinking is None:
-        return kwargs or None
-    if "enable_thinking" in kwargs and kwargs["enable_thinking"] != enable_thinking:
-        raise ValueError("enable_thinking conflicts with chat_template_kwargs.enable_thinking.")
-    kwargs["enable_thinking"] = enable_thinking
-    return kwargs
+    _merge_chat_template_kwarg(kwargs, "enable_thinking", enable_thinking)
+    return kwargs or None
+
+
+def _merge_chat_template_kwarg(kwargs: dict[str, Any], name: str, value: Any):
+    if value is None:
+        return
+    if name in kwargs and kwargs[name] != value:
+        raise ValueError(f"{name} conflicts with chat_template_kwargs.{name}.")
+    kwargs[name] = value
 
 
 def resolve_chat_tools(request: ChatCompletionRequest) -> list[dict[str, Any]] | None:

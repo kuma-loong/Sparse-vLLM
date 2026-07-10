@@ -626,6 +626,47 @@ class OpenAIAPIServerTest(unittest.IsolatedAsyncioTestCase):
             _validate_chat_request(request, "m", Tokenizer())
         self.assertEqual(ctx.exception.status_code, 400)
 
+    def test_vllm_template_kwargs_are_normalized(self):
+        from fastapi import HTTPException
+
+        from sparsevllm.entrypoints.openai.api_server import (
+            ChatCompletionRequest,
+            _chat_request_prompt,
+            _validate_chat_request,
+            resolve_chat_template_kwargs,
+        )
+
+        class Tokenizer:
+            chat_template = "template"
+
+            def __init__(self):
+                self.kwargs = None
+
+            def apply_chat_template(self, _chat, **kwargs):
+                self.kwargs = kwargs
+                return "rendered"
+
+        request = ChatCompletionRequest(
+            model="m",
+            messages=[{"role": "user", "content": "p"}],
+            preserve_thinking=True,
+            chat_template_kwargs={"preserve_thinking": True, "custom_flag": "value"},
+        )
+
+        tokenizer = Tokenizer()
+        _validate_chat_request(request, "m", tokenizer)
+        self.assertEqual(
+            resolve_chat_template_kwargs(request),
+            {"preserve_thinking": True, "custom_flag": "value"},
+        )
+        self.assertEqual(_chat_request_prompt(tokenizer, request), "rendered")
+        self.assertIs(tokenizer.kwargs["preserve_thinking"], True)
+        self.assertEqual(tokenizer.kwargs["custom_flag"], "value")
+
+        conflicting = request.model_copy(update={"preserve_thinking": False})
+        with self.assertRaisesRegex(HTTPException, "conflicts"):
+            _validate_chat_request(conflicting, "m", Tokenizer())
+
     def test_chat_reasoning_effort_controls_thinking(self):
         from fastapi import HTTPException
 
@@ -771,29 +812,21 @@ class OpenAIAPIServerTest(unittest.IsolatedAsyncioTestCase):
         class Tokenizer:
             chat_template = "template"
 
-        with self.assertRaises(HTTPException) as unknown_ctx:
-            _validate_chat_request(
-                ChatCompletionRequest(
-                    model="m",
-                    messages=[{"role": "user", "content": "p"}],
-                    chat_template_kwargs={"unknown": True},
-                ),
-                "m",
-                Tokenizer(),
-            )
-        self.assertEqual(unknown_ctx.exception.status_code, 400)
-
-        with self.assertRaises(HTTPException) as type_ctx:
-            _validate_chat_request(
-                ChatCompletionRequest(
-                    model="m",
-                    messages=[{"role": "user", "content": "p"}],
-                    chat_template_kwargs={"enable_thinking": "false"},
-                ),
-                "m",
-                Tokenizer(),
-            )
-        self.assertEqual(type_ctx.exception.status_code, 400)
+        for kwargs in [
+            {"enable_thinking": "false"},
+            {"preserve_thinking": "true"},
+        ]:
+            with self.assertRaises(HTTPException) as type_ctx:
+                _validate_chat_request(
+                    ChatCompletionRequest(
+                        model="m",
+                        messages=[{"role": "user", "content": "p"}],
+                        chat_template_kwargs=kwargs,
+                    ),
+                    "m",
+                    Tokenizer(),
+                )
+            self.assertEqual(type_ctx.exception.status_code, 400)
 
         class NoTemplateTokenizer:
             chat_template = None
