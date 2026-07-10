@@ -1051,6 +1051,12 @@ to sampling parameters. `tool_choice` is limited to `null` or `"auto"`;
 semantics are implemented. `stream=true` returns Responses semantic SSE events
 instead of Chat Completions chunks.
 
+For client compatibility, `store=false` (or omission) and a non-empty
+`prompt_cache_key` are accepted. Sparse-vLLM does not persist response objects,
+so `store=true` fails explicitly. `prompt_cache_key` is retained in request
+logs as a cache-grouping hint but does not alter the rendered model prompt or
+replace Sparse-vLLM's exact-prefix cache matching.
+
 When `--reasoning-parser qwen3` is enabled, `/v1/responses` parses model output
 that starts with `<think>` into a Sparse-vLLM extension reasoning item followed
 by the assistant message or function call item. This extension exposes local
