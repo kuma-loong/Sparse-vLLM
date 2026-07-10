@@ -497,6 +497,54 @@ class OpenAIAPIServerTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(prompt, "rendered")
         self.assertEqual(tokenizer.chat, [{"role": "system", "content": "policy\ndetails"}])
 
+    def test_chat_prompt_preserves_reasoning_content_for_templates(self):
+        from sparsevllm.entrypoints.openai.api_server import ChatMessage, _chat_prompt
+
+        class Tokenizer:
+            chat_template = "template"
+
+            def __init__(self):
+                self.chat = None
+
+            def apply_chat_template(self, chat, **_kwargs):
+                self.chat = chat
+                return "rendered"
+
+        tokenizer = Tokenizer()
+        prompt = _chat_prompt(
+            tokenizer,
+            [
+                ChatMessage(
+                    role="assistant",
+                    content="answer",
+                    reasoning_content="reason",
+                )
+            ],
+        )
+
+        self.assertEqual(prompt, "rendered")
+        self.assertEqual(
+            tokenizer.chat,
+            [{"role": "assistant", "content": "answer", "reasoning_content": "reason"}],
+        )
+
+    def test_reasoning_content_requires_assistant_role_and_chat_template(self):
+        from pydantic import ValidationError
+
+        from sparsevllm.entrypoints.openai.api_server import ChatMessage, _chat_prompt
+
+        with self.assertRaisesRegex(ValidationError, "only valid for assistant"):
+            ChatMessage(role="user", content="question", reasoning_content="reason")
+
+        class Tokenizer:
+            chat_template = None
+
+        with self.assertRaisesRegex(ValueError, "requires a tokenizer chat_template"):
+            _chat_prompt(
+                Tokenizer(),
+                [ChatMessage(role="assistant", content="answer", reasoning_content="reason")],
+            )
+
     def test_chat_template_kwargs_enable_thinking_passes_to_tokenizer(self):
         from sparsevllm.entrypoints.openai.api_server import ChatMessage, _chat_prompt
 
@@ -519,6 +567,39 @@ class OpenAIAPIServerTest(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(prompt, "rendered")
         self.assertIs(tokenizer.kwargs["enable_thinking"], False)
+
+    def test_top_level_enable_thinking_resolves_to_chat_template_kwargs(self):
+        from sparsevllm.entrypoints.openai.api_server import (
+            ChatCompletionRequest,
+            resolve_chat_template_kwargs,
+        )
+
+        request = ChatCompletionRequest(
+            model="m",
+            messages=[{"role": "user", "content": "p"}],
+            enable_thinking=False,
+        )
+
+        self.assertEqual(resolve_chat_template_kwargs(request), {"enable_thinking": False})
+
+    def test_top_level_enable_thinking_conflict_fails_fast(self):
+        from fastapi import HTTPException
+
+        from sparsevllm.entrypoints.openai.api_server import ChatCompletionRequest, _validate_chat_request
+
+        class Tokenizer:
+            chat_template = "template"
+
+        request = ChatCompletionRequest(
+            model="m",
+            messages=[{"role": "user", "content": "p"}],
+            enable_thinking=False,
+            chat_template_kwargs={"enable_thinking": True},
+        )
+
+        with self.assertRaisesRegex(HTTPException, "conflicts") as ctx:
+            _validate_chat_request(request, "m", Tokenizer())
+        self.assertEqual(ctx.exception.status_code, 400)
 
     def test_chat_template_kwargs_validation_is_explicit(self):
         from fastapi import HTTPException

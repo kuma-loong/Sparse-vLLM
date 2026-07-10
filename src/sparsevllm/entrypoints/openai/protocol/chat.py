@@ -4,6 +4,7 @@ from typing import Literal
 from pydantic import BaseModel
 from pydantic import ConfigDict
 from pydantic import Field
+from pydantic import model_validator
 
 
 class ChatContentPart(BaseModel):
@@ -18,8 +19,15 @@ class ChatMessage(BaseModel):
 
     role: Literal["developer", "system", "user", "assistant", "tool"]
     content: str | list[ChatContentPart] | None = None
+    reasoning_content: str | None = None
     tool_call_id: str | None = None
     tool_calls: list[dict[str, Any]] | None = None
+
+    @model_validator(mode="after")
+    def validate_reasoning_content_role(self):
+        if self.reasoning_content is not None and self.role != "assistant":
+            raise ValueError("reasoning_content is only valid for assistant messages.")
+        return self
 
 
 class ChatCompletionRequest(BaseModel):
@@ -42,4 +50,5 @@ class ChatCompletionRequest(BaseModel):
     tools: list[dict[str, Any]] | None = None
     tool_choice: str | dict[str, Any] | None = None
     parallel_tool_calls: bool | None = None
+    enable_thinking: bool | None = None
     chat_template_kwargs: Any = None

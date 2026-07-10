@@ -992,20 +992,24 @@ disagree with the visible output.
 `/v1/chat/completions` supports the same sampling fields plus `messages`.
 Messages must use `developer`, `system`, `user`, `assistant`, or `tool` roles.
 String content and text-only content-part lists are supported; unknown nested
-message fields are rejected. The `developer` role is rendered as `system` for
-Hugging Face chat templates because most local tokenizer templates do not
-define a separate developer role. When the loaded tokenizer exposes a chat
-template, the server renders messages with
+message fields are rejected. Assistant messages may include the compatible
+`reasoning_content` extension; it is passed through to the Hugging Face chat
+template so the model template controls how historical reasoning is rendered.
+The `developer` role is rendered as `system` for Hugging Face chat templates
+because most local tokenizer templates do not define a separate developer
+role. When the loaded tokenizer exposes a chat template, the server renders messages with
 `apply_chat_template(..., add_generation_prompt=True)`; otherwise it uses a
 simple role-prefixed prompt. Chat `logprobs=true` enables sampled-token
 logprobs, and `top_logprobs` controls the number of top alternatives up to 20.
 Chat requests may set
+`"enable_thinking": false` or
 `"chat_template_kwargs": {"enable_thinking": false}` for Qwen3-style tokenizer
-templates that support explicit thinking control. Unknown keys, non-boolean
-`enable_thinking`, and using `chat_template_kwargs` without a tokenizer chat
-template fail fast. `/v1/completions` remains a raw prompt endpoint and does
-not add a server-side thinking switch; clients can include prompt-level
-markers such as `/think` or `/no_think` themselves if needed.
+templates that support explicit thinking control. If both forms are present,
+their values must agree. Unknown keys, non-boolean `enable_thinking`, conflicting
+values, and using either form without a tokenizer chat template fail fast.
+`/v1/completions` remains a raw prompt endpoint and does not add a server-side
+thinking switch; clients can include prompt-level markers such as `/think` or
+`/no_think` themselves if needed.
 
 `/v1/responses` is exposed as a separate endpoint for item-based input and
 output. The first implementation supports text input, text-only message items,

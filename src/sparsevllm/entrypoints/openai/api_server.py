@@ -24,6 +24,7 @@ from sparsevllm.entrypoints.openai.render import _chat_content_text
 from sparsevllm.entrypoints.openai.render import _chat_prompt
 from sparsevllm.entrypoints.openai.render import _chat_template_role
 from sparsevllm.entrypoints.openai.render import _response_prompt
+from sparsevllm.entrypoints.openai.render import resolve_chat_template_kwargs
 from sparsevllm.entrypoints.openai.render import validate_chat_template_kwargs
 from sparsevllm.entrypoints.openai.responses.reasoning import get_reasoning_parser
 from sparsevllm.entrypoints.openai.routes.chat import router as chat_router

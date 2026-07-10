@@ -12,7 +12,7 @@ from sparsevllm.entrypoints.openai.dispatcher import AsyncEngineDispatcher
 from sparsevllm.entrypoints.openai.dispatcher import RequestHandle
 from sparsevllm.entrypoints.openai.protocol.chat import ChatCompletionRequest
 from sparsevllm.entrypoints.openai.render import _chat_prompt
-from sparsevllm.entrypoints.openai.render import validate_chat_template_kwargs
+from sparsevllm.entrypoints.openai.render import resolve_chat_template_kwargs
 from sparsevllm.entrypoints.openai.sampling import _field_was_set
 from sparsevllm.entrypoints.openai.sampling import _normalize_stop
 from sparsevllm.entrypoints.openai.sampling import _sampling_params_from_request
@@ -50,7 +50,7 @@ async def serve_chat_completion(
     sampling_params = _sampling_params_from_request(request)
     stop = _normalize_stop(request.stop)
     try:
-        chat_template_kwargs = validate_chat_template_kwargs(request.chat_template_kwargs)
+        chat_template_kwargs = resolve_chat_template_kwargs(request)
         prompt = _chat_prompt(tokenizer, request.messages, chat_template_kwargs)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
@@ -151,7 +151,7 @@ def _validate_chat_request(
     if request.stop and request.logprobs:
         raise HTTPException(status_code=400, detail="stop with logprobs is not supported yet.")
     try:
-        chat_template_kwargs = validate_chat_template_kwargs(request.chat_template_kwargs)
+        chat_template_kwargs = resolve_chat_template_kwargs(request)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     if chat_template_kwargs and tokenizer is not None and not getattr(tokenizer, "chat_template", None):

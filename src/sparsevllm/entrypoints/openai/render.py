@@ -2,6 +2,7 @@ import inspect
 from typing import Any
 
 from sparsevllm.entrypoints.openai.protocol.chat import ChatContentPart
+from sparsevllm.entrypoints.openai.protocol.chat import ChatCompletionRequest
 from sparsevllm.entrypoints.openai.protocol.chat import ChatMessage
 from sparsevllm.entrypoints.openai.protocol.responses import ResponseRequest
 from sparsevllm.entrypoints.openai.responses.tools import normalize_tools
@@ -35,6 +36,16 @@ def validate_chat_template_kwargs(value: Any) -> dict[str, Any] | None:
     return dict(value)
 
 
+def resolve_chat_template_kwargs(request: ChatCompletionRequest) -> dict[str, Any] | None:
+    kwargs = validate_chat_template_kwargs(request.chat_template_kwargs) or {}
+    if request.enable_thinking is None:
+        return kwargs or None
+    if "enable_thinking" in kwargs and kwargs["enable_thinking"] != request.enable_thinking:
+        raise ValueError("enable_thinking conflicts with chat_template_kwargs.enable_thinking.")
+    kwargs["enable_thinking"] = request.enable_thinking
+    return kwargs
+
+
 def resolve_response_chat_template_kwargs(request: ResponseRequest) -> dict[str, Any] | None:
     kwargs = validate_chat_template_kwargs(request.chat_template_kwargs) or {}
     effort = request.reasoning.effort if request.reasoning is not None else None
@@ -53,13 +64,15 @@ def _chat_prompt(
     messages: list[ChatMessage],
     chat_template_kwargs: dict[str, Any] | None = None,
 ) -> str:
-    chat = [
-        {
+    chat = []
+    for message in messages:
+        rendered_message = {
             "role": _chat_template_role(message.role),
             "content": _chat_content_text(message.content),
         }
-        for message in messages
-    ]
+        if message.reasoning_content is not None:
+            rendered_message["reasoning_content"] = message.reasoning_content
+        chat.append(rendered_message)
     if getattr(tokenizer, "chat_template", None) and hasattr(tokenizer, "apply_chat_template"):
         kwargs = {
             "tokenize": False,
@@ -67,6 +80,8 @@ def _chat_prompt(
         }
         kwargs.update(chat_template_kwargs or {})
         return tokenizer.apply_chat_template(chat, **kwargs)
+    if any("reasoning_content" in message for message in chat):
+        raise ValueError("reasoning_content requires a tokenizer chat_template.")
     if chat_template_kwargs:
         raise ValueError("chat_template_kwargs requires a tokenizer chat_template.")
 
