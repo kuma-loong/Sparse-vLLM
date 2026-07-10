@@ -542,24 +542,30 @@ class SnapKVCacheManager(CacheManager):
                 prompt_len=int(seq.num_prompt_tokens),
                 device=q.device,
             )
-            prefill_score_fwd(
-                q,
-                view.k_cache,
-                acc.unsqueeze(0),
-                view.req_indices[b_idx : b_idx + 1],
-                b_start_loc[b_idx : b_idx + 1],
-                view.context_lens[b_idx : b_idx + 1],
-                b_prompt_cache_len[b_idx : b_idx + 1],
-                query_len,
-                view.active_slots,
-                *self._prefill_score_bound_tensors(
-                    score_start=score_start,
-                    score_end=score_end,
-                    device=q.device,
-                ),
-                candidate_start=int(self.config.num_sink_tokens),
-                num_recent_tokens=int(self.config.num_recent_tokens),
-            )
+            with profiler.record("prefill_score_pipeline"):
+                prefill_score_fwd(
+                    q,
+                    view.k_cache,
+                    acc.unsqueeze(0),
+                    view.req_indices[b_idx : b_idx + 1],
+                    b_start_loc[b_idx : b_idx + 1],
+                    view.context_lens[b_idx : b_idx + 1],
+                    b_prompt_cache_len[b_idx : b_idx + 1],
+                    query_len,
+                    view.active_slots,
+                    *self._prefill_score_bound_tensors(
+                        score_start=score_start,
+                        score_end=score_end,
+                        device=q.device,
+                    ),
+                    candidate_start=int(self.config.num_sink_tokens),
+                    num_recent_tokens=int(self.config.num_recent_tokens),
+                    host_max_score_len=int(score_end - score_start),
+                    host_max_candidate_end=max(
+                        int(self.config.num_sink_tokens),
+                        int(score_end) - int(self.config.num_recent_tokens),
+                    ),
+                )
             return None
 
         score_starts = torch.zeros((len(seqs),), dtype=torch.int32, device=q.device)
@@ -578,21 +584,30 @@ class SnapKVCacheManager(CacheManager):
             dtype=self._prefill_score_dtype(),
             device=q.device,
         )
-        prefill_score_fwd(
-            q,
-            view.k_cache,
-            step_score,
-            view.req_indices,
-            b_start_loc,
-            view.context_lens,
-            b_prompt_cache_len,
-            max_query_len,
-            view.active_slots,
-            score_starts,
-            score_ends,
-            candidate_start=int(self.config.num_sink_tokens),
-            num_recent_tokens=int(self.config.num_recent_tokens),
-        )
+        with profiler.record("prefill_score_pipeline"):
+            prefill_score_fwd(
+                q,
+                view.k_cache,
+                step_score,
+                view.req_indices,
+                b_start_loc,
+                view.context_lens,
+                b_prompt_cache_len,
+                max_query_len,
+                view.active_slots,
+                score_starts,
+                score_ends,
+                candidate_start=int(self.config.num_sink_tokens),
+                num_recent_tokens=int(self.config.num_recent_tokens),
+                host_max_score_len=max(
+                    int(score_end - score_start)
+                    for _b_idx, _seq, score_start, score_end in rows
+                ),
+                host_max_candidate_end=max(
+                    int(self.config.num_sink_tokens),
+                    int(max_context_len) - int(self.config.num_recent_tokens),
+                ),
+            )
         for b_idx, seq, _score_start, _score_end in rows:
             acc = self._get_prefill_attention_score_accumulator(
                 layer_idx,

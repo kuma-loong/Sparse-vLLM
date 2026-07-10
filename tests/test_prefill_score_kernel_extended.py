@@ -335,19 +335,19 @@ def test_numerical_stress_and_determinism(value_case):
 
 
 @pytest.mark.parametrize(
-    "model_shape,length",
+    "model_shape,length,window",
     [
-        ("qwen3", 4093),
-        ("qwen3", 32749),
-        ("qwen25", 4093),
-        ("qwen25", 79439),
+        ("qwen3", 4093, 32),
+        ("qwen3", 32749, 128),
+        ("qwen25", 4093, 32),
+        ("qwen25", 79439, 128),
     ],
 )
-def test_host_bounds_is_bitwise_and_selection_equivalent_at_long_lengths(model_shape, length):
+def test_host_bounds_is_bitwise_and_selection_equivalent_at_long_lengths(model_shape, length, window):
     num_heads, num_kv_heads = (32, 8) if model_shape == "qwen3" else (28, 4)
     kwargs = dict(
         context_lens=[length],
-        windows=[128],
+        windows=[window],
         num_heads=num_heads,
         num_kv_heads=num_kv_heads,
         head_dim=128,
@@ -359,10 +359,18 @@ def test_host_bounds_is_bitwise_and_selection_equivalent_at_long_lengths(model_s
     )
     baseline = _make_case(**kwargs)
     candidate = _make_case(**kwargs)
+    combined = _make_case(**kwargs)
     _run(baseline, variant_id="three_pass_current")
     _run(candidate, variant_id="three_pass_host_bounds")
+    _run(combined, variant_id="three_pass_host_bounds_bh2")
     torch.cuda.synchronize()
     assert torch.equal(baseline["attn_score"], candidate["attn_score"])
+    torch.testing.assert_close(
+        combined["attn_score"],
+        baseline["attn_score"],
+        rtol=5e-5,
+        atol=5e-7,
+    )
     candidate_end = length - 512
     baseline_scores = baseline["attn_score"][0, 64:candidate_end]
     candidate_scores = candidate["attn_score"][0, 64:candidate_end]
@@ -371,6 +379,10 @@ def test_host_bounds_is_bitwise_and_selection_equivalent_at_long_lengths(model_s
         assert torch.equal(
             torch.topk(baseline_scores, k, sorted=True).indices,
             torch.topk(candidate_scores, k, sorted=True).indices,
+        )
+        assert torch.equal(
+            torch.topk(baseline_scores, k, sorted=True).indices,
+            torch.topk(combined["attn_score"][0, 64:candidate_end], k, sorted=True).indices,
         )
 
 

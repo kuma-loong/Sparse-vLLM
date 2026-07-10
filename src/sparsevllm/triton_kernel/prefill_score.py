@@ -6,6 +6,7 @@ import triton.language as tl
 PREFILL_SCORE_VARIANTS = (
     "three_pass_current",
     "three_pass_host_bounds",
+    "three_pass_host_bounds_bh2",
     "three_pass_bn32",
     "three_pass_bn64",
     "three_pass_bn128",
@@ -46,7 +47,10 @@ def get_prefill_score_variant_config(
     dot_stages = 3
     reduce_rows = 16
 
-    if variant_id.startswith("three_pass_bn"):
+    if variant_id == "three_pass_host_bounds_bh2":
+        if head_dim == 128:
+            block_h = min(2, triton.next_power_of_2(kv_group_num))
+    elif variant_id.startswith("three_pass_bn"):
         block_n = int(variant_id.removeprefix("three_pass_bn"))
     elif variant_id.startswith("three_pass_bh"):
         requested_block_h = int(variant_id.removeprefix("three_pass_bh"))
@@ -77,7 +81,10 @@ def get_prefill_score_variant_config(
         "reduce_rows": reduce_rows,
         "reduce_warps": 8 if reduce_blocks >= 1024 else 4,
         "reduce_stages": 4,
-        "use_host_bounds": variant_id == "three_pass_host_bounds",
+        "use_host_bounds": variant_id in {
+            "three_pass_host_bounds",
+            "three_pass_host_bounds_bh2",
+        },
     }
 
 
@@ -114,6 +121,7 @@ def _prefill_score_partial_stats_kernel(
     BLOCK_DMODEL: tl.constexpr,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
+    USE_IEEE: tl.constexpr,
 ):
     cur_group = tl.program_id(0)
     cur_n_block = tl.program_id(1)
@@ -163,7 +171,10 @@ def _prefill_score_partial_stats_kernel(
     off_k = kv_loc[None, :] * stride_ks + cur_kv_head * stride_kh + offs_d[:, None] * stride_kd
     k = tl.load(K + off_k, mask=kv_in_candidate[None, :], other=0.0)
 
-    qk = tl.dot(q, k, input_precision="ieee") * sm_scale
+    if USE_IEEE:
+        qk = tl.dot(q, k, input_precision="ieee") * sm_scale
+    else:
+        qk = tl.dot(q, k) * sm_scale
     causal_mask = q_abs_pos[:, None] >= kv_pos[None, :]
     valid = q_row_valid[:, None] & kv_in_candidate[None, :] & causal_mask
     qk = tl.where(valid, qk, -1.0e20)
@@ -245,6 +256,7 @@ def _prefill_score_final_kernel(
     BLOCK_DMODEL: tl.constexpr,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
+    USE_IEEE: tl.constexpr,
 ):
     cur_group = tl.program_id(0)
     cur_n_block = tl.program_id(1)
@@ -296,7 +308,10 @@ def _prefill_score_final_kernel(
     off_k = kv_loc[None, :] * stride_ks + cur_kv_head * stride_kh + offs_d[:, None] * stride_kd
     k = tl.load(K + off_k, mask=kv_in_candidate[None, :], other=0.0)
 
-    qk = tl.dot(q, k, input_precision="ieee") * sm_scale
+    if USE_IEEE:
+        qk = tl.dot(q, k, input_precision="ieee") * sm_scale
+    else:
+        qk = tl.dot(q, k) * sm_scale
     causal_mask = q_abs_pos[:, None] >= kv_pos[None, :]
     valid = q_row_valid[:, None] & kv_in_candidate[None, :] & causal_mask
     qk = tl.where(valid, qk, -1.0e20)
@@ -359,7 +374,10 @@ def prefill_score_fwd_variant(
         raise ValueError(f"num query heads must be divisible by num kv heads: q={head} k={kv_head}")
     if stage not in {"partial", "reduce", "final", "combined"}:
         raise ValueError(f"unknown prefill score stage: {stage!r}")
-    use_host_bounds = variant_id == "three_pass_host_bounds" or use_provided_bounds
+    use_host_bounds = variant_id in {
+        "three_pass_host_bounds",
+        "three_pass_host_bounds_bh2",
+    } or use_provided_bounds
     if use_host_bounds:
         if host_max_score_len is None or host_max_candidate_end is None:
             raise ValueError("three_pass_host_bounds requires both host bounds")
@@ -464,6 +482,7 @@ def prefill_score_fwd_variant(
         "BLOCK_DMODEL": head_dim,
         "BLOCK_M": block_m,
         "BLOCK_N": block_n,
+        "USE_IEEE": q.dtype == torch.float32,
         "num_warps": int(config["dot_warps"]),
         "num_stages": int(config["dot_stages"]),
     }
@@ -527,6 +546,8 @@ def prefill_score_fwd(
     *,
     candidate_start: int = 0,
     num_recent_tokens: int = 0,
+    host_max_score_len: int,
+    host_max_candidate_end: int,
 ):
     prefill_score_fwd_variant(
         q,
@@ -542,5 +563,7 @@ def prefill_score_fwd(
         score_q_end,
         candidate_start=candidate_start,
         num_recent_tokens=num_recent_tokens,
-        variant_id="three_pass_current",
+        variant_id="three_pass_host_bounds_bh2",
+        host_max_score_len=host_max_score_len,
+        host_max_candidate_end=host_max_candidate_end,
     )

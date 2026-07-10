@@ -102,6 +102,8 @@ class PrefillScoreKernelTest(unittest.TestCase):
             score_ends,
             candidate_start=candidate_start,
             num_recent_tokens=num_recent_tokens,
+            host_max_score_len=3,
+            host_max_candidate_end=10,
         )
         torch.cuda.synchronize()
 
@@ -160,6 +162,8 @@ class PrefillScoreKernelTest(unittest.TestCase):
             score_ends,
             candidate_start=candidate_start,
             num_recent_tokens=num_recent_tokens,
+            host_max_score_len=4,
+            host_max_candidate_end=10,
         )
         torch.cuda.synchronize()
 
@@ -217,6 +221,8 @@ class PrefillScoreKernelTest(unittest.TestCase):
             score_ends,
             candidate_start=candidate_start,
             num_recent_tokens=num_recent_tokens,
+            host_max_score_len=window,
+            host_max_candidate_end=prompt_len - num_recent_tokens,
         )
         torch.cuda.synchronize()
 

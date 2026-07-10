@@ -1,6 +1,8 @@
 from types import SimpleNamespace
 
-from benchmark.microbench import _resolved_engine_config
+from collections import defaultdict
+
+from benchmark.microbench import _profiler_snapshot, _resolved_engine_config
 
 
 def test_resolved_engine_config_records_backend_and_jsonable_values():
@@ -28,3 +30,20 @@ def test_resolved_engine_config_records_backend_and_jsonable_values():
     assert resolved["deltakv_sparse_decode_backend"] == "fa2"
     assert resolved["full_attn_layers"] == [0, 1, 2, 8]
     assert resolved["obs_layer_ids"] == [2, 8]
+
+
+def test_profiler_snapshot_records_total_calls_and_average():
+    profiler = SimpleNamespace(
+        times={"prefill_score_pipeline": 0.012},
+        counts=defaultdict(int, {"prefill_score_pipeline": 3}),
+    )
+
+    snapshot = _profiler_snapshot(profiler)
+
+    assert snapshot == {
+        "prefill_score_pipeline": {
+            "calls": 3,
+            "total_s": 0.012,
+            "avg_ms": 4.0,
+        }
+    }

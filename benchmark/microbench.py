@@ -342,6 +342,18 @@ def _numeric_delta(before: dict[str, int], after: dict[str, int]) -> dict[str, i
     }
 
 
+def _profiler_snapshot(profiler) -> dict[str, dict[str, float | int]]:
+    return {
+        name: {
+            "calls": int(profiler.counts[name]),
+            "total_s": float(total_s),
+            "avg_ms": float(total_s / profiler.counts[name] * 1000.0),
+        }
+        for name, total_s in sorted(profiler.times.items())
+        if profiler.counts[name] > 0
+    }
+
+
 def _observe_prefix_cache_hits(llm, hits_by_seq_id: dict[int, int]) -> None:
     scheduler = getattr(llm, "scheduler", None)
     if scheduler is None:
@@ -601,6 +613,7 @@ def benchmark_task(method, length, bs, args, results_dict):
         ttft = float(ttft or 0.0)
         prefill_s = sum(prefill_times)
         decode_s = sum(decode_times)
+        profiler_stats = _profiler_snapshot(profiler)
 
         print(f'[debug] {prefill_tokens=} {prefill_s=} {ttft=} {decode_tokens=} {decode_s=} {has_queued=}')
         prefill_tp = prefill_tokens / prefill_s if prefill_s > 0 else 0
@@ -615,6 +628,27 @@ def benchmark_task(method, length, bs, args, results_dict):
             if decode_bs_after_full
             else (decode_tokens / len(decode_times) if decode_times else 0)
         )
+
+        steady_state_samples = []
+        for repeat_index in range(int(getattr(args, "steady_state_repeats", 0) or 0)):
+            profiler.reset()
+            torch.cuda.synchronize()
+            repeat_start = perf_counter()
+            llm.generate(prompt_token_ids, sampling_params, use_tqdm=False)
+            torch.cuda.synchronize()
+            repeat_s = perf_counter() - repeat_start
+            repeat_profiler = _profiler_snapshot(profiler)
+            steady_state_samples.append(
+                {
+                    "sample_id": repeat_index,
+                    "status": "success",
+                    "ttft_s": repeat_s,
+                    "prefill_tok_s": (length * bs) / repeat_s,
+                    "profiler_stats": repeat_profiler,
+                }
+            )
+        steady_ttft_s = [sample["ttft_s"] for sample in steady_state_samples]
+        steady_prefill_tok_s = [sample["prefill_tok_s"] for sample in steady_state_samples]
         
         stage_mode = (
             f" | AdmissionWave: {admission_wave_size}"
@@ -662,6 +696,17 @@ def benchmark_task(method, length, bs, args, results_dict):
                 for seq_id, hit_len in sorted(prefix_hits_by_seq_id.items())
             },
             "memory_accounting": memory_accounting,
+            "profiler_stats": profiler_stats,
+            "steady_state_repeats": len(steady_state_samples),
+            "steady_state_samples": steady_state_samples,
+            "steady_ttft_s_mean": (
+                sum(steady_ttft_s) / len(steady_ttft_s) if steady_ttft_s else None
+            ),
+            "steady_prefill_tok_s_mean": (
+                sum(steady_prefill_tok_s) / len(steady_prefill_tok_s)
+                if steady_prefill_tok_s
+                else None
+            ),
             "engine_hyper_params": engine_kwargs,
             "resolved_engine_config": resolved_engine_config,
             "status": "SUCCESS"
@@ -742,6 +787,15 @@ def main():
         help="Fail the benchmark case unless at least one prefix-cache hit is observed.",
     )
     parser.add_argument(
+        "--steady_state_repeats",
+        type=int,
+        default=0,
+        help=(
+            "Repeat the same request in the initialized engine and save one profiler sample per repeat. "
+            "Requires output_len=1 so elapsed time is TTFT."
+        ),
+    )
+    parser.add_argument(
         "--hyper_params",
         type=str,
         default="{}",
@@ -768,6 +822,10 @@ def main():
         args.hyper_params_dict = _build_engine_hyper_params(args)
     except ValueError as e:
         parser.error(str(e))
+    if args.steady_state_repeats < 0:
+        parser.error("--steady_state_repeats must be >= 0")
+    if args.steady_state_repeats > 0 and args.output_len != 1:
+        parser.error("--steady_state_repeats requires --output_len 1")
     
     test_lengths = [int(x) for x in args.lengths.split(",")]
     test_methods = args.methods.split(",")

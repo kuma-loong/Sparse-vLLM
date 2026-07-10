@@ -371,6 +371,11 @@ class RKVCacheManager(SnapKVCacheManager):
             score_q_end,
             candidate_start=int(candidate_start),
             num_recent_tokens=int(num_recent_tokens),
+            host_max_score_len=int(score_len),
+            host_max_candidate_end=max(
+                int(candidate_start),
+                int(kv_len) - int(num_recent_tokens),
+            ),
         )
         return attn_score[0]
 
@@ -463,6 +468,11 @@ class RKVCacheManager(SnapKVCacheManager):
             score_ends.to(torch.int32),
             candidate_start=int(candidate_start),
             num_recent_tokens=int(num_recent_tokens),
+            host_max_score_len=int(max_score_len),
+            host_max_candidate_end=max(
+                int(candidate_start),
+                int(max_kv_len) - int(num_recent_tokens),
+            ),
         )
         return attn_score
 
