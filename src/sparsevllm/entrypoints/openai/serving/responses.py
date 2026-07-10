@@ -143,6 +143,8 @@ def _validate_response_request(request: ResponseRequest, served_model_name: str)
             status_code=400,
             detail=f"Unknown model {request.model!r}; this server is serving {served_model_name!r}.",
         )
+    if request.store:
+        raise HTTPException(status_code=400, detail="Responses store=true is not supported; responses are not persisted.")
     try:
         resolve_response_chat_template_kwargs(request)
         normalize_tools(request.tools)

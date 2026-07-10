@@ -2779,10 +2779,30 @@ class OpenAIAPIServerTest(unittest.IsolatedAsyncioTestCase):
             ResponseRequest(model="model", input="hello", tool_choice="required"),
             ResponseRequest(model="model", input="hello", parallel_tool_calls=False),
             ResponseRequest(model="model", input="hello", reasoning={"summary": "auto"}),
+            ResponseRequest(model="model", input="hello", store=True),
         ]:
             with self.assertRaises(HTTPException) as ctx:
                 _validate_response_request(request, "model")
             self.assertEqual(ctx.exception.status_code, 400)
+
+    def test_response_accepts_opencode_compatibility_fields(self):
+        from sparsevllm.entrypoints.openai.api_server import ResponseRequest, _response_prompt
+        from sparsevllm.entrypoints.openai.api_server import _validate_response_request
+
+        class Tokenizer:
+            chat_template = None
+
+        request = ResponseRequest(
+            model="model",
+            input="hello",
+            store=False,
+            prompt_cache_key="ses_test",
+        )
+
+        _validate_response_request(request, "model")
+        self.assertFalse(request.store)
+        self.assertEqual(request.prompt_cache_key, "ses_test")
+        self.assertEqual(_response_prompt(Tokenizer(), request), "user: hello\nassistant:")
 
     def test_response_max_output_tokens_maps_to_sampling_params(self):
         from sparsevllm.entrypoints.openai.api_server import ResponseRequest, _sampling_params_from_response_request
@@ -3241,7 +3261,13 @@ class OpenAIAPIServerTest(unittest.IsolatedAsyncioTestCase):
         try:
             response = TestClient(app).post(
                 "/v1/responses",
-                json={"model": "model", "input": "hello", "max_output_tokens": 4},
+                json={
+                    "model": "model",
+                    "input": "hello",
+                    "max_output_tokens": 4,
+                    "store": False,
+                    "prompt_cache_key": "ses_test",
+                },
             )
         finally:
             app.state.dispatcher.close()

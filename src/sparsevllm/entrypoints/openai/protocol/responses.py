@@ -24,6 +24,8 @@ class ResponseRequest(BaseModel):
     top_p: float = Field(default=1.0, gt=0.0, le=1.0)
     top_k: int = Field(default=0, ge=0)
     stream: bool = False
+    store: bool = False
+    prompt_cache_key: str | None = Field(default=None, min_length=1)
     tools: list[dict[str, Any]] | None = None
     tool_choice: str | dict[str, Any] | None = None
     parallel_tool_calls: bool | None = None
