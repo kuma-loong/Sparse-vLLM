@@ -1001,6 +1001,67 @@ class OpenAIAPIServerTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(payload["token_ids"], [ord(ch) for ch in "user:hello"])
         self.assertEqual(payload["thread"], "sparsevllm-openai-dispatcher")
 
+    async def test_prefix_cache_match_accepts_full_chat_selector(self):
+        from sparsevllm.entrypoints.openai import api_server
+
+        class Tokenizer:
+            bos_token = None
+            chat_template = "template"
+
+            def apply_chat_template(
+                self,
+                chat,
+                tools=None,
+                enable_thinking=True,
+                **_kwargs,
+            ):
+                tool_name = tools[0]["name"] if tools else "none"
+                return (
+                    f"thinking={enable_thinking}|tool={tool_name}|"
+                    + "|".join(f"{item['role']}:{item['content']}" for item in chat)
+                )
+
+            def encode(self, text, add_special_tokens=False):
+                del add_special_tokens
+                return [ord(ch) for ch in text]
+
+        class Engine:
+            tokenizer = Tokenizer()
+            config = type("Config", (), {"vllm_sparse_method": ""})()
+
+            def prefix_cache_match(self, token_ids):
+                return {"token_ids": list(token_ids), "supported": True, "enabled": True}
+
+            def exit(self):
+                pass
+
+        app = api_server.create_app("/tmp/model", served_model_name="model", engine=Engine())
+        endpoint = _route_endpoint(app, "/v1/prefix_cache/match")
+        chat = {
+            "model": "model",
+            "messages": [{"role": "user", "content": "hello"}],
+            "reasoning_effort": "none",
+            "tools": [
+                {
+                    "type": "function",
+                    "function": {"name": "search", "parameters": {}},
+                }
+            ],
+        }
+        try:
+            response = await endpoint(
+                api_server.PrefixCacheMatchRequest(chat=chat),
+                _TestRequest(app),
+            )
+        finally:
+            app.state.dispatcher.close()
+
+        rendered = "thinking=False|tool=search|user:hello"
+        self.assertEqual(
+            json.loads(response.body)["token_ids"],
+            [ord(ch) for ch in rendered],
+        )
+
     async def test_worker_info_and_load_routes(self):
         from sparsevllm.entrypoints.openai import api_server
 

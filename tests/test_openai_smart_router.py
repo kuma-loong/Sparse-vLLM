@@ -132,12 +132,23 @@ class OpenAISmartRouterTest(unittest.TestCase):
     def test_match_payload_for_chat_and_completion_requests(self):
         from sparsevllm.entrypoints.openai.smart_router import match_payload_for_request
 
+        chat_payload = {
+            "model": "model",
+            "messages": [{"role": "user", "content": "hello"}],
+            "tools": [
+                {
+                    "type": "function",
+                    "function": {"name": "search", "parameters": {}},
+                }
+            ],
+            "reasoning_effort": "none",
+        }
         self.assertEqual(
             match_payload_for_request(
                 "/v1/chat/completions",
-                {"messages": [{"role": "user", "content": "hello"}]},
+                chat_payload,
             ),
-            {"messages": [{"role": "user", "content": "hello"}]},
+            {"chat": chat_payload},
         )
         self.assertEqual(
             match_payload_for_request("/v1/completions", {"prompt": [1, 2, 3]}),

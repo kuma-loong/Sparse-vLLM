@@ -501,7 +501,7 @@ def match_payload_for_request(endpoint: str, payload: dict[str, Any]) -> dict[st
     if endpoint == "/v1/chat/completions":
         messages = payload.get("messages")
         if isinstance(messages, list) and messages:
-            return {"messages": messages}
+            return {"chat": payload}
     if endpoint in {"/v1/completions", "/v1/prefix_cache/inspect"}:
         prompt = payload.get("prompt")
         if "token_ids" in payload or "text" in payload:

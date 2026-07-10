@@ -20,6 +20,7 @@ class PrefixCacheMatchRequest(BaseModel):
     token_ids: list[int] | None = None
     text: str | None = None
     messages: list[ChatMessage] | None = None
+    chat: dict[str, Any] | None = None
     response: dict[str, Any] | None = None
 
 
