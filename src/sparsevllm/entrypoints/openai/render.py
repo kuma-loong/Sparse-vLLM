@@ -38,12 +38,36 @@ def validate_chat_template_kwargs(value: Any) -> dict[str, Any] | None:
 
 def resolve_chat_template_kwargs(request: ChatCompletionRequest) -> dict[str, Any] | None:
     kwargs = validate_chat_template_kwargs(request.chat_template_kwargs) or {}
-    if request.enable_thinking is None:
+    enable_thinking = request.enable_thinking
+    if request.reasoning_effort is not None:
+        effort_enable_thinking = request.reasoning_effort != "none"
+        if enable_thinking is not None and enable_thinking != effort_enable_thinking:
+            raise ValueError("reasoning_effort conflicts with enable_thinking.")
+        enable_thinking = effort_enable_thinking
+    if enable_thinking is None:
         return kwargs or None
-    if "enable_thinking" in kwargs and kwargs["enable_thinking"] != request.enable_thinking:
+    if "enable_thinking" in kwargs and kwargs["enable_thinking"] != enable_thinking:
         raise ValueError("enable_thinking conflicts with chat_template_kwargs.enable_thinking.")
-    kwargs["enable_thinking"] = request.enable_thinking
+    kwargs["enable_thinking"] = enable_thinking
     return kwargs
+
+
+def resolve_chat_tools(request: ChatCompletionRequest) -> list[dict[str, Any]] | None:
+    tools = normalize_tools(request.tools)
+    if request.tool_choice not in (None, "auto", "none"):
+        raise ValueError("Chat tool_choice only supports null, 'auto', or 'none' in this implementation.")
+    if request.parallel_tool_calls not in (None, True):
+        raise ValueError("Chat parallel_tool_calls=false is not implemented yet.")
+    return None if request.tool_choice == "none" else tools
+
+
+def _chat_request_prompt(tokenizer: Any, request: ChatCompletionRequest) -> str:
+    return _chat_prompt(
+        tokenizer,
+        request.messages,
+        resolve_chat_template_kwargs(request),
+        resolve_chat_tools(request),
+    )
 
 
 def resolve_response_chat_template_kwargs(request: ResponseRequest) -> dict[str, Any] | None:
@@ -63,15 +87,20 @@ def _chat_prompt(
     tokenizer: Any,
     messages: list[ChatMessage],
     chat_template_kwargs: dict[str, Any] | None = None,
+    tools: list[dict[str, Any]] | None = None,
 ) -> str:
     chat = []
     for message in messages:
         rendered_message = {
             "role": _chat_template_role(message.role),
-            "content": _chat_content_text(message.content),
+            "content": None if message.content is None else _chat_content_text(message.content),
         }
         if message.reasoning_content is not None:
             rendered_message["reasoning_content"] = message.reasoning_content
+        if message.tool_calls is not None:
+            rendered_message["tool_calls"] = message.tool_calls
+        if message.tool_call_id is not None:
+            rendered_message["tool_call_id"] = message.tool_call_id
         chat.append(rendered_message)
     if getattr(tokenizer, "chat_template", None) and hasattr(tokenizer, "apply_chat_template"):
         kwargs = {
@@ -79,15 +108,23 @@ def _chat_prompt(
             "add_generation_prompt": True,
         }
         kwargs.update(chat_template_kwargs or {})
+        if tools:
+            if not _supports_chat_template_kwarg(tokenizer, "tools"):
+                raise ValueError("Tokenizer chat template does not support tools.")
+            kwargs["tools"] = tools
         return tokenizer.apply_chat_template(chat, **kwargs)
     if any("reasoning_content" in message for message in chat):
         raise ValueError("reasoning_content requires a tokenizer chat_template.")
     if chat_template_kwargs:
         raise ValueError("chat_template_kwargs requires a tokenizer chat_template.")
+    if tools:
+        raise ValueError("tools requires a tokenizer chat_template with tools support.")
+    if _messages_require_chat_template(chat):
+        raise ValueError("Chat tool-call history requires a tokenizer chat_template.")
 
     rendered = []
     for message in chat:
-        rendered.append(f"{message['role']}: {message['content']}")
+        rendered.append(f"{message['role']}: {message['content'] or ''}")
     rendered.append("assistant:")
     return "\n".join(rendered)
 

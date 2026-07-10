@@ -24,9 +24,17 @@ class ChatMessage(BaseModel):
     tool_calls: list[dict[str, Any]] | None = None
 
     @model_validator(mode="after")
-    def validate_reasoning_content_role(self):
+    def validate_role_specific_fields(self):
         if self.reasoning_content is not None and self.role != "assistant":
             raise ValueError("reasoning_content is only valid for assistant messages.")
+        if self.tool_calls is not None and self.role != "assistant":
+            raise ValueError("tool_calls is only valid for assistant messages.")
+        if self.tool_call_id is not None and self.role != "tool":
+            raise ValueError("tool_call_id is only valid for tool messages.")
+        if self.role == "tool" and not self.tool_call_id:
+            raise ValueError("tool messages require tool_call_id.")
+        for tool_call in self.tool_calls or []:
+            _validate_message_tool_call(tool_call)
         return self
 
 
@@ -50,5 +58,21 @@ class ChatCompletionRequest(BaseModel):
     tools: list[dict[str, Any]] | None = None
     tool_choice: str | dict[str, Any] | None = None
     parallel_tool_calls: bool | None = None
+    reasoning_effort: Literal["none", "minimal", "low", "medium", "high", "xhigh"] | None = None
     enable_thinking: bool | None = None
     chat_template_kwargs: Any = None
+
+
+def _validate_message_tool_call(tool_call: dict[str, Any]):
+    call_id = tool_call.get("id")
+    if not isinstance(call_id, str) or not call_id:
+        raise ValueError("assistant tool_calls entries require a non-empty id.")
+    if tool_call.get("type") != "function":
+        raise ValueError("assistant tool_calls only supports type='function'.")
+    function = tool_call.get("function")
+    if not isinstance(function, dict):
+        raise ValueError("assistant tool_calls entries require a function object.")
+    if not isinstance(function.get("name"), str) or not function["name"]:
+        raise ValueError("assistant tool_calls function.name must be a non-empty string.")
+    if not isinstance(function.get("arguments"), str):
+        raise ValueError("assistant tool_calls function.arguments must be a string.")

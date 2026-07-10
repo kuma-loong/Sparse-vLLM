@@ -413,6 +413,29 @@ class OpenAIAPIServerTest(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(request.stream_options["include_usage"])
         self.assertEqual(ChatMessage(role="assistant").content, None)
 
+    def test_chat_message_tool_fields_are_role_scoped(self):
+        from pydantic import ValidationError
+
+        from sparsevllm.entrypoints.openai.api_server import ChatMessage
+
+        with self.assertRaisesRegex(ValidationError, "tool_calls is only valid"):
+            ChatMessage(role="user", content="question", tool_calls=[])
+        with self.assertRaisesRegex(ValidationError, "tool_call_id is only valid"):
+            ChatMessage(role="assistant", content="answer", tool_call_id="call_1")
+        with self.assertRaisesRegex(ValidationError, "require tool_call_id"):
+            ChatMessage(role="tool", content="result")
+        with self.assertRaisesRegex(ValidationError, "non-empty id"):
+            ChatMessage(
+                role="assistant",
+                tool_calls=[
+                    {
+                        "id": "",
+                        "type": "function",
+                        "function": {"name": "search", "arguments": "{}"},
+                    }
+                ],
+            )
+
     def test_logprob_request_limits_match_openai_bounds(self):
         from pydantic import ValidationError
 
@@ -600,6 +623,143 @@ class OpenAIAPIServerTest(unittest.IsolatedAsyncioTestCase):
         with self.assertRaisesRegex(HTTPException, "conflicts") as ctx:
             _validate_chat_request(request, "m", Tokenizer())
         self.assertEqual(ctx.exception.status_code, 400)
+
+    def test_chat_reasoning_effort_controls_thinking(self):
+        from fastapi import HTTPException
+
+        from sparsevllm.entrypoints.openai.api_server import (
+            ChatCompletionRequest,
+            _validate_chat_request,
+            resolve_chat_template_kwargs,
+        )
+
+        request = ChatCompletionRequest(
+            model="m",
+            messages=[{"role": "user", "content": "p"}],
+            reasoning_effort="none",
+        )
+        self.assertEqual(resolve_chat_template_kwargs(request), {"enable_thinking": False})
+
+        conflicting = ChatCompletionRequest(
+            model="m",
+            messages=[{"role": "user", "content": "p"}],
+            reasoning_effort="high",
+            enable_thinking=False,
+        )
+        with self.assertRaisesRegex(HTTPException, "conflicts"):
+            _validate_chat_request(conflicting, "m")
+
+    def test_chat_prompt_passes_tools_and_tool_history(self):
+        from sparsevllm.entrypoints.openai.api_server import (
+            ChatCompletionRequest,
+            _chat_request_prompt,
+        )
+
+        class Tokenizer:
+            chat_template = "template"
+
+            def __init__(self):
+                self.chat = None
+                self.tools = None
+
+            def apply_chat_template(self, chat, tools=None, **_kwargs):
+                self.chat = chat
+                self.tools = tools
+                return "rendered"
+
+        request = ChatCompletionRequest(
+            model="m",
+            messages=[
+                {"role": "user", "content": "weather"},
+                {
+                    "role": "assistant",
+                    "content": None,
+                    "reasoning_content": "need a lookup",
+                    "tool_calls": [
+                        {
+                            "id": "call_1",
+                            "type": "function",
+                            "function": {"name": "get_weather", "arguments": '{"city":"Paris"}'},
+                        }
+                    ],
+                },
+                {"role": "tool", "tool_call_id": "call_1", "content": "sunny"},
+            ],
+            tools=[
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "get_weather",
+                        "description": "Get weather",
+                        "parameters": {"type": "object"},
+                    },
+                }
+            ],
+        )
+        tokenizer = Tokenizer()
+
+        self.assertEqual(_chat_request_prompt(tokenizer, request), "rendered")
+        self.assertEqual(tokenizer.chat[1]["reasoning_content"], "need a lookup")
+        self.assertEqual(tokenizer.chat[1]["tool_calls"][0]["id"], "call_1")
+        self.assertEqual(tokenizer.chat[2]["tool_call_id"], "call_1")
+        self.assertEqual(tokenizer.tools[0]["name"], "get_weather")
+
+    def test_chat_tool_controls_and_template_support_fail_fast(self):
+        from fastapi import HTTPException
+
+        from sparsevllm.entrypoints.openai.api_server import (
+            ChatCompletionRequest,
+            _chat_request_prompt,
+            _validate_chat_request,
+        )
+
+        tool = {"type": "function", "function": {"name": "search", "parameters": {}}}
+        for request in (
+            ChatCompletionRequest(
+                model="m",
+                messages=[{"role": "user", "content": "p"}],
+                tools=[tool],
+                tool_choice="required",
+            ),
+            ChatCompletionRequest(
+                model="m",
+                messages=[{"role": "user", "content": "p"}],
+                tools=[tool],
+                parallel_tool_calls=False,
+            ),
+        ):
+            with self.assertRaises(HTTPException):
+                _validate_chat_request(request, "m")
+
+        class NoTemplateTokenizer:
+            chat_template = None
+
+        with self.assertRaisesRegex(ValueError, "tools requires"):
+            _chat_request_prompt(
+                NoTemplateTokenizer(),
+                ChatCompletionRequest(
+                    model="m",
+                    messages=[{"role": "user", "content": "p"}],
+                    tools=[tool],
+                ),
+            )
+
+        class NoToolsTokenizer:
+            chat_template = "template"
+
+            def apply_chat_template(self, chat, tokenize=False, add_generation_prompt=True):
+                del chat, tokenize, add_generation_prompt
+                return "rendered"
+
+        with self.assertRaisesRegex(ValueError, "does not support tools"):
+            _chat_request_prompt(
+                NoToolsTokenizer(),
+                ChatCompletionRequest(
+                    model="m",
+                    messages=[{"role": "user", "content": "p"}],
+                    tools=[tool],
+                ),
+            )
 
     def test_chat_template_kwargs_validation_is_explicit(self):
         from fastapi import HTTPException
