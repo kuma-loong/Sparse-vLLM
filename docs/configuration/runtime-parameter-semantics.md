@@ -1008,9 +1008,14 @@ Chat requests may set `reasoning_effort` to `none`, `minimal`, `low`,
 `medium`, `high`, or `xhigh`; `none` maps to `enable_thinking=false` and every
 other value maps to `true`. The direct `enable_thinking` field and
 `"chat_template_kwargs": {"enable_thinking": false}` remain available for
-Qwen3-style templates. Conflicting values, unknown template kwargs,
-non-boolean `enable_thinking`, or thinking controls without a tokenizer chat
-template fail fast.
+Qwen3-style templates. Following vLLM's Chat API contract,
+`chat_template_kwargs` is an open JSON object whose values are passed directly
+to the tokenizer template. The compatible top-level `preserve_thinking` field
+is normalized into `chat_template_kwargs.preserve_thinking`; this lets local
+Qwen-family clients replay historical reasoning when the loaded template
+supports that switch. Duplicate controls with the same value are accepted,
+while conflicting values, non-boolean known thinking controls, or template
+kwargs without a tokenizer chat template fail fast.
 
 Chat function tools accept OpenAI nested function schemas and the compatible
 flat Responses form. Effective tools are passed through the tokenizer's
