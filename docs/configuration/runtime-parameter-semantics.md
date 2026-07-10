@@ -1019,7 +1019,9 @@ omits tools from the generation prompt. Named/required choices and
 `parallel_tool_calls=false` fail explicitly because their generation
 constraints are not implemented. The server parses Qwen-style
 `<tool_call>`/`<tool_calls>` output only when tools are effective and never
-executes tools itself.
+executes tools itself. Enable `--reasoning-parser qwen3` when Qwen3 thinking
+and tool calling are both active; without it, combined reasoning plus tool-call
+text remains raw `content` instead of being guessed into a structured call.
 
 With `--reasoning-parser qwen3`, non-streaming Chat responses split local raw
 reasoning into the Sparse-vLLM `message.reasoning_content` extension and place
