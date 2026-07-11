@@ -163,3 +163,45 @@ def test_aggregate_keeps_failures_and_separates_model_gates():
     ]
     assert {gate["model_shape"] for gate in gates} == {"qwen3_8b", "qwen25_7b"}
     assert all(gate["geomean_speedup"] == 2.0 and gate["passed"] for gate in gates)
+
+
+def test_compile_metadata_uses_new_files_then_exact_signature_cache(tmp_path, monkeypatch):
+    module = _load_module()
+    cache_dir = tmp_path / "triton-cache"
+    names = [
+        "_prefill_score_partial_stats_kernel",
+        "_prefill_score_reduce_stats_kernel",
+        "_prefill_score_final_kernel",
+    ]
+    for name in names:
+        stale = cache_dir / f"stale-{name}" / f"{name}.json"
+        stale.parent.mkdir(parents=True)
+        stale.write_text(json.dumps({"shared": 111}), encoding="utf-8")
+    monkeypatch.setenv("TRITON_CACHE_DIR", str(cache_dir))
+    before = module._triton_metadata_snapshot()
+
+    for name in names:
+        exact = cache_dir / f"exact-{name}" / f"{name}.json"
+        exact.parent.mkdir(parents=True)
+        exact.write_text(
+            json.dumps({"shared": 222, "num_warps": 4, "num_stages": 3}),
+            encoding="utf-8",
+        )
+    case = module.build_manifest(
+        _args(
+            variants="three_pass_current",
+            stages="combined",
+            head_shapes="qwen3_8b:32:8:128",
+        )
+    )[0]
+
+    resources, reason = module._compiled_resource_metadata(case, before)
+
+    assert reason == ""
+    assert [resource["shared_bytes"] for resource in resources] == [222, 222, 222]
+    cached, reason = module._compiled_resource_metadata(
+        case,
+        module._triton_metadata_snapshot(),
+    )
+    assert reason == ""
+    assert cached == resources

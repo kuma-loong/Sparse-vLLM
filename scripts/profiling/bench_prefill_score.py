@@ -49,6 +49,7 @@ STAGES = ("partial", "reduce", "final", "combined")
 DEFAULT_SEED = 20260711
 H100_BF16_PEAK_TFLOPS = 989.0
 H100_HBM_TBPS = 3.35
+_KERNEL_RESOURCE_CACHE = {}
 
 
 def _csv(value, cast=str):
@@ -411,7 +412,71 @@ def _cuobjdump_path():
     return next((path for path in candidates if path and Path(path).is_file()), None)
 
 
-def _compiled_resource_metadata(stage):
+def _triton_metadata_snapshot():
+    cache_dir = os.environ.get("TRITON_CACHE_DIR")
+    if not cache_dir or not Path(cache_dir).is_dir():
+        return {}
+    return {
+        str(path): path.stat().st_mtime_ns
+        for path in Path(cache_dir).rglob("*.json")
+    }
+
+
+def _kernel_resource_key(case, kernel_name):
+    return (
+        kernel_name,
+        case.dtype,
+        case.score_dtype,
+        case.Hq,
+        case.Hkv,
+        case.head_dim,
+        case.candidate_start,
+        case.num_recent_tokens,
+        case.layout_case,
+        case.block_m,
+        case.block_n,
+        case.block_h,
+        case.block_rows,
+        case.dot_warps,
+        case.dot_stages,
+        case.reduce_blocks,
+        case.reduce_rows,
+        case.reduce_warps,
+        case.reduce_stages,
+        case.candidate_blocks,
+    )
+
+
+def _read_kernel_resource(metadata_path, kernel_name, cuobjdump):
+    metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    resource = {
+        "kernel_name": kernel_name,
+        "metadata_path": str(metadata_path),
+        "shared_bytes": metadata.get("shared"),
+        "num_warps": metadata.get("num_warps"),
+        "num_stages": metadata.get("num_stages"),
+        "global_scratch_size": metadata.get("global_scratch_size"),
+    }
+    cubin = metadata_path.with_suffix(".cubin")
+    if cuobjdump and cubin.is_file():
+        result = subprocess.run(
+            [cuobjdump, "--dump-resource-usage", str(cubin)],
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        match = re.search(r"REG:(\d+)\s+STACK:(\d+)\s+SHARED:(\d+)\s+LOCAL:(\d+)", result.stdout)
+        if result.returncode == 0 and match:
+            resource.update(
+                registers_per_thread=int(match.group(1)),
+                stack_bytes=int(match.group(2)),
+                static_shared_bytes=int(match.group(3)),
+                local_bytes=int(match.group(4)),
+            )
+    return resource
+
+
+def _compiled_resource_metadata(case, before_snapshot):
     cache_dir = os.environ.get("TRITON_CACHE_DIR")
     if not cache_dir or not Path(cache_dir).is_dir():
         return None, "TRITON_CACHE_DIR is missing or does not exist"
@@ -424,39 +489,33 @@ def _compiled_resource_metadata(stage):
             "_prefill_score_reduce_stats_kernel",
             "_prefill_score_final_kernel",
         ],
-    }[stage]
+    }[case.stage]
     cuobjdump = _cuobjdump_path()
+    after_snapshot = _triton_metadata_snapshot()
+    changed_paths = {
+        path
+        for path, mtime_ns in after_snapshot.items()
+        if before_snapshot.get(path) != mtime_ns
+    }
     resources = []
     for name in names:
-        metadata_files = list(Path(cache_dir).rglob(f"{name}.json"))
-        if not metadata_files:
-            return None, f"compiled metadata for {name} was not found in {cache_dir}"
-        metadata_path = max(metadata_files, key=lambda path: path.stat().st_mtime_ns)
-        metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
-        resource = {
-            "kernel_name": name,
-            "metadata_path": str(metadata_path),
-            "shared_bytes": metadata.get("shared"),
-            "num_warps": metadata.get("num_warps"),
-            "num_stages": metadata.get("num_stages"),
-            "global_scratch_size": metadata.get("global_scratch_size"),
-        }
-        cubin = metadata_path.with_suffix(".cubin")
-        if cuobjdump and cubin.is_file():
-            result = subprocess.run(
-                [cuobjdump, "--dump-resource-usage", str(cubin)],
-                text=True,
-                capture_output=True,
-                check=False,
+        resource_key = _kernel_resource_key(case, name)
+        metadata_files = [
+            Path(path)
+            for path in changed_paths
+            if Path(path).name == f"{name}.json"
+        ]
+        if metadata_files:
+            metadata_path = max(metadata_files, key=lambda path: path.stat().st_mtime_ns)
+            resource = _read_kernel_resource(metadata_path, name, cuobjdump)
+            _KERNEL_RESOURCE_CACHE[resource_key] = resource
+        elif resource_key in _KERNEL_RESOURCE_CACHE:
+            resource = dict(_KERNEL_RESOURCE_CACHE[resource_key])
+        else:
+            return None, (
+                f"exact compiled metadata for {name} was not created in this launch "
+                "and its compile signature was not observed earlier"
             )
-            match = re.search(r"REG:(\d+)\s+STACK:(\d+)\s+SHARED:(\d+)\s+LOCAL:(\d+)", result.stdout)
-            if result.returncode == 0 and match:
-                resource.update(
-                    registers_per_thread=int(match.group(1)),
-                    stack_bytes=int(match.group(2)),
-                    static_shared_bytes=int(match.group(3)),
-                    local_bytes=int(match.group(4)),
-                )
         resources.append(resource)
     return resources, ""
 
@@ -527,11 +586,12 @@ def run_case(case, writer, *, selection_ks, profile_only=False):
         }
         compile_row["tensor_strides"] = base["tensor_strides"]
         torch.cuda.synchronize()
+        metadata_before = _triton_metadata_snapshot()
         compile_start = time.perf_counter()
         workspace = _launch(case, tensors, stage="combined")
         torch.cuda.synchronize()
         compile_row["first_call_ms"] = (time.perf_counter() - compile_start) * 1000
-        resources, resource_reason = _compiled_resource_metadata(case.stage)
+        resources, resource_reason = _compiled_resource_metadata(case, metadata_before)
         if resources is None:
             compile_row["resource_metadata_reason"] = resource_reason
         else:
