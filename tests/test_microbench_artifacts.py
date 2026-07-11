@@ -2,7 +2,11 @@ from types import SimpleNamespace
 
 from collections import defaultdict
 
-from benchmark.microbench import _profiler_snapshot, _resolved_engine_config
+from benchmark.microbench import (
+    _artifact_records,
+    _profiler_snapshot,
+    _resolved_engine_config,
+)
 
 
 def test_resolved_engine_config_records_backend_and_jsonable_values():
@@ -47,3 +51,24 @@ def test_profiler_snapshot_records_total_calls_and_average():
             "avg_ms": 4.0,
         }
     }
+
+
+def test_artifact_records_preserve_generated_outputs():
+    args = SimpleNamespace(output_len=2, temperature=0.0, top_p=1.0)
+    generated_outputs = [{"seq_id": 7, "token_ids": [11, 13]}]
+    steady_outputs = [{"text": "sample", "token_ids": [11, 13]}]
+
+    records = _artifact_records(
+        args,
+        [
+            {
+                "status": "SUCCESS",
+                "length": 16,
+                "generated_outputs": generated_outputs,
+                "steady_state_samples": [{"outputs": steady_outputs}],
+            }
+        ],
+    )
+
+    assert records[0]["generated_outputs"] == generated_outputs
+    assert records[0]["steady_state_samples"][0]["outputs"] == steady_outputs

@@ -499,6 +499,7 @@ def benchmark_task(method, length, bs, args, results_dict):
         decode_steps_since_last_wave = 0
         request_seq_ids: list[int] = []
         prefix_hits_by_seq_id: dict[int, int] = {}
+        generated_outputs: list[dict[str, Any]] = []
 
         def add_wave(max_new_requests: int):
             nonlocal next_request_idx, decode_steps_since_last_wave
@@ -534,6 +535,13 @@ def benchmark_task(method, length, bs, args, results_dict):
             finished_outputs, num_tokens = llm.step()
             step_dt = perf_counter() - step_start
             _observe_prefix_cache_hits(llm, prefix_hits_by_seq_id)
+            for seq_id, token_ids, _token_logprobs, _top_logprobs in finished_outputs:
+                generated_outputs.append(
+                    {
+                        "seq_id": int(seq_id),
+                        "token_ids": [int(token_id) for token_id in token_ids],
+                    }
+                )
             
             if num_tokens > 0:
                 prefill_tokens += num_tokens
@@ -634,7 +642,7 @@ def benchmark_task(method, length, bs, args, results_dict):
             profiler.reset()
             torch.cuda.synchronize()
             repeat_start = perf_counter()
-            llm.generate(prompt_token_ids, sampling_params, use_tqdm=False)
+            repeat_outputs = llm.generate(prompt_token_ids, sampling_params, use_tqdm=False)
             torch.cuda.synchronize()
             repeat_s = perf_counter() - repeat_start
             repeat_profiler = _profiler_snapshot(profiler)
@@ -645,6 +653,7 @@ def benchmark_task(method, length, bs, args, results_dict):
                     "ttft_s": repeat_s,
                     "prefill_tok_s": (length * bs) / repeat_s,
                     "profiler_stats": repeat_profiler,
+                    "outputs": repeat_outputs,
                 }
             )
         steady_ttft_s = [sample["ttft_s"] for sample in steady_state_samples]
@@ -696,6 +705,7 @@ def benchmark_task(method, length, bs, args, results_dict):
                 for seq_id, hit_len in sorted(prefix_hits_by_seq_id.items())
             },
             "memory_accounting": memory_accounting,
+            "generated_outputs": generated_outputs,
             "profiler_stats": profiler_stats,
             "steady_state_repeats": len(steady_state_samples),
             "steady_state_samples": steady_state_samples,
