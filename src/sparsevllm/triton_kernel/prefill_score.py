@@ -3,6 +3,12 @@ import triton
 import triton.language as tl
 
 
+_TRITON_MAJOR_MINOR = tuple(int(part) for part in triton.__version__.split(".")[:2])
+# Triton 3.4 lowers the coarsened loop 5% slower on H100; 3.7 makes the
+# Q/global-stat reuse profitable. Keep the original kernels intact below.
+TRITON_PROGRAM_SPAN_SUPPORTED = _TRITON_MAJOR_MINOR >= (3, 7)
+
+
 PREFILL_SCORE_VARIANTS = (
     "three_pass_current",
     "three_pass_host_bounds",
@@ -26,6 +32,19 @@ PREFILL_SCORE_VARIANTS = (
     "three_pass_reduce_rows8",
     "three_pass_reduce_rows16",
     "three_pass_reduce_rows32",
+    "three_pass_lse",
+    "three_pass_lse_span2",
+    "three_pass_lse_span4",
+    "three_pass_lse_span8",
+    "three_pass_program_span2",
+    "three_pass_program_span4",
+    "three_pass_program_span8",
+    "three_pass_final_span2",
+    "three_pass_final_span4",
+    "three_pass_final_span8",
+    "three_pass_both_span2",
+    "three_pass_both_span4",
+    "three_pass_adaptive_span2",
 )
 
 
@@ -46,6 +65,10 @@ def get_prefill_score_variant_config(
     block_h = min(triton.next_power_of_2(kv_group_num), block_h_limit)
     dot_stages = 3
     reduce_rows = 16
+    stats_span = 1
+    program_span = 1
+    final_span = 1
+    use_lse = variant_id.startswith("three_pass_lse")
 
     if variant_id == "three_pass_host_bounds_bh2":
         if head_dim == 128:
@@ -59,6 +82,34 @@ def get_prefill_score_variant_config(
         dot_stages = int(variant_id.removeprefix("three_pass_stages"))
     elif variant_id.startswith("three_pass_reduce_rows"):
         reduce_rows = int(variant_id.removeprefix("three_pass_reduce_rows"))
+    elif variant_id.startswith("three_pass_lse_span"):
+        stats_span = int(variant_id.removeprefix("three_pass_lse_span"))
+        program_span = stats_span
+    elif variant_id.startswith("three_pass_program_span"):
+        program_span = int(variant_id.removeprefix("three_pass_program_span"))
+    elif variant_id.startswith("three_pass_final_span"):
+        final_span = int(variant_id.removeprefix("three_pass_final_span"))
+    elif variant_id.startswith("three_pass_both_span"):
+        program_span = int(variant_id.removeprefix("three_pass_both_span"))
+        final_span = program_span
+    elif variant_id == "three_pass_adaptive_span2":
+        if (
+            TRITON_PROGRAM_SPAN_SUPPORTED
+            and head_dim == 128
+            and max_score_len > 64
+            and candidate_blocks >= 256
+        ):
+            program_span = 2
+            final_span = 2
+
+    if head_dim == 128 and (
+        variant_id.startswith("three_pass_lse")
+        or variant_id.startswith("three_pass_program_span")
+        or variant_id.startswith("three_pass_final_span")
+        or variant_id.startswith("three_pass_both_span")
+        or variant_id == "three_pass_adaptive_span2"
+    ):
+        block_h = min(2, triton.next_power_of_2(kv_group_num))
 
     block_rows = block_h * block_m
     dot_warps = 8 if block_rows >= 128 or block_n >= 128 else 4
@@ -67,7 +118,8 @@ def get_prefill_score_variant_config(
     elif variant_id == "three_pass_warps8":
         dot_warps = 8
 
-    reduce_blocks = triton.next_power_of_2(candidate_blocks)
+    stats_blocks = triton.cdiv(candidate_blocks, stats_span)
+    reduce_blocks = triton.next_power_of_2(stats_blocks)
     while reduce_rows > 1 and reduce_rows * reduce_blocks > 32768:
         reduce_rows //= 2
     return {
@@ -81,10 +133,20 @@ def get_prefill_score_variant_config(
         "reduce_rows": reduce_rows,
         "reduce_warps": 8 if reduce_blocks >= 1024 else 4,
         "reduce_stages": 4,
+        "stats_span": stats_span,
+        "program_span": program_span,
+        "final_span": final_span,
+        "stats_blocks": stats_blocks,
+        "use_lse": use_lse,
         "use_host_bounds": variant_id in {
             "three_pass_host_bounds",
             "three_pass_host_bounds_bh2",
-        },
+        }
+        or variant_id.startswith("three_pass_lse")
+        or variant_id.startswith("three_pass_program_span")
+        or variant_id.startswith("three_pass_final_span")
+        or variant_id.startswith("three_pass_both_span")
+        or variant_id == "three_pass_adaptive_span2",
     }
 
 
@@ -336,6 +398,309 @@ def _prefill_score_final_kernel(
     )
 
 
+@triton.jit
+def _prefill_score_partial_stats_extended_kernel(
+    Q,
+    K,
+    Partial_M,
+    Partial_L,
+    B_Seqlen,
+    Req_to_tokens,
+    B_req_idx,
+    Score_Q_Start,
+    Score_Q_End,
+    B_Start_Loc,
+    B_Prompt_Cache_Len,
+    stride_qt,
+    stride_qh,
+    stride_qd,
+    stride_ks,
+    stride_kh,
+    stride_kd,
+    stride_req_to_tokens_b,
+    stride_req_to_tokens_s,
+    H_PER_KV: tl.constexpr,
+    H_KV: tl.constexpr,
+    HEAD_BLOCKS: tl.constexpr,
+    candidate_start: tl.constexpr,
+    num_recent_tokens: tl.constexpr,
+    sm_scale: tl.constexpr,
+    NUM_CANDIDATE_BLOCKS: tl.constexpr,
+    NUM_STATS_BLOCKS: tl.constexpr,
+    STATS_SPAN: tl.constexpr,
+    PROGRAM_SPAN: tl.constexpr,
+    USE_LSE: tl.constexpr,
+    BLOCK_H: tl.constexpr,
+    BLOCK_ROWS: tl.constexpr,
+    BLOCK_DMODEL: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    USE_IEEE: tl.constexpr,
+):
+    cur_group = tl.program_id(0)
+    cur_program_block = tl.program_id(1)
+    cur_head_block = cur_group % HEAD_BLOCKS
+    cur_bkv = cur_group // HEAD_BLOCKS
+    cur_batch = cur_bkv // H_KV
+    cur_kv_head = cur_bkv % H_KV
+
+    cur_batch_in_all_start_index = tl.load(B_Start_Loc + cur_batch)
+    prompt_cache_len = tl.load(B_Prompt_Cache_Len + cur_batch)
+    context_len = tl.load(B_Seqlen + cur_batch)
+    cur_batch_seq_len = context_len - prompt_cache_len
+    cur_batch_req_idx = tl.load(B_req_idx + cur_batch)
+    score_q_start = tl.load(Score_Q_Start + cur_batch)
+    score_q_end = tl.load(Score_Q_End + cur_batch)
+
+    offs_rows = tl.arange(0, BLOCK_ROWS)
+    offs_d = tl.arange(0, BLOCK_DMODEL)
+    offs_n = tl.arange(0, BLOCK_N)
+    local_head = cur_head_block * BLOCK_H + offs_rows // BLOCK_M
+    q_head = cur_kv_head * H_PER_KV + local_head
+    q_abs_pos = score_q_start + (offs_rows % BLOCK_M)
+    q_rel_pos = q_abs_pos - prompt_cache_len
+    q_row_valid = (
+        (local_head < H_PER_KV)
+        & (q_abs_pos < score_q_end)
+        & (q_rel_pos >= 0)
+        & (q_rel_pos < cur_batch_seq_len)
+    )
+
+    off_q = (
+        (cur_batch_in_all_start_index + q_rel_pos[:, None]) * stride_qt
+        + q_head[:, None] * stride_qh
+        + offs_d[None, :] * stride_qd
+    )
+    q = tl.load(Q + off_q, mask=q_row_valid[:, None], other=0.0)
+
+    # LSE variants coarsen several 64-token dot tiles into one online-softmax
+    # state. Rescaling l_i when m_i grows preserves the exact softmax invariant
+    # without materializing logits.
+    m_i = tl.full([BLOCK_ROWS], -1.0e20, tl.float32)
+    l_i = tl.zeros([BLOCK_ROWS], tl.float32)
+    for span_idx in tl.static_range(0, PROGRAM_SPAN):
+        cur_n_block = cur_program_block * PROGRAM_SPAN + span_idx
+        start_n = cur_n_block * BLOCK_N
+        kv_pos = start_n + offs_n
+        candidate_end = tl.maximum(candidate_start, context_len - num_recent_tokens)
+        if PROGRAM_SPAN == 1:
+            kv_in_candidate = (kv_pos >= candidate_start) & (kv_pos < candidate_end)
+        else:
+            kv_in_candidate = (
+                (cur_n_block < NUM_CANDIDATE_BLOCKS)
+                & (kv_pos >= candidate_start)
+                & (kv_pos < candidate_end)
+            )
+        kv_loc = tl.load(
+            Req_to_tokens + stride_req_to_tokens_b * cur_batch_req_idx + stride_req_to_tokens_s * kv_pos,
+            mask=kv_in_candidate,
+            other=0,
+        )
+        off_k = kv_loc[None, :] * stride_ks + cur_kv_head * stride_kh + offs_d[:, None] * stride_kd
+        k = tl.load(K + off_k, mask=kv_in_candidate[None, :], other=0.0)
+
+        if USE_IEEE:
+            qk = tl.dot(q, k, input_precision="ieee") * sm_scale
+        else:
+            qk = tl.dot(q, k) * sm_scale
+        causal_mask = q_abs_pos[:, None] >= kv_pos[None, :]
+        valid = q_row_valid[:, None] & kv_in_candidate[None, :] & causal_mask
+        qk = tl.where(valid, qk, -1.0e20)
+        block_m = tl.max(qk, axis=1)
+        p = tl.exp(qk - block_m[:, None])
+        p = tl.where(valid, p, 0.0)
+        block_l = tl.sum(p, axis=1)
+        if not USE_LSE:
+            stats_offs = (cur_group * NUM_STATS_BLOCKS + cur_n_block) * BLOCK_ROWS + offs_rows
+            if PROGRAM_SPAN == 1:
+                tl.store(Partial_M + stats_offs, block_m)
+                tl.store(Partial_L + stats_offs, block_l)
+            else:
+                block_exists = cur_n_block < NUM_CANDIDATE_BLOCKS
+                tl.store(Partial_M + stats_offs, block_m, mask=block_exists)
+                tl.store(Partial_L + stats_offs, block_l, mask=block_exists)
+        else:
+            new_m = tl.maximum(m_i, block_m)
+            l_i = l_i * tl.exp(m_i - new_m) + block_l * tl.exp(block_m - new_m)
+            m_i = new_m
+
+    if USE_LSE:
+        stats_offs = (cur_group * NUM_STATS_BLOCKS + cur_program_block) * BLOCK_ROWS + offs_rows
+        lse_i = tl.where(l_i > 0.0, m_i + tl.log(l_i), -1.0e20)
+        tl.store(Partial_M + stats_offs, lse_i)
+
+
+@triton.jit
+def _prefill_score_reduce_stats_extended_kernel(
+    Partial_M,
+    Partial_L,
+    Global_M,
+    Global_L,
+    NUM_BLOCKS: tl.constexpr,
+    BLOCK_ROWS: tl.constexpr,
+    REDUCE_BLOCKS: tl.constexpr,
+    REDUCE_ROWS: tl.constexpr,
+    USE_LSE: tl.constexpr,
+):
+    cur_group = tl.program_id(0)
+    cur_row_block = tl.program_id(1)
+    offs_rows = cur_row_block * REDUCE_ROWS + tl.arange(0, REDUCE_ROWS)
+    offs_blocks = tl.arange(0, REDUCE_BLOCKS)
+
+    stats_offs = (
+        cur_group * NUM_BLOCKS * BLOCK_ROWS
+        + offs_blocks[None, :] * BLOCK_ROWS
+        + offs_rows[:, None]
+    )
+    mask = (offs_rows[:, None] < BLOCK_ROWS) & (offs_blocks[None, :] < NUM_BLOCKS)
+    partial_m = tl.load(Partial_M + stats_offs, mask=mask, other=-1.0e20)
+    m_i = tl.max(partial_m, axis=1)
+    if USE_LSE:
+        l_i = tl.sum(tl.exp(partial_m - m_i[:, None]), axis=1)
+    else:
+        partial_l = tl.load(Partial_L + stats_offs, mask=mask, other=0.0)
+        l_i = tl.sum(partial_l * tl.exp(partial_m - m_i[:, None]), axis=1)
+
+    out_offs = cur_group * BLOCK_ROWS + offs_rows
+    if USE_LSE:
+        global_lse = tl.where(l_i > 0.0, m_i + tl.log(l_i), -1.0e20)
+        tl.store(Global_M + out_offs, global_lse, mask=offs_rows < BLOCK_ROWS)
+    else:
+        tl.store(Global_M + out_offs, m_i, mask=offs_rows < BLOCK_ROWS)
+        tl.store(Global_L + out_offs, l_i, mask=offs_rows < BLOCK_ROWS)
+
+
+@triton.jit
+def _prefill_score_final_extended_kernel(
+    Q,
+    K,
+    Attn_Score,
+    Global_M,
+    Global_L,
+    B_Seqlen,
+    Req_to_tokens,
+    B_req_idx,
+    Score_Q_Start,
+    Score_Q_End,
+    B_Start_Loc,
+    B_Prompt_Cache_Len,
+    stride_qt,
+    stride_qh,
+    stride_qd,
+    stride_ks,
+    stride_kh,
+    stride_kd,
+    stride_asb,
+    stride_asl,
+    stride_req_to_tokens_b,
+    stride_req_to_tokens_s,
+    H_PER_KV: tl.constexpr,
+    H_KV: tl.constexpr,
+    HEAD_BLOCKS: tl.constexpr,
+    candidate_start: tl.constexpr,
+    num_recent_tokens: tl.constexpr,
+    sm_scale: tl.constexpr,
+    NUM_BLOCKS: tl.constexpr,
+    BLOCK_H: tl.constexpr,
+    BLOCK_ROWS: tl.constexpr,
+    BLOCK_DMODEL: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    USE_IEEE: tl.constexpr,
+    USE_LSE: tl.constexpr,
+    FINAL_SPAN: tl.constexpr,
+):
+    cur_group = tl.program_id(0)
+    cur_program_block = tl.program_id(1)
+    cur_head_block = cur_group % HEAD_BLOCKS
+    cur_bkv = cur_group // HEAD_BLOCKS
+    cur_batch = cur_bkv // H_KV
+    cur_kv_head = cur_bkv % H_KV
+
+    cur_batch_in_all_start_index = tl.load(B_Start_Loc + cur_batch)
+    prompt_cache_len = tl.load(B_Prompt_Cache_Len + cur_batch)
+    context_len = tl.load(B_Seqlen + cur_batch)
+    cur_batch_seq_len = context_len - prompt_cache_len
+    cur_batch_req_idx = tl.load(B_req_idx + cur_batch)
+    score_q_start = tl.load(Score_Q_Start + cur_batch)
+    score_q_end = tl.load(Score_Q_End + cur_batch)
+    score_q_len = tl.maximum(score_q_end - score_q_start, 1)
+
+    offs_rows = tl.arange(0, BLOCK_ROWS)
+    offs_d = tl.arange(0, BLOCK_DMODEL)
+    offs_n = tl.arange(0, BLOCK_N)
+    local_head = cur_head_block * BLOCK_H + offs_rows // BLOCK_M
+    q_head = cur_kv_head * H_PER_KV + local_head
+    q_abs_pos = score_q_start + (offs_rows % BLOCK_M)
+    q_rel_pos = q_abs_pos - prompt_cache_len
+    row_head_in_block = offs_rows // BLOCK_M
+    q_row_valid = (
+        (local_head < H_PER_KV)
+        & (q_abs_pos < score_q_end)
+        & (q_rel_pos >= 0)
+        & (q_rel_pos < cur_batch_seq_len)
+    )
+
+    off_q = (
+        (cur_batch_in_all_start_index + q_rel_pos[:, None]) * stride_qt
+        + q_head[:, None] * stride_qh
+        + offs_d[None, :] * stride_qd
+    )
+    q = tl.load(Q + off_q, mask=q_row_valid[:, None], other=0.0)
+
+    stats_offs = cur_group * BLOCK_ROWS + offs_rows
+    m_i = tl.load(Global_M + stats_offs)
+    if not USE_LSE:
+        l_i = tl.load(Global_L + stats_offs)
+        safe_l_i = tl.where(l_i > 0.0, l_i, 1.0)
+
+    for span_idx in tl.static_range(0, FINAL_SPAN):
+        cur_n_block = cur_program_block * FINAL_SPAN + span_idx
+        start_n = cur_n_block * BLOCK_N
+        kv_pos = start_n + offs_n
+        candidate_end = tl.maximum(candidate_start, context_len - num_recent_tokens)
+        if FINAL_SPAN == 1:
+            kv_in_candidate = (kv_pos >= candidate_start) & (kv_pos < candidate_end)
+        else:
+            kv_in_candidate = (
+                (cur_n_block < NUM_BLOCKS)
+                & (kv_pos >= candidate_start)
+                & (kv_pos < candidate_end)
+            )
+        kv_loc = tl.load(
+            Req_to_tokens + stride_req_to_tokens_b * cur_batch_req_idx + stride_req_to_tokens_s * kv_pos,
+            mask=kv_in_candidate,
+            other=0,
+        )
+        off_k = kv_loc[None, :] * stride_ks + cur_kv_head * stride_kh + offs_d[:, None] * stride_kd
+        k = tl.load(K + off_k, mask=kv_in_candidate[None, :], other=0.0)
+
+        if USE_IEEE:
+            qk = tl.dot(q, k, input_precision="ieee") * sm_scale
+        else:
+            qk = tl.dot(q, k) * sm_scale
+        causal_mask = q_abs_pos[:, None] >= kv_pos[None, :]
+        valid = q_row_valid[:, None] & kv_in_candidate[None, :] & causal_mask
+        qk = tl.where(valid, qk, -1.0e20)
+        if USE_LSE:
+            probs = tl.exp(qk - m_i[:, None])
+        else:
+            probs = tl.exp(qk - m_i[:, None]) / safe_l_i[:, None]
+        probs = tl.where(valid, probs, 0.0)
+
+        token_score = tl.zeros([BLOCK_N], dtype=tl.float32)
+        for head_idx in tl.static_range(0, BLOCK_H):
+            head_rows = row_head_in_block == head_idx
+            head_score = tl.sum(tl.where(head_rows[:, None], probs, 0.0), axis=0) / (score_q_len * 1.0)
+            token_score = tl.maximum(token_score, head_score)
+
+        tl.atomic_max(
+            Attn_Score + cur_batch * stride_asb + kv_pos * stride_asl,
+            token_score,
+            mask=kv_in_candidate,
+        )
+
+
 @torch.no_grad()
 def prefill_score_fwd_variant(
     q: torch.Tensor,
@@ -374,10 +739,18 @@ def prefill_score_fwd_variant(
         raise ValueError(f"num query heads must be divisible by num kv heads: q={head} k={kv_head}")
     if stage not in {"partial", "reduce", "final", "combined"}:
         raise ValueError(f"unknown prefill score stage: {stage!r}")
-    use_host_bounds = variant_id in {
-        "three_pass_host_bounds",
-        "three_pass_host_bounds_bh2",
-    } or use_provided_bounds
+    use_host_bounds = (
+        variant_id in {
+            "three_pass_host_bounds",
+            "three_pass_host_bounds_bh2",
+        }
+        or variant_id.startswith("three_pass_lse")
+        or variant_id.startswith("three_pass_program_span")
+        or variant_id.startswith("three_pass_final_span")
+        or variant_id.startswith("three_pass_both_span")
+        or variant_id == "three_pass_adaptive_span2"
+        or use_provided_bounds
+    )
     if use_host_bounds:
         if host_max_score_len is None or host_max_candidate_end is None:
             raise ValueError("three_pass_host_bounds requires both host bounds")
@@ -426,21 +799,42 @@ def prefill_score_fwd_variant(
     if group_count <= 0:
         return None
 
-    expected_shapes = (
-        (group_count, candidate_blocks, block_rows),
-        (group_count, candidate_blocks, block_rows),
-        (group_count, block_rows),
-        (group_count, block_rows),
-    )
+    use_lse = bool(config["use_lse"])
+    stats_span = int(config["stats_span"])
+    program_span = int(config["program_span"])
+    final_span = int(config["final_span"])
+    stats_blocks = int(config["stats_blocks"])
+    program_blocks = triton.cdiv(candidate_blocks, program_span)
+    if use_lse:
+        expected_shapes = (
+            (group_count, stats_blocks, block_rows),
+            (group_count, block_rows),
+        )
+    else:
+        expected_shapes = (
+            (group_count, stats_blocks, block_rows),
+            (group_count, stats_blocks, block_rows),
+            (group_count, block_rows),
+            (group_count, block_rows),
+        )
     if workspace is None:
         partial_m = torch.empty(expected_shapes[0], device=q.device, dtype=torch.float32)
-        partial_l = torch.empty_like(partial_m)
-        global_m = torch.empty(expected_shapes[2], device=q.device, dtype=torch.float32)
-        global_l = torch.empty_like(global_m)
-        workspace = (partial_m, partial_l, global_m, global_l)
+        if use_lse:
+            global_m = torch.empty(expected_shapes[1], device=q.device, dtype=torch.float32)
+            partial_l = partial_m
+            global_l = global_m
+            workspace = (partial_m, global_m)
+        else:
+            partial_l = torch.empty_like(partial_m)
+            global_m = torch.empty(expected_shapes[2], device=q.device, dtype=torch.float32)
+            global_l = torch.empty_like(global_m)
+            workspace = (partial_m, partial_l, global_m, global_l)
     else:
-        if len(workspace) != 4:
-            raise ValueError(f"prefill score workspace must contain four tensors, got {len(workspace)}")
+        expected_count = 2 if use_lse else 4
+        if len(workspace) != expected_count:
+            raise ValueError(
+                f"prefill score workspace must contain {expected_count} tensors, got {len(workspace)}"
+            )
         for index, (tensor, expected_shape) in enumerate(zip(workspace, expected_shapes)):
             if tensor.device != q.device or tensor.dtype != torch.float32 or tuple(tensor.shape) != expected_shape:
                 raise ValueError(
@@ -448,7 +842,12 @@ def prefill_score_fwd_variant(
                     f"dtype=float32, device={q.device}; got shape={tuple(tensor.shape)}, "
                     f"dtype={tensor.dtype}, device={tensor.device}"
                 )
-        partial_m, partial_l, global_m, global_l = workspace
+        if use_lse:
+            partial_m, global_m = workspace
+            partial_l = partial_m
+            global_l = global_m
+        else:
+            partial_m, partial_l, global_m, global_l = workspace
 
     common = (
         q,
@@ -476,44 +875,75 @@ def prefill_score_fwd_variant(
         "candidate_start": int(candidate_start),
         "num_recent_tokens": int(num_recent_tokens),
         "sm_scale": float(head_dim) ** -0.5,
-        "NUM_BLOCKS": candidate_blocks,
         "BLOCK_H": block_h,
         "BLOCK_ROWS": block_rows,
         "BLOCK_DMODEL": head_dim,
         "BLOCK_M": block_m,
         "BLOCK_N": block_n,
         "USE_IEEE": q.dtype == torch.float32,
+        "USE_LSE": use_lse,
         "num_warps": int(config["dot_warps"]),
         "num_stages": int(config["dot_stages"]),
     }
+    legacy_common_meta = dict(common_meta)
+    legacy_common_meta.pop("USE_LSE")
     if stage in {"partial", "combined"}:
-        _prefill_score_partial_stats_kernel[(group_count, candidate_blocks)](
-            common[0],
-            common[1],
-            partial_m,
-            partial_l,
-            *common[2:],
-            **common_meta,
-        )
+        if use_lse or program_span > 1:
+            _prefill_score_partial_stats_extended_kernel[(group_count, program_blocks)](
+                common[0],
+                common[1],
+                partial_m,
+                partial_l,
+                *common[2:],
+                NUM_CANDIDATE_BLOCKS=candidate_blocks,
+                NUM_STATS_BLOCKS=stats_blocks,
+                STATS_SPAN=stats_span,
+                PROGRAM_SPAN=program_span,
+                **common_meta,
+            )
+        else:
+            _prefill_score_partial_stats_kernel[(group_count, candidate_blocks)](
+                common[0],
+                common[1],
+                partial_m,
+                partial_l,
+                *common[2:],
+                NUM_BLOCKS=candidate_blocks,
+                **legacy_common_meta,
+            )
     if stage in {"reduce", "combined"}:
         reduce_grid = (group_count, triton.cdiv(block_rows, int(config["reduce_rows"])))
-        _prefill_score_reduce_stats_kernel[reduce_grid](
-            partial_m,
-            partial_l,
-            global_m,
-            global_l,
-            NUM_BLOCKS=candidate_blocks,
-            BLOCK_ROWS=block_rows,
-            REDUCE_BLOCKS=int(config["reduce_blocks"]),
-            REDUCE_ROWS=int(config["reduce_rows"]),
-            num_warps=int(config["reduce_warps"]),
-            num_stages=int(config["reduce_stages"]),
-        )
+        reduce_args = {
+            "NUM_BLOCKS": stats_blocks,
+            "BLOCK_ROWS": block_rows,
+            "REDUCE_BLOCKS": int(config["reduce_blocks"]),
+            "REDUCE_ROWS": int(config["reduce_rows"]),
+            "num_warps": int(config["reduce_warps"]),
+            "num_stages": int(config["reduce_stages"]),
+        }
+        if use_lse:
+            _prefill_score_reduce_stats_extended_kernel[reduce_grid](
+                partial_m,
+                partial_l,
+                global_m,
+                global_l,
+                USE_LSE=True,
+                **reduce_args,
+            )
+        else:
+            _prefill_score_reduce_stats_kernel[reduce_grid](
+                partial_m,
+                partial_l,
+                global_m,
+                global_l,
+                **reduce_args,
+            )
     if stage in {"final", "combined"}:
         # Triton 3.4 does not support atomic_max on fp16/bf16 pointers. Preserve
         # cross-step max accumulation in FP32, then cast the complete result.
         atomic_score = attn_score if attn_score.dtype == torch.float32 else attn_score.float()
-        _prefill_score_final_kernel[(group_count, candidate_blocks)](
+        final_program_blocks = triton.cdiv(candidate_blocks, final_span)
+        final_args = (
             common[0],
             common[1],
             atomic_score,
@@ -523,8 +953,20 @@ def prefill_score_fwd_variant(
             atomic_score.stride(0),
             atomic_score.stride(1),
             *common[15:],
-            **common_meta,
         )
+        if use_lse or final_span > 1:
+            _prefill_score_final_extended_kernel[(group_count, final_program_blocks)](
+                *final_args,
+                NUM_BLOCKS=candidate_blocks,
+                FINAL_SPAN=final_span,
+                **common_meta,
+            )
+        else:
+            _prefill_score_final_kernel[(group_count, candidate_blocks)](
+                *final_args,
+                NUM_BLOCKS=candidate_blocks,
+                **legacy_common_meta,
+            )
         if atomic_score is not attn_score:
             attn_score.copy_(atomic_score)
     return workspace
@@ -563,7 +1005,7 @@ def prefill_score_fwd(
         score_q_end,
         candidate_start=candidate_start,
         num_recent_tokens=num_recent_tokens,
-        variant_id="three_pass_host_bounds_bh2",
+        variant_id="three_pass_adaptive_span2",
         host_max_score_len=host_max_score_len,
         host_max_candidate_end=host_max_candidate_end,
     )

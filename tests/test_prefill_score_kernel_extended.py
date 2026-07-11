@@ -414,6 +414,59 @@ def test_host_bounds_is_bitwise_and_selection_equivalent_at_long_lengths(model_s
         )
 
 
+@pytest.mark.parametrize("model_shape", ["qwen3", "qwen25"])
+@pytest.mark.parametrize("window", [65, 128])
+def test_adaptive_program_span_is_bitwise_equivalent(model_shape, window):
+    num_heads, num_kv_heads = (32, 8) if model_shape == "qwen3" else (28, 4)
+    kwargs = dict(
+        context_lens=[32749],
+        windows=[window],
+        num_heads=num_heads,
+        num_kv_heads=num_kv_heads,
+        head_dim=128,
+        q_dtype=torch.bfloat16,
+        score_dtype=torch.float32,
+        candidate_start=64,
+        num_recent_tokens=512,
+        slot_case="shuffled",
+    )
+    baseline = _make_case(**kwargs)
+    candidate = _make_case(**kwargs)
+    _run(baseline, variant_id="three_pass_host_bounds_bh2")
+    _run(candidate, variant_id="three_pass_adaptive_span2")
+    torch.cuda.synchronize()
+
+    assert torch.equal(baseline["attn_score"], candidate["attn_score"])
+    candidate_end = 32749 - 512
+    for requested_k in (32, 64, 128, 512, 1024):
+        assert torch.equal(
+            torch.topk(baseline["attn_score"][0, 64:candidate_end], requested_k, sorted=True).indices,
+            torch.topk(candidate["attn_score"][0, 64:candidate_end], requested_k, sorted=True).indices,
+        )
+
+
+def test_adaptive_program_span_dispatch_boundaries():
+    from sparsevllm.triton_kernel.prefill_score import (
+        TRITON_PROGRAM_SPAN_SUPPORTED,
+        get_prefill_score_variant_config,
+    )
+
+    def config(*, window, candidate_blocks, head_dim=128):
+        return get_prefill_score_variant_config(
+            "three_pass_adaptive_span2",
+            head_dim=head_dim,
+            max_score_len=window,
+            kv_group_num=4,
+            candidate_blocks=candidate_blocks,
+        )
+
+    assert config(window=64, candidate_blocks=4096)["program_span"] == 1
+    assert config(window=65, candidate_blocks=255)["program_span"] == 1
+    expected_span = 2 if TRITON_PROGRAM_SPAN_SUPPORTED else 1
+    assert config(window=65, candidate_blocks=256)["program_span"] == expected_span
+    assert config(window=128, candidate_blocks=4096, head_dim=64)["program_span"] == 1
+
+
 @pytest.mark.parametrize("length", MANDATORY_CONTEXT_LENGTHS)
 def test_context_length_manifest_current_and_production(length):
     window = min(15, length)
@@ -433,7 +486,7 @@ def test_context_length_manifest_current_and_production(length):
     production = _make_case(**kwargs)
 
     _run(baseline, variant_id="three_pass_current")
-    _run(production, variant_id="three_pass_host_bounds_bh2")
+    _run(production, variant_id="three_pass_adaptive_span2")
     torch.cuda.synchronize()
 
     assert torch.equal(baseline["attn_score"], production["attn_score"])

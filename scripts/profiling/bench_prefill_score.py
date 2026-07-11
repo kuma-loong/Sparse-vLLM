@@ -141,6 +141,11 @@ class Case:
     reduce_warps: int
     reduce_stages: int
     candidate_blocks: int
+    stats_blocks: int
+    stats_span: int
+    program_span: int
+    final_span: int
+    use_lse: bool
     group_count: int
     stats_workspace_bytes: int
     atomic_score_bytes: int
@@ -218,10 +223,12 @@ def build_manifest(args):
                                         )
                                         head_blocks = triton.cdiv(hq // hkv, int(config["block_h"]))
                                         group_count = batch * hkv * head_blocks
-                                        stats_workspace_bytes = (
-                                            2 * group_count * candidate_blocks * int(config["block_rows"]) * 4
-                                            + 2 * group_count * int(config["block_rows"]) * 4
-                                        )
+                                        stats_blocks = int(config["stats_blocks"])
+                                        stats_tensor_count = 1 if bool(config["use_lse"]) else 2
+                                        stats_workspace_bytes = stats_tensor_count * group_count * (
+                                            stats_blocks * int(config["block_rows"])
+                                            + int(config["block_rows"])
+                                        ) * 4
                                         atomic_score_bytes = (
                                             0
                                             if score_dtype == "fp32"
@@ -274,6 +281,11 @@ def build_manifest(args):
                                                     reduce_warps=int(config["reduce_warps"]),
                                                     reduce_stages=int(config["reduce_stages"]),
                                                     candidate_blocks=candidate_blocks,
+                                                    stats_blocks=stats_blocks,
+                                                    stats_span=int(config["stats_span"]),
+                                                    program_span=int(config["program_span"]),
+                                                    final_span=int(config["final_span"]),
+                                                    use_lse=bool(config["use_lse"]),
                                                     group_count=group_count,
                                                     stats_workspace_bytes=stats_workspace_bytes,
                                                     atomic_score_bytes=atomic_score_bytes,
@@ -423,10 +435,14 @@ def _triton_metadata_snapshot():
 
 
 def _kernel_resource_key(case, kernel_name):
-    if kernel_name == "_prefill_score_reduce_stats_kernel":
+    if kernel_name in {
+        "_prefill_score_reduce_stats_kernel",
+        "_prefill_score_reduce_stats_extended_kernel",
+    }:
         return (
             kernel_name,
-            case.candidate_blocks,
+            case.stats_blocks,
+            case.use_lse,
             case.block_rows,
             case.reduce_blocks,
             case.reduce_rows,
@@ -453,6 +469,11 @@ def _kernel_resource_key(case, kernel_name):
         case.reduce_warps,
         case.reduce_stages,
         case.candidate_blocks,
+        case.stats_blocks,
+        case.stats_span,
+        case.program_span,
+        case.final_span,
+        case.use_lse,
     )
 
 
@@ -495,6 +516,11 @@ def _case_with_variant_config(case, variant_id):
         reduce_warps=int(config["reduce_warps"]),
         reduce_stages=int(config["reduce_stages"]),
         candidate_blocks=int(candidate_blocks),
+        stats_blocks=int(config["stats_blocks"]),
+        stats_span=int(config["stats_span"]),
+        program_span=int(config["program_span"]),
+        final_span=int(config["final_span"]),
+        use_lse=bool(config["use_lse"]),
         group_count=int(case.B * case.Hkv * head_blocks),
     )
 
@@ -532,15 +558,26 @@ def _compiled_resource_metadata(case, before_snapshot):
     cache_dir = os.environ.get("TRITON_CACHE_DIR")
     if not cache_dir or not Path(cache_dir).is_dir():
         return None, "TRITON_CACHE_DIR is missing or does not exist"
+    partial_name = (
+        "_prefill_score_partial_stats_extended_kernel"
+        if case.use_lse or case.program_span > 1
+        else "_prefill_score_partial_stats_kernel"
+    )
+    reduce_name = (
+        "_prefill_score_reduce_stats_extended_kernel"
+        if case.use_lse
+        else "_prefill_score_reduce_stats_kernel"
+    )
+    final_name = (
+        "_prefill_score_final_extended_kernel"
+        if case.use_lse or case.final_span > 1
+        else "_prefill_score_final_kernel"
+    )
     names = {
-        "partial": ["_prefill_score_partial_stats_kernel"],
-        "reduce": ["_prefill_score_reduce_stats_kernel"],
-        "final": ["_prefill_score_final_kernel"],
-        "combined": [
-            "_prefill_score_partial_stats_kernel",
-            "_prefill_score_reduce_stats_kernel",
-            "_prefill_score_final_kernel",
-        ],
+        "partial": [partial_name],
+        "reduce": [reduce_name],
+        "final": [final_name],
+        "combined": [partial_name, reduce_name, final_name],
     }[case.stage]
     cuobjdump = _cuobjdump_path()
     after_snapshot = _triton_metadata_snapshot()
@@ -621,7 +658,7 @@ def _performance_metrics(case, latency_ms):
     }
 
 
-def run_case(case, writer, *, selection_ks, profile_only=False):
+def run_case(case, writer, *, selection_ks, baseline_variant, profile_only=False):
     base = asdict(case)
     compile_row = {
         **base,
@@ -658,10 +695,10 @@ def run_case(case, writer, *, selection_ks, profile_only=False):
             baseline_tensors["attn_score_storage"] = torch.full_like(tensors["attn_score_storage"], -7.0)
             baseline_tensors["attn_score"] = baseline_tensors["attn_score_storage"][:, : case.max_context_len]
             baseline_metadata_before = _triton_metadata_snapshot()
-            _launch(case, baseline_tensors, stage="combined", variant_id="three_pass_current")
+            _launch(case, baseline_tensors, stage="combined", variant_id=baseline_variant)
             torch.cuda.synchronize()
             _compiled_resource_metadata(
-                _case_with_variant_config(case, "three_pass_current"),
+                _case_with_variant_config(case, baseline_variant),
                 baseline_metadata_before,
             )
             baseline_output = baseline_tensors["attn_score"].clone()
@@ -792,6 +829,11 @@ def _comparison_key(row):
         "reduce_warps",
         "reduce_stages",
         "candidate_blocks",
+        "stats_blocks",
+        "stats_span",
+        "program_span",
+        "final_span",
+        "use_lse",
         "group_count",
         "stats_workspace_bytes",
         "atomic_score_bytes",
@@ -820,7 +862,7 @@ def _comparison_key(row):
     )
 
 
-def aggregate_results(results):
+def aggregate_results(results, *, baseline_variant="three_pass_current"):
     status_counts = {
         status: sum(row.get("status") == status for row in results)
         for status in sorted(VALID_STATUSES)
@@ -830,7 +872,7 @@ def aggregate_results(results):
         by_key.setdefault(_comparison_key(row), {})[row["variant_id"]] = row
     comparisons = []
     for variants in by_key.values():
-        baseline = variants.get("three_pass_current")
+        baseline = variants.get(baseline_variant)
         if not baseline or baseline.get("status") != "success" or "latency_p50_ms" not in baseline:
             continue
         for variant_id, row in variants.items():
@@ -842,7 +884,7 @@ def aggregate_results(results):
                     "stage": row["stage"],
                     "model_shape": row["model_shape"],
                     "variant_id": variant_id,
-                    "baseline_id": "three_pass_current",
+                    "baseline_id": baseline_variant,
                     "latency_ratio": row["latency_p50_ms"] / baseline["latency_p50_ms"],
                     "speedup": baseline["latency_p50_ms"] / row["latency_p50_ms"],
                 }
@@ -862,7 +904,7 @@ def aggregate_results(results):
                 "stage": stage,
                 "model_shape": model_shape,
                 "variant_id": variant_id,
-                "baseline_id": "three_pass_current",
+                "baseline_id": baseline_variant,
                 "case_count": len(ratios),
                 "geomean_latency_ratio": geomean_ratio,
                 "geomean_speedup": 1.0 / geomean_ratio,
@@ -919,6 +961,7 @@ def _run_info(args, manifest_hash):
         "triton_cache_dir": os.environ.get("TRITON_CACHE_DIR"),
         "nsight_compute": "not used: normal-user performance counter access is unavailable",
         "selection_ks": _csv(args.selection_ks, int),
+        "baseline_variant": args.baseline_variant,
         "thresholds": {
             "fp32": {"rtol": 5e-5, "atol": 5e-7},
             "fp16": {"rtol": 2e-3, "atol": 2e-3},
@@ -974,6 +1017,7 @@ def _report(run_info, aggregate):
 def parse_args():
     parser = argparse.ArgumentParser(description="Reproducible prefill score Triton benchmark")
     parser.add_argument("--variants", default="three_pass_current,three_pass_host_bounds")
+    parser.add_argument("--baseline-variant", default="three_pass_current")
     parser.add_argument("--stages", default="combined")
     parser.add_argument("--head-shapes", default="qwen3_8b:32:8:128,qwen25_7b:28:4:128")
     parser.add_argument("--batch-sizes", default="1,8")
@@ -1003,6 +1047,8 @@ def main():
     if not args.profile_only and (args.warmup < 25 or args.rounds < 5 or args.iterations < 100):
         raise ValueError("formal timing requires warmup>=25, rounds>=5, and iterations>=100")
     manifest = build_manifest(args)
+    if args.baseline_variant not in _csv(args.variants):
+        raise ValueError("baseline variant must be included in --variants")
     manifest_rows = [asdict(case) for case in manifest]
     manifest_hash = _json_hash(manifest_rows)
     run_id = args.run_id or datetime.now().strftime("%Y%m%d-%H%M%S") + "-" + manifest_hash[:8]
@@ -1020,10 +1066,16 @@ def main():
             flush=True,
         )
         results.append(
-            run_case(case, writer, selection_ks=selection_ks, profile_only=args.profile_only)
+            run_case(
+                case,
+                writer,
+                selection_ks=selection_ks,
+                baseline_variant=args.baseline_variant,
+                profile_only=args.profile_only,
+            )
         )
         torch.cuda.empty_cache()
-    aggregate = aggregate_results(results)
+    aggregate = aggregate_results(results, baseline_variant=args.baseline_variant)
     writer.write_json("aggregate_metrics.json", aggregate)
     (run_dir / "report.md").write_text(_report(run_info, aggregate), encoding="utf-8")
     print(f"artifacts={run_dir}")
