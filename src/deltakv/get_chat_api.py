@@ -304,6 +304,7 @@ def get_generate_api(model_path: str, infer_config: dict, deltakv_checkpoint_pat
             
             sampling_params = SamplingParams(temperature=temperature, top_p=top_p, max_tokens=max_tokens)
             outputs = llm.generate(prompts, sampling_params, use_tqdm=False)
+            generate._sparsevllm_last_outputs = outputs
             
             results = [out['text'] for out in outputs]
             if return_kv_cache:
@@ -312,6 +313,7 @@ def get_generate_api(model_path: str, infer_config: dict, deltakv_checkpoint_pat
 
         generate._sparsevllm_llm = llm
         generate._sparsevllm_infer_config = dict(public_infer_config)
+        generate._sparsevllm_last_outputs = []
         
         if return_model:
             raise ValueError('sparse vllm 不支持 return_model=True')

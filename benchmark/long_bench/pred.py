@@ -409,6 +409,14 @@ def get_pred(rank, data, dataset_info, args, model, tokenizer, model_max_length)
         if hasattr(tokenizer, 'eot_token_id'):
             eos_token_id.append(tokenizer.eot_token_id)
 
+        sparse_llm = getattr(model, "_sparsevllm_llm", None)
+        sparse_controller = getattr(
+            getattr(sparse_llm, "model_runner", None),
+            "sparse_controller",
+            None,
+        )
+        trace_buffer = getattr(sparse_controller, "prefill_selection_trace", None)
+        trace_start = len(trace_buffer) if trace_buffer is not None else 0
         try:
             preds = model(
                 prompts,
@@ -436,6 +444,20 @@ def get_pred(rank, data, dataset_info, args, model, tokenizer, model_max_length)
                 failures.append(failed)
             break
 
+        if trace_buffer is not None:
+            trace_path = os.path.join(out_root, "selection_trace", f"trace-rank{rank}.jsonl")
+            source_indices = [int(record["source_idx"]) for record in prepared_records]
+            for trace in trace_buffer[trace_start:]:
+                trace_record = dict(trace)
+                trace_record.update(
+                    {
+                        "dataset": dataset,
+                        "rank": int(rank),
+                        "batch_source_indices": source_indices,
+                    }
+                )
+                _append_jsonl(trace_path, trace_record)
+
         if isinstance(preds, str): preds = [preds]
         if len(preds) != len(prepared_records):
             error = (
@@ -456,7 +478,14 @@ def get_pred(rank, data, dataset_info, args, model, tokenizer, model_max_length)
                 failures.append(failed)
             break
 
-        for record, pred in zip(prepared_records, preds):
+        sparse_outputs = getattr(model, "_sparsevllm_last_outputs", [])
+        if sparse_outputs and len(sparse_outputs) != len(prepared_records):
+            raise RuntimeError(
+                f"Sparse-vLLM returned {len(sparse_outputs)} token outputs for "
+                f"{len(prepared_records)} LongBench records in dataset={dataset}."
+            )
+
+        for output_idx, (record, pred) in enumerate(zip(prepared_records, preds)):
             raw_pred = pred
             try:
                 if not isinstance(raw_pred, str):
@@ -483,6 +512,11 @@ def get_pred(rank, data, dataset_info, args, model, tokenizer, model_max_length)
                     "status": "success",
                     "pred": parsed_pred,
                     "raw_pred": raw_pred,
+                    "generated_token_ids": (
+                        [int(token_id) for token_id in sparse_outputs[output_idx]["token_ids"]]
+                        if sparse_outputs
+                        else None
+                    ),
                 }
             )
             _write_sample_record(out_root=out_root, task_out_path=out_path, record=ok)
@@ -501,6 +535,10 @@ def get_pred(rank, data, dataset_info, args, model, tokenizer, model_max_length)
 def worker(rank, world_size, datasets, dataset2prompt, dataset2maxlen, args, out_root, max_length_limit):
     seed_everything(42)
     model, tokenizer, model_max_length = load_model_and_tokenizer(rank, args)
+    trace_path = os.path.join(out_root, "selection_trace", f"trace-rank{rank}.jsonl")
+    if os.getenv("SPARSEVLLM_PREFILL_SELECTION_TRACE"):
+        Path(trace_path).parent.mkdir(parents=True, exist_ok=True)
+        Path(trace_path).write_text("", encoding="utf-8")
     
     for dataset in datasets:
         data_path = get_longbench_data_path(dataset, args.e)

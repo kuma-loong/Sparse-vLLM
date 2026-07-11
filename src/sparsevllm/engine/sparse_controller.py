@@ -1,5 +1,7 @@
-from dataclasses import dataclass
+import hashlib
 import os
+from dataclasses import dataclass
+
 import torch
 import torch.nn.functional as F
 from sparsevllm.config import Config
@@ -65,6 +67,11 @@ class SparseController:
             "SPARSEVLLM_DELTAKV_DETERMINISTIC_TOPK_TIEBREAK",
             False,
         )
+        self.prefill_selection_trace_enabled = _env_bool(
+            "SPARSEVLLM_PREFILL_SELECTION_TRACE",
+            False,
+        )
+        self.prefill_selection_trace: list[dict] = []
         
         self.config = config
         self.cache_manager = cache_manager
@@ -112,6 +119,84 @@ class SparseController:
         }
 
         self.layers = None
+
+    @torch.no_grad()
+    def _record_prefill_selection_trace(
+        self,
+        *,
+        layer_idx: int,
+        seq: Sequence,
+        kv_len: int,
+        budget: int,
+        scores: torch.Tensor,
+        keep_indices: torch.Tensor,
+        source_slots: torch.Tensor | None,
+        cache_slots: torch.Tensor,
+        pool_kernel_size: int,
+    ) -> None:
+        if not self.prefill_selection_trace_enabled:
+            return
+
+        valid_scores = scores[:kv_len].detach().contiguous()
+        score_bytes = valid_scores.view(torch.uint8).cpu().numpy().tobytes()
+        scores_fp32 = valid_scores.float().cpu()
+        keep_cpu = keep_indices.detach().to(dtype=torch.long, device="cpu")
+        cache_order = torch.sort(keep_cpu).values
+        cache_slots_cpu = cache_slots.detach().to(dtype=torch.long, device="cpu")
+
+        recent_start = max(int(self.num_sink), int(kv_len) - int(self.num_recent))
+        middle_scores = valid_scores[int(self.num_sink) : recent_start].float()
+        pool_kernel_size = int(pool_kernel_size)
+        if pool_kernel_size > 1 and middle_scores.numel() > 0:
+            middle_scores = F.max_pool1d(
+                middle_scores[None, None, :],
+                kernel_size=pool_kernel_size,
+                padding=pool_kernel_size // 2,
+                stride=1,
+            ).squeeze(0).squeeze(0)
+        num_topk = max(0, int(budget) - int(self.num_sink) - int(self.num_recent))
+        cutoff_margin = None
+        if 0 < num_topk < int(middle_scores.numel()):
+            cutoff = middle_scores.topk(num_topk + 1, sorted=True).values
+            cutoff_margin = float((cutoff[num_topk - 1] - cutoff[num_topk]).item())
+
+        selected_slots = None
+        source_slots_sha256 = None
+        if source_slots is not None:
+            source_slots_cpu = source_slots.detach().to(dtype=torch.long, device="cpu")
+            selected_slots = source_slots_cpu[keep_cpu].tolist()
+            source_slots_sha256 = hashlib.sha256(
+                source_slots_cpu.contiguous().view(torch.uint8).numpy().tobytes()
+            ).hexdigest()
+
+        self.prefill_selection_trace.append(
+            {
+                "method": str(self.sparse_method),
+                "layer_idx": int(layer_idx),
+                "seq_id": int(seq.seq_id),
+                "prefill_step_start": int(seq.num_prefilled_tokens),
+                "prefill_step_tokens": int(seq.current_chunk_size),
+                "kv_len": int(kv_len),
+                "budget": int(budget),
+                "score_dtype": str(valid_scores.dtype),
+                "score_numel": int(valid_scores.numel()),
+                "score_sha256": hashlib.sha256(score_bytes).hexdigest(),
+                "score_min": float(scores_fp32.min().item()),
+                "score_max": float(scores_fp32.max().item()),
+                "score_sum": float(scores_fp32.sum(dtype=torch.float64).item()),
+                "score_finite": bool(torch.isfinite(scores_fp32).all().item()),
+                "pool_kernel_size": pool_kernel_size,
+                "cutoff_margin": cutoff_margin,
+                "selected_token_indices": keep_cpu.tolist(),
+                "cache_order_token_indices": cache_order.tolist(),
+                "selected_source_slots": selected_slots,
+                "source_slots_sha256": source_slots_sha256,
+                "cache_slots": cache_slots_cpu.tolist(),
+                "cache_slots_sha256": hashlib.sha256(
+                    cache_slots_cpu.contiguous().view(torch.uint8).numpy().tobytes()
+                ).hexdigest(),
+            }
+        )
 
     def set_tokenizer_metadata(
         self,
@@ -327,6 +412,7 @@ class SparseController:
                     return
                 raise RuntimeError("PyramidKV full-prefill staging should only run on the final prefill chunk.")
             seq_keep_indices = []
+            trace_rows = []
             for seq in seqs:
                 kv_len = int(seq.num_prefilled_tokens) + int(seq.current_chunk_size)
                 if budget is None or kv_len <= budget:
@@ -347,7 +433,26 @@ class SparseController:
                         pool_kernel_size=int(getattr(self.config, "pool_kernel_size", 1) or 1),
                     )
                 seq_keep_indices.append((seq, keep_indices))
+                if self.prefill_selection_trace_enabled and budget is not None and kv_len > budget:
+                    trace_rows.append((seq, kv_len, attn_scores[:kv_len], keep_indices))
             self.cache_manager.materialize_prefill_staging_layer_batch(layer_idx, seq_keep_indices)
+            for seq, kv_len, attn_scores, keep_indices in trace_rows:
+                row_idx = self.cache_manager.seq_id_to_row[layer_idx][int(seq.seq_id)]
+                cache_len = int(self.cache_manager.row_seq_lens[layer_idx][row_idx])
+                cache_slots = self.cache_manager.buffer_req_to_token_slots[layer_idx][
+                    row_idx, :cache_len
+                ]
+                self._record_prefill_selection_trace(
+                    layer_idx=layer_idx,
+                    seq=seq,
+                    kv_len=kv_len,
+                    budget=int(budget),
+                    scores=attn_scores,
+                    keep_indices=keep_indices,
+                    source_slots=None,
+                    cache_slots=cache_slots,
+                    pool_kernel_size=int(getattr(self.config, "pool_kernel_size", 1) or 1),
+                )
 
     @torch.no_grad()
     def post_forward(self, seqs: list[Sequence], is_prefill: bool):
@@ -593,7 +698,30 @@ class SparseController:
                     budget,
                     pool_kernel_size=int(getattr(self.config, "pool_kernel_size", 1) or 1),
                 )
+                source_slots = None
+                if self.prefill_selection_trace_enabled:
+                    row_idx = self.cache_manager.seq_id_to_row[layer_idx][int(seq.seq_id)]
+                    source_slots = self.cache_manager.buffer_req_to_token_slots[layer_idx][
+                        row_idx, :kv_len
+                    ].clone()
                 self.cache_manager.free_part_slots(layer_idx, seq, keep_indices)
+                if self.prefill_selection_trace_enabled:
+                    row_idx = self.cache_manager.seq_id_to_row[layer_idx][int(seq.seq_id)]
+                    cache_len = int(self.cache_manager.row_seq_lens[layer_idx][row_idx])
+                    cache_slots = self.cache_manager.buffer_req_to_token_slots[layer_idx][
+                        row_idx, :cache_len
+                    ]
+                    self._record_prefill_selection_trace(
+                        layer_idx=layer_idx,
+                        seq=seq,
+                        kv_len=kv_len,
+                        budget=int(budget),
+                        scores=seq_scores,
+                        keep_indices=keep_indices,
+                        source_slots=source_slots,
+                        cache_slots=cache_slots,
+                        pool_kernel_size=int(getattr(self.config, "pool_kernel_size", 1) or 1),
+                    )
 
     @torch.no_grad()
     def _snapkv_decode_eviction(self, seqs: list[Sequence]):

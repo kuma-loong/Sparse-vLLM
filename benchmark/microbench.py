@@ -150,6 +150,7 @@ def _selected_env_snapshot() -> dict[str, str]:
         "SPARSEVLLM_LONG_PREFILL_OFFLOAD_MIN_TOKENS",
         "SPARSEVLLM_RAWKV_BUFFER_MODE",
         "SPARSEVLLM_RAWKV_PREFETCH",
+        "SPARSEVLLM_PREFILL_SELECTION_TRACE",
     ]
     return {key: os.environ[key] for key in keys if key in os.environ}
 
@@ -264,6 +265,45 @@ def _write_output_dir(args, rows: list[dict[str, Any]]) -> None:
     _write_jsonl_rows(output_dir / "performance.jsonl", records)
     _write_jsonl_rows(output_dir / "per_sample_results.jsonl", records)
     _write_json(output_dir / "aggregate_metrics.json", aggregate)
+    selection_trace = []
+    quality_rows = []
+    for record in records:
+        for trace in record.get("selection_trace", []):
+            selection_trace.append(
+                {
+                    "case_id": int(record["case_id"]),
+                    "benchmark_method": record.get("method"),
+                    **trace,
+                }
+            )
+        if record.get("generated_outputs"):
+            quality_rows.append(
+                {
+                    "case_id": int(record["case_id"]),
+                    "status": record["status"],
+                    "method": record.get("method"),
+                    "prompt_tokens": record.get("prompt_tokens"),
+                    "batch_size": record.get("batch_size"),
+                    "generated_outputs": record["generated_outputs"],
+                    "selection_trace_count": len(record.get("selection_trace", [])),
+                }
+            )
+    if selection_trace:
+        _write_jsonl_rows(output_dir / "selection_trace" / "trace.jsonl", selection_trace)
+    if quality_rows:
+        _write_jsonl_rows(output_dir / "quality" / "per_sample.jsonl", quality_rows)
+        _write_json(
+            output_dir / "quality" / "aggregate_metrics.json",
+            {
+                "status": "success"
+                if all(row["status"] == "success" for row in quality_rows)
+                else "model_failed",
+                "sample_count": len(quality_rows),
+                "selection_trace_count": sum(
+                    int(row["selection_trace_count"]) for row in quality_rows
+                ),
+            },
+        )
     (output_dir / "report.md").write_text("\n".join(report_lines) + "\n", encoding="utf-8")
 
 
@@ -458,6 +498,13 @@ def benchmark_task(method, length, bs, args, results_dict):
         llm = LLM(args.model_path, **engine_kwargs)
         resolved_engine_config = _resolved_engine_config(llm)
         prefix_cache_stats_before = _cache_stats(llm)
+        trace_buffer = getattr(
+            getattr(getattr(llm, "model_runner", None), "sparse_controller", None),
+            "prefill_selection_trace",
+            None,
+        )
+        if trace_buffer is not None:
+            trace_buffer.clear()
 
         prompt_token_ids = [[100] * length for _ in range(bs)]
         sampling_params = [
@@ -658,6 +705,12 @@ def benchmark_task(method, length, bs, args, results_dict):
             )
         steady_ttft_s = [sample["ttft_s"] for sample in steady_state_samples]
         steady_prefill_tok_s = [sample["prefill_tok_s"] for sample in steady_state_samples]
+        trace_buffer = getattr(
+            getattr(getattr(llm, "model_runner", None), "sparse_controller", None),
+            "prefill_selection_trace",
+            [],
+        )
+        selection_trace = [dict(row) for row in trace_buffer]
         
         stage_mode = (
             f" | AdmissionWave: {admission_wave_size}"
@@ -706,6 +759,7 @@ def benchmark_task(method, length, bs, args, results_dict):
             },
             "memory_accounting": memory_accounting,
             "generated_outputs": generated_outputs,
+            "selection_trace": selection_trace,
             "profiler_stats": profiler_stats,
             "steady_state_repeats": len(steady_state_samples),
             "steady_state_samples": steady_state_samples,
