@@ -6,6 +6,34 @@ import torch
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
 
+MANDATORY_CONTEXT_LENGTHS = [
+    1,
+    15,
+    16,
+    17,
+    63,
+    64,
+    65,
+    127,
+    128,
+    129,
+    511,
+    512,
+    513,
+    997,
+    2535,
+    4093,
+    4096,
+    6872,
+    15437,
+    32749,
+    65521,
+    65536,
+    79439,
+    131071,
+    262143,
+]
+
 
 def _score_tolerance(dtype):
     return {
@@ -384,6 +412,40 @@ def test_host_bounds_is_bitwise_and_selection_equivalent_at_long_lengths(model_s
             torch.topk(baseline_scores, k, sorted=True).indices,
             torch.topk(combined["attn_score"][0, 64:candidate_end], k, sorted=True).indices,
         )
+
+
+@pytest.mark.parametrize("length", MANDATORY_CONTEXT_LENGTHS)
+def test_context_length_manifest_current_and_production(length):
+    window = min(15, length)
+    kwargs = dict(
+        context_lens=[length],
+        windows=[window],
+        num_heads=4,
+        num_kv_heads=2,
+        head_dim=16,
+        q_dtype=torch.bfloat16,
+        score_dtype=torch.float32,
+        candidate_start=0,
+        num_recent_tokens=0,
+        slot_case="ordered",
+    )
+    baseline = _make_case(**kwargs)
+    production = _make_case(**kwargs)
+
+    _run(baseline, variant_id="three_pass_current")
+    _run(production, variant_id="three_pass_host_bounds_bh2")
+    torch.cuda.synchronize()
+
+    assert torch.equal(baseline["attn_score"], production["attn_score"])
+    assert torch.isfinite(production["attn_score"]).all()
+    for requested_k in (1, 32, 128, 1024):
+        k = min(requested_k, length)
+        assert torch.equal(
+            torch.topk(baseline["attn_score"][0], k, sorted=True).indices,
+            torch.topk(production["attn_score"][0], k, sorted=True).indices,
+        )
+    if length <= 4096:
+        _assert_oracle_and_guards(production)
 
 
 def test_candidate_empty_and_single_token_ranges_preserve_guards():
