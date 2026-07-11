@@ -13,7 +13,7 @@ import subprocess
 import sys
 import time
 import traceback
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -423,10 +423,19 @@ def _triton_metadata_snapshot():
 
 
 def _kernel_resource_key(case, kernel_name):
+    if kernel_name == "_prefill_score_reduce_stats_kernel":
+        return (
+            kernel_name,
+            case.candidate_blocks,
+            case.block_rows,
+            case.reduce_blocks,
+            case.reduce_rows,
+            case.reduce_warps,
+            case.reduce_stages,
+        )
     return (
         kernel_name,
         case.dtype,
-        case.score_dtype,
         case.Hq,
         case.Hkv,
         case.head_dim,
@@ -444,6 +453,49 @@ def _kernel_resource_key(case, kernel_name):
         case.reduce_warps,
         case.reduce_stages,
         case.candidate_blocks,
+    )
+
+
+def _case_with_variant_config(case, variant_id):
+    max_candidate_end = max(
+        max(case.candidate_start, length - case.num_recent_tokens)
+        for length in case.context_lens
+    )
+    initial_blocks = triton.cdiv(
+        max_candidate_end,
+        64 if case.head_dim >= 128 else 128,
+    )
+    config = get_prefill_score_variant_config(
+        variant_id,
+        head_dim=case.head_dim,
+        max_score_len=max(case.score_windows),
+        kv_group_num=case.gqa_ratio,
+        candidate_blocks=initial_blocks,
+    )
+    candidate_blocks = triton.cdiv(max_candidate_end, int(config["block_n"]))
+    config = get_prefill_score_variant_config(
+        variant_id,
+        head_dim=case.head_dim,
+        max_score_len=max(case.score_windows),
+        kv_group_num=case.gqa_ratio,
+        candidate_blocks=candidate_blocks,
+    )
+    head_blocks = triton.cdiv(case.gqa_ratio, int(config["block_h"]))
+    return replace(
+        case,
+        variant_id=variant_id,
+        block_m=int(config["block_m"]),
+        block_n=int(config["block_n"]),
+        block_h=int(config["block_h"]),
+        block_rows=int(config["block_rows"]),
+        dot_warps=int(config["dot_warps"]),
+        dot_stages=int(config["dot_stages"]),
+        reduce_blocks=int(config["reduce_blocks"]),
+        reduce_rows=int(config["reduce_rows"]),
+        reduce_warps=int(config["reduce_warps"]),
+        reduce_stages=int(config["reduce_stages"]),
+        candidate_blocks=int(candidate_blocks),
+        group_count=int(case.B * case.Hkv * head_blocks),
     )
 
 
@@ -605,8 +657,13 @@ def run_case(case, writer, *, selection_ks, profile_only=False):
             baseline_tensors = dict(tensors)
             baseline_tensors["attn_score_storage"] = torch.full_like(tensors["attn_score_storage"], -7.0)
             baseline_tensors["attn_score"] = baseline_tensors["attn_score_storage"][:, : case.max_context_len]
+            baseline_metadata_before = _triton_metadata_snapshot()
             _launch(case, baseline_tensors, stage="combined", variant_id="three_pass_current")
             torch.cuda.synchronize()
+            _compiled_resource_metadata(
+                _case_with_variant_config(case, "three_pass_current"),
+                baseline_metadata_before,
+            )
             baseline_output = baseline_tensors["attn_score"].clone()
             max_abs_diff = float((candidate_output.float() - baseline_output.float()).abs().max().item())
             mismatches = _selection_diagnostics(case, candidate_output, baseline_output, selection_ks)
