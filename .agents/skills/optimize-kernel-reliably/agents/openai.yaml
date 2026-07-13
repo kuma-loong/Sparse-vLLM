@@ -1,0 +1,4 @@
+interface:
+  display_name: "Reliable Kernel Optimizer"
+  short_description: "Plan, execute, and verify reliable kernel optimization"
+  default_prompt: "Use $optimize-kernel-reliably to optimize this GPU kernel with reproducible correctness and performance evidence."
