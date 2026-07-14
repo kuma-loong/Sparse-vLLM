@@ -12,6 +12,7 @@ def _omnikv_build_keep_and_slots_kernel(
     recent_lens_ptr,
     buffer_req_to_token_slots_ptr,
     req_indices_ptr,
+    new_context_lens_ptr,
     keep_indices_ptr,
     active_slots_ptr,
     stride_topk_b,
@@ -39,6 +40,7 @@ def _omnikv_build_keep_and_slots_kernel(
     hist_len = tl.maximum(hist_len, 0).to(tl.int32)
     recent_len = tl.maximum(recent_len, 0).to(tl.int32)
     new_context_len = num_sink + k_b + recent_len
+    tl.store(new_context_lens_ptr + pid_b, new_context_len, mask=pid_blk == 0)
 
     mask_sink = offs < num_sink
     mask_topk = (offs >= num_sink) & (offs < num_sink + k_b)
@@ -102,13 +104,17 @@ def build_omnikv_keep_and_slots(
         assert topk_lens.shape == (batch_size,)
         assert int(topk_lens.min().item()) >= 0
         assert int(topk_lens.max().item()) <= k_max
-    new_context_lens = num_sink + topk_lens + recent_chunk_lens
     if max_s is None:
+        new_context_lens = num_sink + topk_lens + recent_chunk_lens
         max_s = int(new_context_lens.max().item())
     else:
         max_s = int(max_s)
         if max_s < 0:
             raise ValueError(f"max_s must be >= 0, got {max_s}.")
+        if max_s == 0:
+            new_context_lens = num_sink + topk_lens + recent_chunk_lens
+        else:
+            new_context_lens = torch.empty_like(topk_lens)
 
     keep_indices = torch.empty((batch_size, max_s), dtype=torch.int32, device=topk_indices.device)
     active_slots = torch.empty((batch_size, max_s), dtype=torch.int32, device=topk_indices.device)
@@ -122,6 +128,7 @@ def build_omnikv_keep_and_slots(
         recent_chunk_lens,
         buffer_req_to_token_slots,
         req_indices,
+        new_context_lens,
         keep_indices,
         active_slots,
         topk_indices.stride(0),
