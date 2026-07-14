@@ -6,6 +6,7 @@ from time import perf_counter
 import threading
 from tqdm.auto import tqdm
 from transformers import AutoTokenizer, GenerationConfig, Qwen2Tokenizer
+import torch
 import torch.multiprocessing as mp
 from sparsevllm.utils.log import logger
 import sys
@@ -345,33 +346,7 @@ class LLMEngine:
         logger.info("Warmup finished.")
 
     def _after_warmup_debug_cleanup(self):
-        model_runner = getattr(self, "model_runner", None)
-        runtime_state = getattr(model_runner, "runtime_state", None)
-        reset_after_warmup = getattr(runtime_state, "reset_after_warmup", None)
-        if callable(reset_after_warmup):
-            reset_after_warmup()
-        else:
-            cache_manager = getattr(model_runner, "cache_manager", None)
-            reset_cache = getattr(cache_manager, "reset_after_warmup", None)
-            if callable(reset_cache):
-                reset_cache()
-            else:
-                reset_prefix_cache = getattr(cache_manager, "reset_prefix_cache", None)
-                if callable(reset_prefix_cache):
-                    reset_prefix_cache()
-
-        runner = getattr(model_runner, "decode_cuda_graph_runner", None)
-        if runner is not None and os.getenv("SPARSEVLLM_DELTAKV_CLEAR_GRAPHS_AFTER_WARMUP", "0") == "1":
-            runner.clear_captured_graphs()
-            logger.info("Cleared decode CUDA graphs after warmup.")
-
-        sparse_controller = getattr(model_runner, "sparse_controller", None)
-        if (
-            sparse_controller is not None
-            and os.getenv("SPARSEVLLM_DELTAKV_CLEAR_ATTN_SCORE_BUFFERS_AFTER_WARMUP", "0") == "1"
-        ):
-            sparse_controller.clear_decode_attn_score_buffers()
-            logger.info("Cleared decode attention score buffers after warmup.")
+        self.model_runner.call("reset_after_warmup")
 
     @staticmethod
     def _cleanup_model_runner_shared_memory(model_runner):
@@ -524,6 +499,38 @@ class LLMEngine:
             [int(token_id) for token_id in token_ids],
             int(priority),
         )
+
+    def debug_sparse_state_summaries(self) -> list[dict[str, object]]:
+        summaries = self.model_runner.call("debug_sparse_state_summaries")
+        if not isinstance(summaries, list) or len(summaries) != self.config.world_size:
+            raise RuntimeError(
+                "Sparse-state summary did not return one record per world rank: "
+                f"expected={self.config.world_size}, got={summaries!r}."
+            )
+        return summaries
+
+    def debug_last_logits(self) -> torch.Tensor:
+        logits = self.model_runner.call("debug_last_logits_cpu")
+        if not isinstance(logits, torch.Tensor):
+            raise RuntimeError(f"Rank 0 did not return debug logits: {logits!r}.")
+        return logits
+
+    def debug_hidden_states(self) -> dict[int, torch.Tensor]:
+        snapshots = self.model_runner.call("debug_hidden_states_cpu")
+        if not isinstance(snapshots, dict) or not all(
+            isinstance(layer_idx, int) and isinstance(tensor, torch.Tensor)
+            for layer_idx, tensor in snapshots.items()
+        ):
+            raise RuntimeError(
+                f"Rank 0 did not return hidden-state snapshots: {snapshots!r}."
+            )
+        return snapshots
+
+    def debug_moe_states(self) -> dict[int, dict[str, torch.Tensor]]:
+        snapshots = self.model_runner.call("debug_moe_states_cpu")
+        if not isinstance(snapshots, dict):
+            raise RuntimeError(f"Rank 0 did not return MoE snapshots: {snapshots!r}.")
+        return snapshots
 
     def worker_info(
         self,

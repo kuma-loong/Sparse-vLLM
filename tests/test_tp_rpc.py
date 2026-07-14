@@ -130,6 +130,40 @@ def test_run_rpc_reports_any_tp_worker_failure():
             raise AssertionError("expected worker failure to be surfaced on rank 0")
 
 
+def test_warmup_reset_uses_failure_synchronized_world_rpc():
+    assert "reset_after_warmup" in TP_RPC_STATUS_SYNC_METHODS
+
+
+def test_hidden_state_debug_uses_failure_synchronized_world_rpc():
+    assert "debug_hidden_states_cpu" in TP_RPC_STATUS_SYNC_METHODS
+    assert "debug_moe_states_cpu" in TP_RPC_STATUS_SYNC_METHODS
+
+
+def test_model_runner_reset_after_warmup_resets_local_runtime_state():
+    calls = []
+    runner = object.__new__(ModelRunner)
+    runner.runtime_state = SimpleNamespace(
+        reset_after_warmup=lambda: calls.append("runtime")
+    )
+    runner.decode_cuda_graph_runner = SimpleNamespace(
+        clear_captured_graphs=lambda: calls.append("graphs")
+    )
+    runner.sparse_controller = SimpleNamespace(
+        clear_decode_attn_score_buffers=lambda: calls.append("scores")
+    )
+
+    with patch.dict(
+        os.environ,
+        {
+            "SPARSEVLLM_DELTAKV_CLEAR_GRAPHS_AFTER_WARMUP": "0",
+            "SPARSEVLLM_DELTAKV_CLEAR_ATTN_SCORE_BUFFERS_AFTER_WARMUP": "0",
+        },
+    ):
+        ModelRunner.reset_after_warmup(runner)
+
+    assert calls == ["runtime"]
+
+
 def test_tp_worker_decode_skips_rank0_sampling_path():
     calls: list[str] = []
 

@@ -1,8 +1,9 @@
 from __future__ import annotations
 
 import os
+import hashlib
 from collections import deque
-from dataclasses import dataclass
+from dataclasses import dataclass, fields, is_dataclass
 from abc import ABC, abstractmethod
 from typing import Any
 
@@ -16,6 +17,49 @@ from sparsevllm.method_registry import SUPPORTED_SPARSE_METHODS, normalize_spars
 from sparsevllm.triton_kernel.store_kvcache import store_kvcache
 import sparsevllm.platforms as platforms
 from sparsevllm.utils.log import logger, log_level
+
+
+def _debug_tensor_summary(tensor: torch.Tensor) -> dict[str, Any]:
+    detached = tensor.detach().contiguous().cpu()
+    raw = detached.reshape(-1).view(torch.uint8).numpy().tobytes()
+    summary = {
+        "shape": list(detached.shape),
+        "dtype": str(detached.dtype),
+        "numel": int(detached.numel()),
+        "sha256": hashlib.sha256(raw).hexdigest(),
+    }
+    if detached.numel() > 0 and not detached.is_complex():
+        numeric = detached.to(torch.float64)
+        summary.update(
+            {
+                "min": float(numeric.min().item()),
+                "max": float(numeric.max().item()),
+                "sum": float(numeric.sum().item()),
+            }
+        )
+    return summary
+
+
+def _debug_value_summary(value: Any) -> Any:
+    if isinstance(value, torch.Tensor):
+        return _debug_tensor_summary(value)
+    if is_dataclass(value):
+        return {
+            field.name: _debug_value_summary(getattr(value, field.name))
+            for field in fields(value)
+        }
+    if isinstance(value, dict):
+        return {
+            str(key): _debug_value_summary(item)
+            for key, item in sorted(value.items(), key=lambda pair: str(pair[0]))
+        }
+    if isinstance(value, (list, tuple)):
+        return [_debug_value_summary(item) for item in value]
+    if isinstance(value, (str, int, float, bool)) or value is None:
+        return value
+    if hasattr(value, "tolist"):
+        return _debug_value_summary(value.tolist())
+    return repr(value)
 
 
 @dataclass
@@ -1010,6 +1054,83 @@ class CacheManager(ABC):
     def free_slot_stats(self) -> dict[str, int]:
         """Return a small set of free-slot stats for logging/debugging."""
         return {"free_slots": int(self.num_free_slots)}
+
+    def debug_state_summary(self) -> dict[str, Any]:
+        """Return a synchronized-test snapshot without touching the inference hot path."""
+        live_rows = {}
+        seq_id_to_row = getattr(self, "seq_id_to_row", {})
+        mappings = (
+            [(layer_idx, mapping) for layer_idx, mapping in enumerate(seq_id_to_row)]
+            if isinstance(seq_id_to_row, list)
+            else [(None, seq_id_to_row)]
+        )
+        for layer_idx, mapping in mappings:
+            if not isinstance(mapping, dict) or not mapping:
+                continue
+            row_seq_lens = getattr(self, "row_seq_lens")
+            token_slots = getattr(self, "buffer_req_to_token_slots")
+            if layer_idx is not None:
+                row_seq_lens = row_seq_lens[layer_idx]
+                token_slots = token_slots[layer_idx]
+            records = []
+            for seq_id, row_idx in sorted(mapping.items()):
+                row_len = int(row_seq_lens[row_idx])
+                record = {
+                    "seq_id": int(seq_id),
+                    "row_idx": int(row_idx),
+                    "row_len": row_len,
+                    "token_slots": _debug_tensor_summary(
+                        token_slots[row_idx, :row_len]
+                    ),
+                }
+                page_slots = getattr(self, "buffer_req_to_page_slots", None)
+                if layer_idx is None and page_slots is not None:
+                    page_size = int(getattr(self, "page_size"))
+                    num_pages = (row_len + page_size - 1) // page_size
+                    record["page_slots"] = _debug_tensor_summary(
+                        page_slots[row_idx, :num_pages]
+                    )
+                records.append(record)
+            live_rows["shared" if layer_idx is None else str(layer_idx)] = records
+
+        prefix_state: dict[str, Any] | None = None
+        prefix_cache = getattr(self, "prefix_cache", None)
+        if prefix_cache is not None:
+            blocks = []
+            for block_id, block in sorted(prefix_cache.blocks.items()):
+                blocks.append(
+                    {
+                        "stable_block_id": block_id.hex(),
+                        "parent_block_id": (
+                            None
+                            if block.parent_block_id is None
+                            else block.parent_block_id.hex()
+                        ),
+                        "logical_block_idx": int(block.logical_block_idx),
+                        "token_ids": [int(token_id) for token_id in block.token_ids],
+                        "ref_count": int(block.ref_count),
+                        "last_access": int(block.last_access),
+                        "eviction_priority": int(block.eviction_priority),
+                        "payload": _debug_value_summary(block.payload),
+                    }
+                )
+            prefix_state = {
+                "fingerprint": prefix_cache.fingerprint.hex(),
+                "stats": {
+                    str(key): int(value)
+                    for key, value in prefix_cache.stats().items()
+                },
+                "blocks": blocks,
+            }
+
+        return {
+            "cache_manager_class": type(self).__name__,
+            "free_slot_stats": {
+                str(key): int(value) for key, value in self.free_slot_stats().items()
+            },
+            "live_rows": live_rows,
+            "prefix_cache": prefix_state,
+        }
 
     def _cache_slot_dtype_size(self) -> int:
         dtype = getattr(self.hf_config, "torch_dtype", torch.float16)

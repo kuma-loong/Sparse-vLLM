@@ -22,6 +22,7 @@ from sparsevllm.utils.context import set_context, get_context, reset_context
 from sparsevllm.utils.loader import load_model, sync_deltakv_config_from_checkpoint
 
 from sparsevllm.engine.cache_manager import CacheManager
+from sparsevllm.engine.cache_manager.base import _debug_tensor_summary
 from sparsevllm.engine.decode_cuda_graph import DecodeCudaGraphRunner
 from sparsevllm.engine.prefix_cache_coordinator import PrefixCacheCoordinator
 from sparsevllm.engine.recurrent_state_manager import RecurrentStateManager, RecurrentStateSpec
@@ -56,7 +57,12 @@ PREFIX_CACHE_CONTROL_RPC_METHODS = {
     "prefix_cache_delete_subtree",
     "prefix_cache_set_eviction_priority",
 }
-TP_RPC_STATUS_SYNC_METHODS = PREFIX_CACHE_CONTROL_RPC_METHODS | {"run"}
+TP_RPC_STATUS_SYNC_METHODS = PREFIX_CACHE_CONTROL_RPC_METHODS | {
+    "debug_hidden_states_cpu",
+    "debug_moe_states_cpu",
+    "reset_after_warmup",
+    "run",
+}
 
 
 def make_tp_shm_name() -> str:
@@ -369,6 +375,24 @@ class ModelRunner:
 
         load_deltakv_compressors_to_cache_manager(self.cache_manager, self.config.deltakv_path)
 
+    def reset_after_warmup(self) -> None:
+        reset_after_warmup = getattr(self.runtime_state, "reset_after_warmup", None)
+        if callable(reset_after_warmup):
+            reset_after_warmup()
+        else:
+            reset_cache = getattr(self.cache_manager, "reset_after_warmup", None)
+            if callable(reset_cache):
+                reset_cache()
+            else:
+                reset_prefix_cache = getattr(self.cache_manager, "reset_prefix_cache", None)
+                if callable(reset_prefix_cache):
+                    reset_prefix_cache()
+
+        if os.getenv("SPARSEVLLM_DELTAKV_CLEAR_GRAPHS_AFTER_WARMUP", "0") == "1":
+            self.decode_cuda_graph_runner.clear_captured_graphs()
+        if os.getenv("SPARSEVLLM_DELTAKV_CLEAR_ATTN_SCORE_BUFFERS_AFTER_WARMUP", "0") == "1":
+            self.sparse_controller.clear_decode_attn_score_buffers()
+
     def free_slots(self, seq_id: int):
         """通知 CacheManager 释放该序列占用的物理显存位子"""
         with profiler.record("model_free_slots"):
@@ -440,6 +464,200 @@ class ModelRunner:
             [int(token_id) for token_id in token_ids],
             priority=int(priority),
         )
+
+    def debug_sparse_state_summary(self) -> dict[str, object]:
+        moe_synced = {}
+        moe_local = {}
+        model = getattr(getattr(self, "model", None), "model", None)
+        layers = getattr(model, "layers", ())
+        selected_layers = {0, len(layers) - 1} if layers else set()
+        for layer_idx, layer in enumerate(layers):
+            if layer_idx not in selected_layers:
+                continue
+            block = getattr(layer, "mlp", None)
+            topk_ids = getattr(block, "debug_last_topk_ids", None)
+            topk_weights = getattr(block, "debug_last_topk_weights", None)
+            output = getattr(block, "debug_last_output", None)
+            if topk_ids is None or topk_weights is None or output is None:
+                continue
+            moe_synced[str(layer_idx)] = {
+                "topk_ids": _debug_tensor_summary(topk_ids),
+                "topk_weights": _debug_tensor_summary(topk_weights),
+                "output": _debug_tensor_summary(output),
+            }
+            experts = block.experts
+            moe_local[str(layer_idx)] = {
+                "local_expert_start": int(experts.local_expert_start),
+                "local_expert_end": int(experts.local_expert_end),
+                "local_hit_count": int(block.debug_last_local_hit_count),
+                "local_output": _debug_tensor_summary(block.debug_last_local_output),
+            }
+        return {
+            "world_rank": self.parallel_context.world_rank,
+            "ep_rank": self.parallel_context.ep_rank,
+            "state": self.sparse_controller.debug_state_summary(),
+            "last_logits": (
+                _debug_tensor_summary(self.debug_last_logits)
+                if hasattr(self, "debug_last_logits")
+                else None
+            ),
+            "moe_synced": moe_synced,
+            "moe_local": moe_local,
+        }
+
+    def debug_last_logits_cpu(self) -> torch.Tensor | None:
+        logits = getattr(self, "debug_last_logits", None)
+        if logits is None:
+            raise RuntimeError(
+                "No debug logits are available. Set SPARSEVLLM_DEBUG_RUNTIME=1 before engine startup."
+            )
+        return logits.detach().cpu() if self.rank == 0 else None
+
+    def debug_hidden_states_cpu(self) -> dict[int, torch.Tensor] | None:
+        model = getattr(getattr(self, "model", None), "model", None)
+        snapshots = getattr(model, "debug_last_hidden_states", None)
+        if snapshots is None:
+            raise RuntimeError(
+                "No hidden-state snapshots are available. Set "
+                "SPARSEVLLM_DEBUG_HIDDEN_LAYERS before model execution."
+            )
+        if self.rank != 0:
+            return None
+        return {
+            int(layer_idx): tensor.detach().cpu()
+            for layer_idx, tensor in snapshots.items()
+        }
+
+    def debug_moe_states_cpu(self) -> dict[int, dict[str, torch.Tensor]] | None:
+        model = getattr(getattr(self, "model", None), "model", None)
+        layers = getattr(model, "layers", ())
+        snapshots = {}
+        for layer_idx, layer in enumerate(layers):
+            block = getattr(layer, "mlp", None)
+            required = {
+                "input": getattr(block, "debug_last_input", None),
+                "topk_ids": getattr(block, "debug_last_topk_ids", None),
+                "topk_weights": getattr(block, "debug_last_topk_weights", None),
+                "output": getattr(block, "debug_last_output", None),
+            }
+            missing = [name for name, tensor in required.items() if tensor is None]
+            if missing:
+                raise RuntimeError(
+                    f"Layer {layer_idx} is missing MoE debug tensors {missing}. Set "
+                    "SPARSEVLLM_DEBUG_MOE before model execution."
+                )
+            snapshots[layer_idx] = {
+                name: tensor.detach().cpu()
+                for name, tensor in required.items()
+            }
+        return snapshots if self.rank == 0 else None
+
+    def _debug_float_error_from_world_rank_zero(
+        self,
+        tensor: torch.Tensor,
+        *,
+        atol: float,
+        rtol: float,
+    ) -> tuple[float, float]:
+        if self.world_size == 1:
+            return 0.0, 0.0
+        reference = tensor.detach().clone()
+        dist.broadcast(
+            reference,
+            src=self.parallel_context.world.ranks[0],
+            group=self.parallel_context.world.process_group,
+        )
+        difference = (tensor.detach().float() - reference.float()).abs()
+        max_abs = difference.max()
+        tolerance_ratio = (
+            difference / (float(atol) + float(rtol) * reference.float().abs())
+        ).max()
+        self.parallel_context.world_all_reduce(max_abs, op=dist.ReduceOp.MAX)
+        self.parallel_context.world_all_reduce(tolerance_ratio, op=dist.ReduceOp.MAX)
+        return float(max_abs.item()), float(tolerance_ratio.item())
+
+    def _debug_any_mismatch_from_world_rank_zero(self, tensor: torch.Tensor) -> bool:
+        if self.world_size == 1:
+            return False
+        reference = tensor.detach().clone()
+        dist.broadcast(
+            reference,
+            src=self.parallel_context.world.ranks[0],
+            group=self.parallel_context.world.process_group,
+        )
+        mismatch = torch.tensor(
+            [int(not torch.equal(tensor.detach(), reference))],
+            dtype=torch.int32,
+            device=self.device,
+        )
+        self.parallel_context.world_all_reduce(mismatch, op=dist.ReduceOp.MAX)
+        return bool(mismatch.item())
+
+    def debug_replica_consistency(self) -> dict[str, object] | None:
+        logits = getattr(self, "debug_last_logits", None)
+        if logits is None:
+            return None
+        logits_max_abs, logits_tolerance_ratio = self._debug_float_error_from_world_rank_zero(
+            logits,
+            atol=0.05,
+            rtol=0.05,
+        )
+        result: dict[str, object] = {
+            "last_logits_max_abs": logits_max_abs,
+            "last_logits_tolerance_ratio": logits_tolerance_ratio,
+            "moe_layers": {},
+        }
+        model = getattr(getattr(self, "model", None), "model", None)
+        layers = getattr(model, "layers", ())
+        for layer_idx in sorted({0, len(layers) - 1} if layers else set()):
+            block = getattr(layers[layer_idx], "mlp", None)
+            if not hasattr(block, "debug_last_topk_ids"):
+                continue
+            topk_weights_max_abs, topk_weights_tolerance_ratio = (
+                self._debug_float_error_from_world_rank_zero(
+                    block.debug_last_topk_weights,
+                    atol=0.01,
+                    rtol=0.01,
+                )
+            )
+            output_max_abs, output_tolerance_ratio = (
+                self._debug_float_error_from_world_rank_zero(
+                    block.debug_last_output,
+                    atol=0.05,
+                    rtol=0.05,
+                )
+            )
+            result["moe_layers"][str(layer_idx)] = {
+                "topk_ids_mismatch": self._debug_any_mismatch_from_world_rank_zero(
+                    block.debug_last_topk_ids
+                ),
+                "topk_weights_max_abs": topk_weights_max_abs,
+                "topk_weights_tolerance_ratio": topk_weights_tolerance_ratio,
+                "output_max_abs": output_max_abs,
+                "output_tolerance_ratio": output_tolerance_ratio,
+            }
+        return result
+
+    def debug_sparse_state_summaries(self) -> list[dict[str, object]] | None:
+        local_error: BaseException | None = None
+        local_summary = None
+        try:
+            local_summary = self.debug_sparse_state_summary()
+            local_summary["replica_consistency"] = self.debug_replica_consistency()
+        except BaseException as exc:
+            local_error = exc
+        self._sync_tp_rpc_status("debug_sparse_state_summaries", local_error)
+        if local_error is not None:
+            raise local_error
+        if self.world_size == 1:
+            return [local_summary]
+        summaries = [None] * self.world_size
+        dist.all_gather_object(
+            summaries,
+            local_summary,
+            group=self.parallel_context.world.process_group,
+        )
+        return summaries if self.rank == 0 else None
 
     def _long_text_threshold(self, is_prefill: bool) -> int:
         if (
@@ -532,7 +750,10 @@ class ModelRunner:
         """物理执行逻辑：统一使用 Eager 模式"""
         _stage = 'prefill' if is_prefill else 'decode'
         with profiler.record(f"model_run_model_{_stage}"):
-            return self.model.compute_logits(self.model(input_ids, positions))
+            logits = self.model.compute_logits(self.model(input_ids, positions))
+        if os.getenv("SPARSEVLLM_DEBUG_RUNTIME", "0") == "1":
+            self.debug_last_logits = logits.detach().clone()
+        return logits
 
     def run_logits_for_compare(self, seqs: list[Sequence], is_prefill: bool) -> torch.Tensor | None:
         """Debug logits-alignment path: execute one step and return rank-0 logits without sampling."""
