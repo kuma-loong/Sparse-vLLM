@@ -13,6 +13,7 @@ from sparsevllm.config import (
     _resolve_decode_cuda_graph_capture_sizes,
     _resolve_decode_cuda_graph_context_sizes,
 )
+from sparsevllm.distributed import init_parallel_context, reset_parallel_context
 from sparsevllm.engine.sequence import Sequence
 from sparsevllm.models.qwen2 import Qwen2ForCausalLM
 from sparsevllm.models.llama import LlamaForCausalLM
@@ -71,7 +72,7 @@ class ModelRunner:
         profiler.set_enabled(config.enable_profiler and rank == 0)
         hf_config = config.hf_config
         self.enforce_eager = config.enforce_eager
-        self.world_size = config.tensor_parallel_size
+        self.world_size = config.world_size
         self.rank = rank
         self.event = event
         self.tp_shm_name = tp_shm_name
@@ -90,6 +91,11 @@ class ModelRunner:
                 world_size=self.world_size,
                 rank=rank,
             )
+        self.parallel_context = init_parallel_context(
+            tp_size=config.tensor_parallel_size,
+            ep_size=config.expert_parallel_size,
+            dp_size=config.data_parallel_size,
+        )
 
         # CUDA allocator peaks are process-global and survive LLMEngine.exit().
         # Start a new lifecycle before model construction so KV sizing observes
@@ -121,7 +127,12 @@ class ModelRunner:
             self.model = LlamaForCausalLM(hf_config)
         else:
             raise NotImplementedError(f"Unsupported Sparse-vLLM model_type={hf_config.model_type!r}.")
-        load_model(self.model, config.model, rank=rank, world_size=self.world_size)
+        load_model(
+            self.model,
+            config.model,
+            tp_rank=self.parallel_context.tp_rank,
+            tp_size=self.parallel_context.tp_size,
+        )
         
         self.sampler = Sampler()
 
@@ -137,7 +148,7 @@ class ModelRunner:
                 "provide recurrent_state_spec()."
             )
         state_spec = (
-            state_spec_provider(config.hf_config, self.world_size)
+            state_spec_provider(config.hf_config, self.parallel_context.tp_size)
             if has_linear_layers
             else None
         )
@@ -149,15 +160,14 @@ class ModelRunner:
         if state_spec is not None:
             self.recurrent_state_manager = RecurrentStateManager(
                 config,
-                rank,
-                self.world_size,
+                self.parallel_context,
                 device=self.device,
                 platform=self.platform,
                 state_spec=state_spec,
             )
         # Recurrent rows are persistent runtime state. Allocate them before the
         # cache manager sizes KV so gpu_memory_utilization accounts for both.
-        self.cache_manager = CacheManager.create(config, rank, self.world_size)
+        self.cache_manager = CacheManager.create(config, self.parallel_context)
         self.prefix_cache_coordinator = (
             PrefixCacheCoordinator(config, self.cache_manager, self.recurrent_state_manager)
             if has_linear_layers and bool(config.enable_prefix_caching)
@@ -212,14 +222,18 @@ class ModelRunner:
         # TP 场景下的多进程指令同步
         if self.world_size > 1:
             if not self.tp_shm_name:
-                raise ValueError("tp_shm_name is required when tensor_parallel_size > 1.")
+                raise ValueError("tp_shm_name is required when world_size > 1.")
             if rank == 0:
                 # Rank 0 创建共享内存用于发送方法调用指令
                 self.shm = SharedMemory(name=self.tp_shm_name, create=True, size=2**20)
-                dist.barrier(device_ids=self.platform.barrier_device_ids(rank))
+                self.parallel_context.world_barrier(
+                    device_ids=self.platform.barrier_device_ids(rank)
+                )
             else:
                 # 其他 Rank 监听共享内存中的指令
-                dist.barrier(device_ids=self.platform.barrier_device_ids(rank))
+                self.parallel_context.world_barrier(
+                    device_ids=self.platform.barrier_device_ids(rank)
+                )
                 self.shm = SharedMemory(name=self.tp_shm_name)
                 self.loop()
 
@@ -227,10 +241,13 @@ class ModelRunner:
         """释放资源并注销分布式进程组"""
         if self.world_size > 1:
             self.shm.close()
-            dist.barrier(device_ids=self.platform.barrier_device_ids(self.rank))
+            self.parallel_context.world_barrier(
+                device_ids=self.platform.barrier_device_ids(self.rank)
+            )
             if self.rank == 0:
                 self.shm.unlink()
         self.platform.synchronize()
+        reset_parallel_context()
         dist.destroy_process_group()
 
     def loop(self):
@@ -314,9 +331,9 @@ class ModelRunner:
             dtype=torch.int32,
             device=self.device,
         )
-        dist.all_reduce(failed, op=dist.ReduceOp.MAX)
+        self.parallel_context.world_all_reduce(failed, op=dist.ReduceOp.MAX)
         if int(failed.item()) != 0 and local_error is None:
-            raise RuntimeError(f"At least one TP worker failed during {method_name}.")
+            raise RuntimeError(f"At least one world worker failed during {method_name}.")
 
     def _sync_prefix_cache_control_rpc_status(
         self,

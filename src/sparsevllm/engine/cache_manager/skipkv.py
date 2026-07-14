@@ -5,6 +5,7 @@ from dataclasses import dataclass, field
 import torch
 
 from sparsevllm.config import Config
+from sparsevllm.distributed import ParallelContext
 from sparsevllm.engine.sequence import Sequence
 
 from .rkv import RKVCacheManager
@@ -34,8 +35,8 @@ class SkipKVSequenceState:
 class SkipKVCacheManager(RKVCacheManager):
     """SkipKV sentence-aware KV storage skipping."""
 
-    def __init__(self, config: Config, rank: int, world_size: int):
-        super().__init__(config, rank, world_size)
+    def __init__(self, config: Config, parallel_context: ParallelContext):
+        super().__init__(config, parallel_context)
         self._rkv_vectorized_prefill_query_cache = False
         self._rkv_batch_clear_query_cache_rows = False
         self._skipkv_delimiter_token_ids: set[int] = set()

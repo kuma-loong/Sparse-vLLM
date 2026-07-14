@@ -171,22 +171,42 @@ class ParallelContext:
         return self.data.size
 
     @staticmethod
-    def _all_reduce(tensor: torch.Tensor, group: ParallelGroup) -> torch.Tensor:
+    def _all_reduce(
+        tensor: torch.Tensor,
+        group: ParallelGroup,
+        op: dist.ReduceOp = dist.ReduceOp.SUM,
+    ) -> torch.Tensor:
         if group.size > 1:
-            dist.all_reduce(tensor, group=group.process_group)
+            dist.all_reduce(tensor, op=op, group=group.process_group)
         return tensor
 
-    def world_all_reduce(self, tensor: torch.Tensor) -> torch.Tensor:
-        return self._all_reduce(tensor, self.world)
+    def world_all_reduce(
+        self,
+        tensor: torch.Tensor,
+        op: dist.ReduceOp = dist.ReduceOp.SUM,
+    ) -> torch.Tensor:
+        return self._all_reduce(tensor, self.world, op)
 
-    def tp_all_reduce(self, tensor: torch.Tensor) -> torch.Tensor:
-        return self._all_reduce(tensor, self.tensor)
+    def tp_all_reduce(
+        self,
+        tensor: torch.Tensor,
+        op: dist.ReduceOp = dist.ReduceOp.SUM,
+    ) -> torch.Tensor:
+        return self._all_reduce(tensor, self.tensor, op)
 
-    def ep_all_reduce(self, tensor: torch.Tensor) -> torch.Tensor:
-        return self._all_reduce(tensor, self.expert)
+    def ep_all_reduce(
+        self,
+        tensor: torch.Tensor,
+        op: dist.ReduceOp = dist.ReduceOp.SUM,
+    ) -> torch.Tensor:
+        return self._all_reduce(tensor, self.expert, op)
 
-    def dp_all_reduce(self, tensor: torch.Tensor) -> torch.Tensor:
-        return self._all_reduce(tensor, self.data)
+    def dp_all_reduce(
+        self,
+        tensor: torch.Tensor,
+        op: dist.ReduceOp = dist.ReduceOp.SUM,
+    ) -> torch.Tensor:
+        return self._all_reduce(tensor, self.data, op)
 
     def tp_gather(self, tensor: torch.Tensor, dst: int = 0) -> list[torch.Tensor] | None:
         dst = int(dst)

@@ -3,6 +3,7 @@ from __future__ import annotations
 import torch
 
 from sparsevllm.config import Config
+from sparsevllm.distributed import ParallelContext
 from sparsevllm.engine.sequence import Sequence
 from sparsevllm.triton_kernel.prefill_score import prefill_score_fwd
 
@@ -13,8 +14,8 @@ from .snapkv import SnapKVCacheManager
 class RKVCacheManager(SnapKVCacheManager):
     """SnapKV-style physical cache with R-KV decode-time joint eviction scoring."""
 
-    def __init__(self, config: Config, rank: int, world_size: int):
-        super().__init__(config, rank, world_size)
+    def __init__(self, config: Config, parallel_context: ParallelContext):
+        super().__init__(config, parallel_context)
         self._rkv_observation_tokens = int(config.rkv_observation_tokens)
         self._rkv_query_cache_enabled = self._query_cache_needed_for_config(config)
         self._rkv_vectorized_prefill_query_cache = True
@@ -76,7 +77,7 @@ class RKVCacheManager(SnapKVCacheManager):
         return dtype if isinstance(dtype, torch.dtype) else torch.float16
 
     def _rkv_num_query_heads(self) -> int:
-        return int(self.hf_config.num_attention_heads) // int(self.world_size)
+        return int(self.hf_config.num_attention_heads) // int(self.tp_size)
 
     def _rkv_query_cache_bytes(self) -> int:
         if not self._is_rkv_query_cache_enabled():

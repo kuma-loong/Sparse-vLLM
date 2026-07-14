@@ -8,6 +8,7 @@ import torch
 
 import sparsevllm.platforms as platforms
 from sparsevllm.config import Config, RuntimeLayout
+from sparsevllm.distributed import ParallelContext, ParallelGroup
 from sparsevllm.engine.cache_manager.base import (
     CacheManager,
     LayerBatchStates,
@@ -35,6 +36,11 @@ from sparsevllm.models.qwen3_5 import (
 )
 from sparsevllm.platforms.cpu import CpuPlatform
 from sparsevllm.utils.loader import _target_weight_name_for_model, _validate_all_quantized_weights_loaded
+
+
+def _single_process_parallel_context() -> ParallelContext:
+    group = ParallelGroup(process_group=None, ranks=(0,), rank=0, size=1)
+    return ParallelContext(world=group, tensor=group, expert=group, data=group)
 
 
 def _qwen35_outer_config(*, num_layers: int = 64, full_layers: tuple[int, ...] | None = None):
@@ -610,7 +616,7 @@ def test_qwen35_snapkv_initializes_compact_kv_metadata(tmp_path):
         patch.object(platforms, "_current_platform", CpuPlatform()),
         patch.object(SnapKVCacheManager, "allocate_kv_cache", allocate_small_cache),
     ):
-        manager = SnapKVCacheManager(cfg, rank=0, world_size=1)
+        manager = SnapKVCacheManager(cfg, _single_process_parallel_context())
 
     assert manager.buffer_req_to_token_slots_tensor.shape == (2, 6, 8)
     assert manager.free_slots_stack_tensor.shape == (2, 16)
@@ -728,7 +734,10 @@ def test_qwen35_raw_config_fallback_when_transformers_autoconfig_is_unknown(tmp_
 
 
 def test_qwen35_linear_conv1d_matches_hf_biasless_checkpoint():
-    with patch("torch.distributed.get_rank", return_value=0), patch("torch.distributed.get_world_size", return_value=1):
+    with patch(
+        "sparsevllm.models.qwen3_5.get_parallel_context",
+        return_value=_single_process_parallel_context(),
+    ):
         conv = Qwen35LinearConv1D(conv_dim=16, kernel_size=4, qk_dim=4, v_dim=8)
 
     assert conv.bias is None
@@ -1374,8 +1383,7 @@ def test_recurrent_state_manager_reuses_preallocated_rows_for_decode():
     )
     manager = RecurrentStateManager(
         config,
-        rank=0,
-        world_size=1,
+        _single_process_parallel_context(),
         device=torch.device("cpu"),
         state_spec=RecurrentStateSpec(
             name="test recurrent",
@@ -1444,8 +1452,7 @@ def test_recurrent_state_manager_uses_model_declared_state_schema():
     )
     manager = RecurrentStateManager(
         config,
-        rank=0,
-        world_size=1,
+        _single_process_parallel_context(),
         device=torch.device("cpu"),
         state_spec=RecurrentStateSpec(
             name="single-state model",

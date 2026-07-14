@@ -7,6 +7,7 @@ import numpy as np
 import torch
 
 from sparsevllm.config import Config
+from sparsevllm.distributed import ParallelContext
 from sparsevllm.engine.sequence import Sequence
 from sparsevllm.engine.prefix_cache import (
     PrefixCacheBlock,
@@ -33,8 +34,8 @@ class QuestPrefixBlockPayload:
 class QuestCacheManager(PrefixCacheMixin, CacheManager):
     """Paged KV cache + page metadata cache for QuEST."""
 
-    def __init__(self, config: Config, rank: int, world_size: int):
-        super().__init__(config, rank, world_size)
+    def __init__(self, config: Config, parallel_context: ParallelContext):
+        super().__init__(config, parallel_context)
         self.page_size = int(config.quest_chunk_size)
         self.max_pages_per_row = (self.max_model_len + self.page_size - 1) // self.page_size
         self.page_offsets_i32 = torch.arange(self.page_size, dtype=torch.int32, device=self.device)

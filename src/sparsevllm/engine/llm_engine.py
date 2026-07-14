@@ -187,12 +187,12 @@ class LLMEngine:
         # 初始化 Profiler
         profiler.set_enabled(config.enable_profiler)
         
-        # 2. 启动多进程张量并行 (TP) 环境
+        # 2. 启动 world worker 进程；TP/EP/DP 语义由 ParallelContext 管理。
         self.ps = []
         self.events = []
         ctx = mp.get_context("spawn")
-        tp_shm_name = make_tp_shm_name() if config.tensor_parallel_size > 1 else None
-        for i in range(1, config.tensor_parallel_size):
+        tp_shm_name = make_tp_shm_name() if config.world_size > 1 else None
+        for i in range(1, config.world_size):
             event = ctx.Event()
             # 为每一个非零 Rank 启动一个独立的 ModelRunner 进程
             process = ctx.Process(target=ModelRunner, args=(config, i, event, tp_shm_name))
@@ -536,7 +536,10 @@ class LLMEngine:
             "model": str(config.model),
             "model_type": str(getattr(config.hf_config, "model_type", "")),
             "sparse_method": str(getattr(config, "vllm_sparse_method", "") or ""),
+            "world_size": int(getattr(config, "world_size", 1)),
             "tensor_parallel_size": int(getattr(config, "tensor_parallel_size", 1)),
+            "expert_parallel_size": int(getattr(config, "expert_parallel_size", 1)),
+            "data_parallel_size": int(getattr(config, "data_parallel_size", 1)),
             "max_model_len": int(getattr(config, "max_model_len", 0) or 0),
             "max_num_seqs_in_batch": int(getattr(config, "max_num_seqs_in_batch", 0) or 0),
             "max_decoding_seqs": int(getattr(config, "max_decoding_seqs", 0) or 0),

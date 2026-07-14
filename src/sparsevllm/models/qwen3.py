@@ -1,8 +1,8 @@
 import os
 import torch
 from torch import nn
-import torch.distributed as dist
 from transformers import Qwen3Config
+from sparsevllm.distributed import get_parallel_context
 from sparsevllm.utils.log import logger
 from sparsevllm.utils.context import get_context
 
@@ -54,7 +54,7 @@ class Qwen3Attention(nn.Module):
         proj_chunk_size: int = 16384,
     ) -> None:
         super().__init__()
-        tp_size = dist.get_world_size()
+        tp_size = get_parallel_context().tp_size
         self.total_num_heads = num_heads
         assert self.total_num_heads % tp_size == 0
         self.num_heads = self.total_num_heads // tp_size

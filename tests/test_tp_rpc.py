@@ -87,6 +87,9 @@ def test_prefix_cache_control_rpc_reports_any_tp_worker_failure():
     runner = object.__new__(ModelRunner)
     runner.world_size = 2
     runner.device = torch.device("cpu")
+    runner.parallel_context = SimpleNamespace(
+        world_all_reduce=lambda tensor, op: dist.all_reduce(tensor, op=op)
+    )
 
     def mark_failed(tensor, op=None):
         assert op == dist.ReduceOp.MAX
@@ -96,7 +99,7 @@ def test_prefix_cache_control_rpc_reports_any_tp_worker_failure():
         try:
             ModelRunner._sync_prefix_cache_control_rpc_status(runner, "prefix_cache_delete_subtree", None)
         except RuntimeError as exc:
-            assert "At least one TP worker failed" in str(exc)
+            assert "At least one world worker failed" in str(exc)
         else:
             raise AssertionError("expected worker failure to be surfaced on rank 0")
 
@@ -110,6 +113,9 @@ def test_run_rpc_reports_any_tp_worker_failure():
     runner = object.__new__(ModelRunner)
     runner.world_size = 2
     runner.device = torch.device("cpu")
+    runner.parallel_context = SimpleNamespace(
+        world_all_reduce=lambda tensor, op: dist.all_reduce(tensor, op=op)
+    )
 
     def mark_failed(tensor, op=None):
         assert op == dist.ReduceOp.MAX
@@ -119,7 +125,7 @@ def test_run_rpc_reports_any_tp_worker_failure():
         try:
             ModelRunner._sync_tp_rpc_status(runner, "run", None)
         except RuntimeError as exc:
-            assert "At least one TP worker failed during run" in str(exc)
+            assert "At least one world worker failed during run" in str(exc)
         else:
             raise AssertionError("expected worker failure to be surfaced on rank 0")
 

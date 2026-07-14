@@ -9,6 +9,7 @@ from typing import Any
 import torch
 
 from sparsevllm.config import Config
+from sparsevllm.distributed import ParallelContext
 from sparsevllm.engine.sequence import Sequence
 from sparsevllm.constant import REDUNDANCY_BATCH_SIZE_FACTOR
 from sparsevllm.method_registry import SUPPORTED_SPARSE_METHODS, normalize_sparse_method
@@ -125,12 +126,19 @@ class PrefillComputeView:
 class CacheManager(ABC):
     """每个 Rank 只有一个 CacheManager，内部管理所有层的物理槽位和 KV Cache。"""
 
-    def __init__(self, config: Config, rank: int, world_size: int):
+    def __init__(self, config: Config, parallel_context: ParallelContext):
         self.config = config
-        self.rank = rank
-        self.world_size = world_size
+        self.parallel_context = parallel_context
+        self.rank = parallel_context.world_rank
+        self.world_size = parallel_context.world_size
+        self.tp_rank = parallel_context.tp_rank
+        self.tp_size = parallel_context.tp_size
+        self.ep_rank = parallel_context.ep_rank
+        self.ep_size = parallel_context.ep_size
+        self.dp_rank = parallel_context.dp_rank
+        self.dp_size = parallel_context.dp_size
         self.platform = platforms.current_platform
-        self.device = self.platform.get_device(rank)
+        self.device = self.platform.get_device(self.rank)
         self.hf_config = config.hf_config
         self.num_layers = self.hf_config.num_hidden_layers
         self.runtime_layout = getattr(config, "runtime_layout", None)
@@ -140,7 +148,7 @@ class CacheManager(ABC):
             self.runtime_layout = RuntimeLayout.dense(self.num_layers)
         self.num_kv_layers = int(self.runtime_layout.num_kv_layers)
 
-        self.num_kv_heads = self.hf_config.num_key_value_heads // world_size
+        self.num_kv_heads = self.hf_config.num_key_value_heads // self.tp_size
         self.head_dim = getattr(
             self.hf_config,
             "head_dim",
@@ -200,7 +208,7 @@ class CacheManager(ABC):
         return bool(torch.cuda.is_available() and torch.cuda.is_current_stream_capturing())
 
     @staticmethod
-    def create(config: Config, rank: int, world_size: int) -> "CacheManager":
+    def create(config: Config, parallel_context: ParallelContext) -> "CacheManager":
         sparse_method = normalize_sparse_method(config.vllm_sparse_method)
         model_type = getattr(getattr(config, "hf_config", None), "model_type", "") or ""
 
@@ -211,35 +219,35 @@ class CacheManager(ABC):
         if sparse_method == "deltakv":
             from .deltakv_runtime import DeltaKVCacheManager
 
-            return DeltaKVCacheManager(config, rank, world_size)
+            return DeltaKVCacheManager(config, parallel_context)
         if sparse_method in ("streamingllm", "attention-sink", "attention_sink"):
             from .streamingllm import StreamingLLMCacheManager
 
-            return StreamingLLMCacheManager(config, rank, world_size)
+            return StreamingLLMCacheManager(config, parallel_context)
         if sparse_method in ("snapkv", "pyramidkv"):
             from .snapkv import SnapKVCacheManager
 
-            return SnapKVCacheManager(config, rank, world_size)
+            return SnapKVCacheManager(config, parallel_context)
         if sparse_method == "rkv":
             from .rkv import RKVCacheManager
 
-            return RKVCacheManager(config, rank, world_size)
+            return RKVCacheManager(config, parallel_context)
         if sparse_method == "skipkv":
             from .skipkv import SkipKVCacheManager
 
-            return SkipKVCacheManager(config, rank, world_size)
+            return SkipKVCacheManager(config, parallel_context)
         if sparse_method == "quest":
             from .quest import QuestCacheManager
 
-            return QuestCacheManager(config, rank, world_size)
+            return QuestCacheManager(config, parallel_context)
         if sparse_method == "omnikv":
             from .omnikv import OmniKVCacheManager
 
-            return OmniKVCacheManager(config, rank, world_size)
+            return OmniKVCacheManager(config, parallel_context)
 
         from .standard import StandardCacheManager
 
-        return StandardCacheManager(config, rank, world_size)
+        return StandardCacheManager(config, parallel_context)
 
     def _get_available_slots_info(self) -> tuple[int, int]:
         """返回 (可用显存字节数, 每层每 token 的字节数)"""
@@ -250,8 +258,8 @@ class CacheManager(ABC):
         # 动态估计 max_num_batched_tokens
         reserved_mem = total * (1 - config.gpu_memory_utilization)
         intermediate_size = getattr(hf_config, "intermediate_size", hf_config.hidden_size * 4)
-        # MLP TP layers already assert intermediate_size is divisible by world_size.
-        intermediate_size_per_rank = intermediate_size // self.world_size
+        # Dense MLP activations are sharded only by tensor parallelism.
+        intermediate_size_per_rank = intermediate_size // self.tp_size
         dtype_size = torch.tensor([], dtype=hf_config.torch_dtype).element_size()
 
         # Keep this heuristic conservative: large prefill batches can still peak on

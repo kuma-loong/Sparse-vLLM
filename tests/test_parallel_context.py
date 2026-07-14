@@ -5,7 +5,9 @@ import pytest
 import torch
 import torch.distributed as dist
 
+import sparsevllm.platforms as platforms
 from sparsevllm.config import Config
+from sparsevllm.distributed import ParallelContext, ParallelGroup
 from sparsevllm.distributed.parallel_context import (
     get_parallel_context,
     init_parallel_context,
@@ -14,6 +16,55 @@ from sparsevllm.distributed.parallel_context import (
     reset_parallel_context,
     world_rank_from_parallel_ranks,
 )
+from sparsevllm.engine.cache_manager.base import CacheManager
+from sparsevllm.layers.embed_head import VocabParallelEmbedding
+from sparsevllm.layers.linear import ColumnParallelLinear, RowParallelLinear
+from sparsevllm.platforms.cpu import CpuPlatform
+
+
+def _replicated_ep_context(world_rank: int = 2, world_size: int = 4) -> ParallelContext:
+    return ParallelContext(
+        world=ParallelGroup(None, tuple(range(world_size)), world_rank, world_size),
+        tensor=ParallelGroup(None, (world_rank,), 0, 1),
+        expert=ParallelGroup(None, tuple(range(world_size)), world_rank, world_size),
+        data=ParallelGroup(None, (world_rank,), 0, 1),
+    )
+
+
+class _MinimalCacheManager(CacheManager):
+    def allocate_kv_cache(self):
+        raise NotImplementedError
+
+    def get_layer_batch_states(self, layer_idx):
+        raise NotImplementedError
+
+    def get_layer_kv_cache(self, layer_idx):
+        raise NotImplementedError
+
+    def get_layer_store_view(self, layer_idx):
+        raise NotImplementedError
+
+    def get_layer_compute_tensors(self, layer_idx, selection=None):
+        raise NotImplementedError
+
+    def get_layer_buffer_req_to_token_slots(self, layer_idx):
+        raise NotImplementedError
+
+    @property
+    def num_free_slots(self):
+        return 0
+
+    def free_seq(self, seq_id):
+        raise NotImplementedError
+
+    def free_part_slots(self, layer_idx, seq, keep_indices):
+        raise NotImplementedError
+
+    def _prepare_prefill(self, seqs):
+        raise NotImplementedError
+
+    def _prepare_decode(self, seqs):
+        raise NotImplementedError
 
 
 def _hf_config(model_type: str = "qwen3_moe", *, num_experts: int = 8):
@@ -122,3 +173,41 @@ def test_dense_config_rejects_expert_or_data_parallelism(tmp_path):
     with patch("sparsevllm.config.AutoConfig.from_pretrained", return_value=_hf_config("qwen3")):
         with pytest.raises(ValueError, match="requires EP=1 and DP=1"):
             Config(model=str(tmp_path), expert_parallel_size=2)
+
+
+def test_dense_layers_use_tp_group_in_replicated_ep_topology():
+    context = _replicated_ep_context()
+    with (
+        patch("sparsevllm.layers.linear.get_parallel_context", return_value=context),
+        patch("sparsevllm.layers.embed_head.get_parallel_context", return_value=context),
+    ):
+        column = ColumnParallelLinear(8, 16)
+        row = RowParallelLinear(8, 16)
+        embedding = VocabParallelEmbedding(32, 8)
+
+    assert column.weight.shape == (16, 8)
+    assert row.weight.shape == (16, 8)
+    assert embedding.weight.shape == (32, 8)
+
+
+def test_cache_kv_heads_depend_on_tp_not_ep():
+    context = _replicated_ep_context()
+    config = SimpleNamespace(
+        hf_config=SimpleNamespace(
+            num_hidden_layers=2,
+            num_key_value_heads=4,
+            num_attention_heads=8,
+            hidden_size=32,
+            head_dim=4,
+        ),
+        runtime_layout=None,
+        max_model_len=128,
+        max_num_seqs_in_batch=2,
+    )
+    with patch.object(platforms, "_current_platform", CpuPlatform()):
+        manager = _MinimalCacheManager(config, context)
+
+    assert manager.world_size == 4
+    assert manager.tp_size == 1
+    assert manager.ep_size == 4
+    assert manager.num_kv_heads == 4
