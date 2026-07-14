@@ -33,6 +33,7 @@ CLAW_EVAL_JUDGE_BASE_URL="${CLAW_EVAL_JUDGE_BASE_URL:-https://openrouter.ai/api/
 CLAW_EVAL_DIR="${CLAW_EVAL_DIR:-${REPO_ROOT}/../claw-eval}"
 CLAW_EVAL_REF="${CLAW_EVAL_REF:-main}"
 CLAW_EVAL_CONFIG_TEMPLATE="${CLAW_EVAL_CONFIG_TEMPLATE:-${REPO_ROOT}/benchmark/claw_eval/sparsevllm_config.yaml}"
+CLAW_EVAL_RESULT_VALIDATOR="${CLAW_EVAL_RESULT_VALIDATOR:-${REPO_ROOT}/benchmark/claw_eval/validate_results.py}"
 CLAW_EVAL_CONFIG="${RUN_DIR}/sparsevllm_config.yaml"
 CLAW_EVAL_ARGS="${CLAW_EVAL_ARGS:-batch --config ${CLAW_EVAL_CONFIG} --sandbox --trials 3 --parallel 1}"
 CLAW_EVAL_UPDATE_REPO="${CLAW_EVAL_UPDATE_REPO:-1}"
@@ -43,6 +44,9 @@ CLAW_EVAL_COMMIT=""
 CLAW_EVAL_EFFECTIVE_SANDBOX_IMAGE=""
 CLAW_EVAL_SANDBOX_IMAGE_ID=""
 CLAW_EVAL_SANDBOX_IMAGE_SIZE_BYTES=""
+CLAW_EVAL_PRE_RUN_SNAPSHOT="${RUN_DIR}/claw_eval_pre_run_snapshot.json"
+CLAW_EVAL_PER_SAMPLE_RESULTS="${RUN_DIR}/per_sample_results.jsonl"
+CLAW_EVAL_FINAL_SUMMARY="${RUN_DIR}/final_summary.json"
 SETUP_ONLY="${SETUP_ONLY:-0}"
 
 SPARSEVLLM_CONDA_ENV="${SPARSEVLLM_CONDA_ENV:-${CONDA_ENVS_ROOT}/sparse-vllm-tf530}"
@@ -84,6 +88,7 @@ export CLAW_EVAL_COMMIT
 export CLAW_EVAL_EFFECTIVE_SANDBOX_IMAGE
 export CLAW_EVAL_SANDBOX_IMAGE_ID
 export CLAW_EVAL_SANDBOX_IMAGE_SIZE_BYTES
+export CLAW_EVAL_RESULT_VALIDATOR
 export SPARSEVLLM_CONDA_ENV
 export CLAW_EVAL_CONDA_ENV
 export SPARSEVLLM_MASTER_PORT
@@ -159,12 +164,23 @@ deactivate_conda_env() {
   set -u
 }
 
+require_clean_claw_eval_checkout() {
+  local status
+  status="$(git -C "${CLAW_EVAL_DIR}" status --porcelain --untracked-files=all)"
+  if [[ -n "${status}" ]]; then
+    echo "[ERROR] Claw-Eval checkout must be clean for a reproducible run:" >&2
+    printf '%s\n' "${status}" | sed -n '1,20p' >&2
+    exit 3
+  fi
+}
+
 prepare_claw_eval_repo() {
   mkdir -p "$(dirname "${CLAW_EVAL_DIR}")"
   if [[ "${CLAW_EVAL_UPDATE_REPO}" == "0" ]]; then
     require_file "${CLAW_EVAL_DIR}/.git" "existing Claw-Eval checkout"
     CLAW_EVAL_COMMIT="$(git -C "${CLAW_EVAL_DIR}" rev-parse HEAD)"
     export CLAW_EVAL_COMMIT
+    require_clean_claw_eval_checkout
     echo "[INFO] Reusing Claw-Eval checkout at ${CLAW_EVAL_COMMIT}"
     return
   fi
@@ -182,6 +198,7 @@ prepare_claw_eval_repo() {
   fi
   CLAW_EVAL_COMMIT="$(git -C "${CLAW_EVAL_DIR}" rev-parse HEAD)"
   export CLAW_EVAL_COMMIT
+  require_clean_claw_eval_checkout
 }
 
 prepare_claw_eval_env() {
@@ -429,6 +446,7 @@ manifest = {
     "repo_root": os.environ["REPO_ROOT"],
     "claw_eval_dir": os.environ["CLAW_EVAL_DIR"],
     "claw_eval_commit": os.environ["CLAW_EVAL_COMMIT"],
+    "claw_eval_checkout_clean": True,
     "sparsevllm_conda_env": os.environ["SPARSEVLLM_CONDA_ENV"],
     "claw_eval_conda_env": os.environ["CLAW_EVAL_CONDA_ENV"],
     "model_path": os.environ["MODEL_PATH"],
@@ -474,6 +492,7 @@ main() {
   require_bool "START_SPARSEVLLM_SERVER" "${START_SPARSEVLLM_SERVER}"
   require_bool "CLAW_EVAL_UPDATE_REPO" "${CLAW_EVAL_UPDATE_REPO}"
   require_bool "CLAW_EVAL_BUILD_SANDBOX_IMAGE" "${CLAW_EVAL_BUILD_SANDBOX_IMAGE}"
+  require_file "${CLAW_EVAL_RESULT_VALIDATOR}" "Claw-Eval result validator"
 
   source "${HOME}/miniconda3/etc/profile.d/conda.sh"
 
@@ -528,13 +547,39 @@ main() {
   fi
   wait_for_server
 
+  "${CLAW_EVAL_CONDA_ENV}/bin/python" "${CLAW_EVAL_RESULT_VALIDATOR}" snapshot \
+    --trace-dir "${TRACE_DIR}" \
+    --output "${CLAW_EVAL_PRE_RUN_SNAPSHOT}"
+
   echo "[INFO] Running claw-eval ${CLAW_EVAL_ARGS}"
+  set +e
   (
     activate_conda_env "${CLAW_EVAL_CONDA_ENV}"
     cd "${CLAW_EVAL_DIR}"
     # shellcheck disable=SC2086
     "${CLAW_EVAL_CONDA_ENV}/bin/claw-eval" ${CLAW_EVAL_ARGS}
   ) 2>&1 | tee "${LOG_DIR}/claw_eval.log"
+  claw_eval_exit="${PIPESTATUS[0]}"
+  set -e
+
+  set +e
+  "${CLAW_EVAL_CONDA_ENV}/bin/python" "${CLAW_EVAL_RESULT_VALIDATOR}" validate \
+    --trace-dir "${TRACE_DIR}" \
+    --snapshot "${CLAW_EVAL_PRE_RUN_SNAPSHOT}" \
+    --per-sample "${CLAW_EVAL_PER_SAMPLE_RESULTS}" \
+    --final-summary "${CLAW_EVAL_FINAL_SUMMARY}" \
+    2>&1 | tee "${LOG_DIR}/claw_eval_result_validation.log"
+  validation_exit="${PIPESTATUS[0]}"
+  set -e
+
+  if [[ "${claw_eval_exit}" != "0" ]]; then
+    echo "[ERROR] claw-eval exited with code ${claw_eval_exit}" >&2
+    return "${claw_eval_exit}"
+  fi
+  if [[ "${validation_exit}" != "0" ]]; then
+    echo "[ERROR] Claw-Eval result validation failed with code ${validation_exit}" >&2
+    return "${validation_exit}"
+  fi
 }
 
 if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then

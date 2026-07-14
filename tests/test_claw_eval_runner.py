@@ -88,6 +88,41 @@ class ClawEvalRunnerTest(unittest.TestCase):
         self.assertIn('START_SPARSEVLLM_SERVER="${START_SPARSEVLLM_SERVER:-1}"', script)
         self.assertIn("Starting sandbox preflight container", script)
         self.assertIn("Set CLAW_EVAL_BUILD_SANDBOX_IMAGE=1", script)
+        self.assertIn("require_clean_claw_eval_checkout", script)
+        self.assertIn("claw_eval_result_validation.log", script)
+        self.assertIn("validate_results.py", script)
+
+    def test_dirty_claw_eval_checkout_is_rejected(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            checkout = root / "claw-eval"
+            checkout.mkdir()
+            subprocess.run(["git", "init", "-q", str(checkout)], check=True)
+            (checkout / "local_change.py").write_text("changed = True\n", encoding="utf-8")
+            env = os.environ.copy()
+            env.update(
+                {
+                    "OUTPUT_ROOT": str(root / "outputs"),
+                    "RUN_NAME": "dirty-checkout-test",
+                    "CLAW_EVAL_DIR": str(checkout),
+                }
+            )
+
+            result = subprocess.run(
+                [
+                    "bash",
+                    "-c",
+                    'source "$1"; require_clean_claw_eval_checkout',
+                    "bash",
+                    str(RUNNER),
+                ],
+                capture_output=True,
+                text=True,
+                env=env,
+            )
+
+        self.assertEqual(result.returncode, 3)
+        self.assertIn("checkout must be clean", result.stderr)
 
 
 if __name__ == "__main__":

@@ -17,6 +17,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Iterable, Sequence
 
+import yaml
+
 
 PROXY_ENV_VARS = (
     "http_proxy",
@@ -35,7 +37,20 @@ FINAL_STATUSES = {
     "skipped_by_policy",
 }
 LOCAL_HOSTS = {"127.0.0.1", "localhost", "::1"}
-SECRET_PATTERN = re.compile(r"sk-[A-Za-z0-9_-]{16,}")
+SECRET_PATTERNS = (
+    re.compile(r"sk-[A-Za-z0-9_-]{16,}"),
+    re.compile(r"hf_[A-Za-z0-9]{16,}"),
+    re.compile(r"AIza[A-Za-z0-9_-]{16,}"),
+    re.compile(r"(?i)Bearer\s+[A-Za-z0-9._~+/-]{12,}=*"),
+)
+SENSITIVE_KEY_PATTERN = re.compile(
+    r"(?i)(?:^|_)(?:api_?key|access_?token|auth_?token|refresh_?token|token|"
+    r"secret|client_?secret|password|credential|credentials|authorization)(?:$|_)"
+)
+INLINE_SECRET_PATTERN = re.compile(
+    r"(?i)(?:--?(?:api[-_]?key|access[-_]?token|auth[-_]?token|token|password|secret)"
+    r"\s+|(?:api[-_]?key|access[-_]?token|auth[-_]?token|token|password|secret)=)\S+"
+)
 
 
 class RunnerError(RuntimeError):
@@ -89,9 +104,15 @@ def _package_version(name: str) -> str | None:
         return None
 
 
-def _git_state(repo: Path) -> dict[str, Any]:
+def _git_state(repo: Path, *, source_roots: Sequence[str]) -> dict[str, Any]:
     if not (repo / ".git").exists():
-        return {"path": str(repo), "commit": None, "dirty": None}
+        return {
+            "path": str(repo),
+            "commit": None,
+            "source_dirty": None,
+            "tracked_diff_sha256": None,
+            "untracked_source_files": [],
+        }
 
     def run(*args: str) -> str:
         proc = subprocess.run(
@@ -102,11 +123,83 @@ def _git_state(repo: Path) -> dict[str, Any]:
         )
         return proc.stdout.strip()
 
+    diff_proc = subprocess.run(
+        ["git", "-C", str(repo), "diff", "--binary", "HEAD", "--"],
+        check=True,
+        capture_output=True,
+    )
+    untracked_output = run(
+        "ls-files", "--others", "--exclude-standard", "--", *source_roots
+    )
+    untracked_files = []
+    for relative in untracked_output.splitlines():
+        path = repo / relative
+        if path.is_file():
+            untracked_files.append(
+                {"path": relative, "sha256": _sha256_file(path)}
+            )
+
+    tracked_diff_sha256 = _sha256_bytes(diff_proc.stdout)
+    source_dirty = bool(diff_proc.stdout or untracked_files)
     return {
         "path": str(repo.resolve()),
         "commit": run("rev-parse", "HEAD"),
-        "dirty": bool(run("status", "--short")),
+        "source_dirty": source_dirty,
+        "tracked_diff_sha256": tracked_diff_sha256,
+        "untracked_source_files": untracked_files,
     }
+
+
+def assert_runtime_provenance_matches(
+    expected: dict[str, Any], current: dict[str, Any]
+) -> None:
+    if expected != current:
+        raise RunnerError(
+            "Runtime provenance drift detected between stages. Use a new --run-dir "
+            "after changing adapter code, SWE-bench code, Python, or package versions."
+        )
+
+
+def build_official_run_id(run_id: str, predictions_sha256: str) -> str:
+    if re.fullmatch(r"[0-9a-f]{64}", predictions_sha256) is None:
+        raise RunnerError("Prediction hash must be a lowercase SHA-256 digest")
+    return f"{run_id}-pred-{predictions_sha256[:12]}"
+
+
+def _reject_secrets(value: Any, *, source: Path, path: str = "root") -> None:
+    if isinstance(value, dict):
+        for key, nested in value.items():
+            key_text = str(key)
+            normalized_key = key_text.replace("-", "_").lower()
+            if (
+                not normalized_key.endswith("_env")
+                and SENSITIVE_KEY_PATTERN.search(normalized_key)
+                and nested not in (None, "")
+            ):
+                raise RunnerError(
+                    f"Potential secret field {path}.{key_text} in {source}; "
+                    "store credentials only in environment variables"
+                )
+            _reject_secrets(nested, source=source, path=f"{path}.{key_text}")
+        return
+    if isinstance(value, list):
+        for index, nested in enumerate(value):
+            _reject_secrets(nested, source=source, path=f"{path}[{index}]")
+        return
+    if not isinstance(value, str):
+        return
+
+    if any(pattern.search(value) for pattern in SECRET_PATTERNS):
+        raise RunnerError(f"Potential secret value at {path} in {source}")
+    if INLINE_SECRET_PATTERN.search(value):
+        raise RunnerError(f"Inline command secret at {path} in {source}")
+    parsed = urllib.parse.urlparse(value)
+    if parsed.scheme and (parsed.username is not None or parsed.password is not None):
+        raise RunnerError(f"URL credentials at {path} in {source} are secret")
+    if parsed.scheme:
+        for key, nested in urllib.parse.parse_qsl(parsed.query, keep_blank_values=True):
+            if SENSITIVE_KEY_PATTERN.search(key.replace("-", "_")) and nested:
+                raise RunnerError(f"URL query secret at {path} in {source}")
 
 
 def _load_dataset(dataset: str, split: str) -> list[dict[str, Any]]:
@@ -196,6 +289,18 @@ def _require_local_images(image_names: Sequence[str]) -> None:
     if not image_names:
         raise RunnerError("No Docker images were derived for the selected instances")
     try:
+        daemon = subprocess.run(
+            ["docker", "info"],
+            text=True,
+            capture_output=True,
+            timeout=10,
+        )
+        if daemon.returncode != 0:
+            detail = (daemon.stderr or daemon.stdout).strip()
+            raise RunnerError(
+                "Docker daemon is unavailable"
+                + (f": {detail[:500]}" if detail else "")
+            )
         proc = subprocess.run(
             ["docker", "image", "inspect", *image_names],
             stdout=subprocess.DEVNULL,
@@ -203,6 +308,8 @@ def _require_local_images(image_names: Sequence[str]) -> None:
         )
     except FileNotFoundError as exc:
         raise RunnerError("docker is not installed or is not on PATH") from exc
+    except subprocess.TimeoutExpired as exc:
+        raise RunnerError("Docker daemon check timed out after 10 seconds") from exc
     if proc.returncode == 0:
         return
 
@@ -247,10 +354,7 @@ def _validate_local_server_manifest(
             raise RunnerError(f"server manifest {field} must be a non-empty string")
     if not isinstance(manifest["engine_kwargs"], dict):
         raise RunnerError("server manifest engine_kwargs must be a JSON object")
-    if SECRET_PATTERN.search(json.dumps(manifest, ensure_ascii=False)):
-        raise RunnerError(
-            "server manifest appears to contain an API key; store secrets only in the environment"
-        )
+    _reject_secrets(manifest, source=path)
     engine_kwargs = manifest["engine_kwargs"]
     if "max_model_len" not in engine_kwargs:
         raise RunnerError("server manifest engine_kwargs must record max_model_len")
@@ -348,7 +452,9 @@ def render_mini_config(
 
 
 def _redact(line: str) -> str:
-    return SECRET_PATTERN.sub("[redacted]", line)
+    for pattern in SECRET_PATTERNS:
+        line = pattern.sub("[redacted]", line)
+    return INLINE_SECRET_PATTERN.sub("[redacted-secret-argument]", line)
 
 
 def _run_logged(
@@ -424,6 +530,27 @@ def validate_predictions(
     return predictions
 
 
+def validate_completed_batch(
+    batch_dir: Path, expected_ids: Sequence[str]
+) -> dict[str, dict[str, Any]]:
+    predictions_path = batch_dir / "preds.json"
+    marker_path = batch_dir / "batch_done.json"
+    predictions = validate_predictions(
+        _read_json(predictions_path), expected_ids, source=predictions_path
+    )
+    marker = _read_json(marker_path)
+    if not isinstance(marker, dict):
+        raise RunnerError(f"Completed batch marker must be a JSON object: {marker_path}")
+    expected_hash = _canonical_hash(predictions)
+    if marker.get("instances") != len(expected_ids) or marker.get(
+        "predictions_sha256"
+    ) != expected_hash:
+        raise RunnerError(
+            f"Completed batch marker does not match predictions: {marker_path}"
+        )
+    return predictions
+
+
 def merge_batch_predictions(
     run_dir: Path,
     batches: Sequence[Sequence[str]],
@@ -448,9 +575,16 @@ def merge_batch_predictions(
             model_stats = (info or {}).get("model_stats") or {}
             if not isinstance(model_stats, dict):
                 raise RunnerError(f"model_stats is not an object for {instance_id}")
+            if trajectory_path is None:
+                status = "parse_failed"
+            elif not prediction["model_patch"]:
+                status = "model_failed"
+            else:
+                status = "success"
             generation_rows.append(
                 {
                     "instance_id": instance_id,
+                    "status": status,
                     "exit_status": (info or {}).get("exit_status"),
                     "has_patch": bool(prediction["model_patch"]),
                     "model_patch_len": len(prediction["model_patch"]),
@@ -466,6 +600,25 @@ def _write_jsonl(path: Path, rows: Iterable[dict[str, Any]]) -> None:
     with path.open("w", encoding="utf-8") as handle:
         for row in rows:
             handle.write(json.dumps(row, ensure_ascii=False, sort_keys=True) + "\n")
+
+
+def _read_jsonl(path: Path) -> list[dict[str, Any]]:
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except FileNotFoundError as exc:
+        raise RunnerError(f"Required JSONL file does not exist: {path}") from exc
+    rows = []
+    for line_number, line in enumerate(lines, start=1):
+        if not line.strip():
+            continue
+        try:
+            row = json.loads(line)
+        except json.JSONDecodeError as exc:
+            raise RunnerError(f"Invalid JSONL in {path}:{line_number}: {exc}") from exc
+        if not isinstance(row, dict):
+            raise RunnerError(f"JSONL row is not an object: {path}:{line_number}")
+        rows.append(row)
+    return rows
 
 
 def normalize_results(
@@ -523,8 +676,13 @@ def normalize_results(
     rows = []
     for instance_id in expected_ids:
         generation = generation_by_id[instance_id]
-        if generation["trajectory_path"] is None:
-            status = "parse_failed"
+        generation_status = generation.get("status")
+        if generation_status not in FINAL_STATUSES:
+            raise RunnerError(
+                f"Generation result has invalid status for {instance_id}: {generation_status!r}"
+            )
+        if generation_status != "success":
+            status = generation_status
         elif instance_id in errors:
             status = "metric_failed"
         elif instance_id in completed:
@@ -589,7 +747,11 @@ class SweBenchLiteRunner:
     def __init__(self, args: argparse.Namespace):
         self.args = args
         self.repo_root = Path(__file__).resolve().parents[2]
-        self.swe_bench_dir = args.swe_bench_dir.expanduser().resolve()
+        self.swe_bench_dir = (
+            args.swe_bench_dir.expanduser().resolve()
+            if args.swe_bench_dir is not None
+            else None
+        )
         self.run_dir = args.run_dir.expanduser().resolve()
         self.status_path = self.run_dir / "status.jsonl"
         self.run_config_path = self.run_dir / "run_config.json"
@@ -600,11 +762,14 @@ class SweBenchLiteRunner:
         self.images_path = self.run_dir / "images.txt"
         self.predictions_path = self.run_dir / "preds_all.json"
         self.generation_results_path = self.run_dir / "generation_results.jsonl"
+        self.per_sample_results_path = self.run_dir / "per_sample_results.jsonl"
+        self.evaluation_identity_path = self.run_dir / "evaluation_identity.json"
         self.official_dir = self.run_dir / "official"
         self.extra_mini_configs = [path.expanduser().resolve() for path in args.mini_extra_config]
         self.extra_mini_config_records: list[dict[str, str]] = []
         self.extra_mini_config_snapshots: list[Path] = []
         self.run_id = args.run_id or f"swe_bench_lite_{self.run_dir.name}"
+        self.official_run_id: str | None = None
         if re.fullmatch(r"[A-Za-z0-9_.-]+", self.run_id) is None:
             raise RunnerError(
                 "--run-id may only contain letters, numbers, dot, underscore, and dash"
@@ -628,8 +793,16 @@ class SweBenchLiteRunner:
                 "A positive --cost-limit is not reliable with --cost-tracking=ignore_errors; "
                 "set --cost-limit=0 or provide model cost metadata and use default tracking"
             )
+        _reject_secrets(
+            {"api_base": args.api_base, "mini_command": args.mini_command},
+            source=Path("<command-line arguments>"),
+        )
 
         self.requires_model_api = args.stage in {"prepare", "generate", "all"}
+        if args.stage != "summarize" and self.swe_bench_dir is None:
+            raise RunnerError("--swe-bench-dir is required unless --stage=summarize")
+        if args.stage != "summarize" and not args.model:
+            raise RunnerError("--model is required unless --stage=summarize")
         self.api_key = os.environ.get(args.api_key_env, "")
         if self.requires_model_api and not self.api_key:
             raise RunnerError(f"Required API key environment variable is empty: {args.api_key_env}")
@@ -637,6 +810,43 @@ class SweBenchLiteRunner:
         self.rows: list[dict[str, Any]] = []
         self.instance_ids: list[str] = []
         self.image_names: list[str] = []
+
+    def _runtime_provenance(self) -> dict[str, Any]:
+        if self.swe_bench_dir is None:
+            raise RunnerError("SWE-bench checkout is unavailable for provenance validation")
+        return {
+            "adapter_git": _git_state(
+                self.repo_root,
+                source_roots=("benchmark", "scripts/benchmarks"),
+            ),
+            "swe_bench_git": _git_state(
+                self.swe_bench_dir,
+                source_roots=("swebench",),
+            ),
+            "python": {"executable": sys.executable, "version": sys.version},
+            "packages": {
+                name: _package_version(name)
+                for name in ("mini-swe-agent", "swebench", "litellm", "datasets")
+            },
+        }
+
+    def _validate_existing_provenance(
+        self, runtime_provenance: dict[str, Any]
+    ) -> dict[str, Any] | None:
+        if not self.manifest_path.exists():
+            return None
+        manifest = _read_json(self.manifest_path)
+        if not isinstance(manifest, dict) or not isinstance(
+            manifest.get("runtime_provenance"), dict
+        ):
+            raise RunnerError(
+                f"Existing run manifest lacks runtime provenance: {self.manifest_path}; "
+                "use a new --run-dir"
+            )
+        assert_runtime_provenance_matches(
+            manifest["runtime_provenance"], runtime_provenance
+        )
+        return manifest
 
     def _status(self, stage: str, status: str, detail: str) -> None:
         _append_jsonl(
@@ -669,7 +879,7 @@ class SweBenchLiteRunner:
         return env
 
     def _load_selection(self) -> None:
-        if not self.swe_bench_dir.is_dir():
+        if self.swe_bench_dir is None or not self.swe_bench_dir.is_dir():
             raise RunnerError(f"SWE-bench checkout does not exist: {self.swe_bench_dir}")
         if self.args.offline_dataset:
             os.environ["HF_DATASETS_OFFLINE"] = "1"
@@ -696,10 +906,14 @@ class SweBenchLiteRunner:
                 content = source.read_text(encoding="utf-8")
             except FileNotFoundError as exc:
                 raise RunnerError(f"Extra mini-SWE-agent config does not exist: {source}") from exc
-            if SECRET_PATTERN.search(content) or re.search(r"(?im)^\s*api_key\s*:", content):
+            try:
+                parsed = yaml.safe_load(content)
+            except yaml.YAMLError as exc:
                 raise RunnerError(
-                    f"Extra mini-SWE-agent config appears to contain an API key: {source}"
-                )
+                    f"Invalid YAML in extra mini-SWE-agent config {source}: {exc}"
+                ) from exc
+            _reject_secrets(content, source=source)
+            _reject_secrets(parsed, source=source)
             snapshot = snapshot_dir / f"{index:02d}_{source.name}"
             if snapshot.exists() and snapshot.read_text(encoding="utf-8") != content:
                 raise RunnerError(f"Extra mini-SWE-agent config snapshot changed: {snapshot}")
@@ -746,6 +960,8 @@ class SweBenchLiteRunner:
     def prepare(self) -> None:
         self.run_dir.mkdir(parents=True, exist_ok=True)
         self._status("prepare", "running", "validating dataset, server, and Docker images")
+        runtime_provenance = self._runtime_provenance()
+        self._validate_existing_provenance(runtime_provenance)
         self._load_selection()
         self._prepare_extra_mini_configs()
         self.instances_path.write_text("\n".join(self.instance_ids) + "\n", encoding="utf-8")
@@ -812,13 +1028,7 @@ class SweBenchLiteRunner:
                 self.manifest_path,
                 {
                     "created_at": _now(),
-                    "adapter_git": _git_state(self.repo_root),
-                    "swe_bench_git": _git_state(self.swe_bench_dir),
-                    "python": {"executable": sys.executable, "version": sys.version},
-                    "packages": {
-                        name: _package_version(name)
-                        for name in ("mini-swe-agent", "swebench", "litellm", "datasets")
-                    },
+                    "runtime_provenance": runtime_provenance,
                     "run_config": semantic_config,
                     "run_id": self.run_id,
                     "run_dir": str(self.run_dir),
@@ -851,12 +1061,221 @@ class SweBenchLiteRunner:
             for index in range(0, len(self.instance_ids), self.args.batch_size)
         ]
 
+    def _load_artifact_context(self) -> None:
+        config = _read_json(self.run_config_path)
+        if not isinstance(config, dict):
+            raise RunnerError(f"Run configuration must be a JSON object: {self.run_config_path}")
+        required = {
+            "run_id",
+            "instance_ids",
+            "batch_size",
+            "model",
+            "dataset",
+            "split",
+        }
+        missing = sorted(required - set(config))
+        if missing:
+            raise RunnerError(f"Run configuration is missing fields: {missing}")
+        if self.args.run_id is not None and self.args.run_id != config["run_id"]:
+            raise RunnerError(
+                f"--run-id {self.args.run_id!r} does not match stored run id "
+                f"{config['run_id']!r}"
+            )
+        if not isinstance(config["run_id"], str) or re.fullmatch(
+            r"[A-Za-z0-9_.-]+", config["run_id"]
+        ) is None:
+            raise RunnerError("Stored run_id is invalid")
+        if (
+            not isinstance(config["instance_ids"], list)
+            or not config["instance_ids"]
+            or not all(
+                isinstance(instance_id, str) and instance_id
+                for instance_id in config["instance_ids"]
+            )
+            or len(set(config["instance_ids"])) != len(config["instance_ids"])
+        ):
+            raise RunnerError("Stored instance_ids must be unique non-empty strings")
+        if (
+            not isinstance(config["batch_size"], int)
+            or isinstance(config["batch_size"], bool)
+            or config["batch_size"] <= 0
+        ):
+            raise RunnerError("Stored batch_size must be a positive integer")
+        for field in ("model", "dataset", "split"):
+            if not isinstance(config[field], str) or not config[field]:
+                raise RunnerError(f"Stored {field} must be a non-empty string")
+        self.run_id = config["run_id"]
+        self.instance_ids = config["instance_ids"]
+        self.args.batch_size = config["batch_size"]
+        self.args.model = config["model"]
+        self.args.dataset = config["dataset"]
+        self.args.split = config["split"]
+
+        identity = _read_json(self.evaluation_identity_path)
+        if (
+            not isinstance(identity, dict)
+            or not isinstance(identity.get("official_run_id"), str)
+            or not isinstance(identity.get("predictions_sha256"), str)
+        ):
+            raise RunnerError(
+                f"Evaluation identity is missing or invalid: {self.evaluation_identity_path}"
+            )
+        predictions = validate_predictions(
+            _read_json(self.predictions_path),
+            self.instance_ids,
+            source=self.predictions_path,
+        )
+        if _canonical_hash(predictions) != identity["predictions_sha256"]:
+            raise RunnerError("Predictions do not match the stored evaluation identity")
+        expected_official_run_id = build_official_run_id(
+            self.run_id, identity["predictions_sha256"]
+        )
+        if identity["official_run_id"] != expected_official_run_id:
+            raise RunnerError("Stored official run id does not match the prediction hash")
+        self.official_run_id = identity["official_run_id"]
+
+    def _prepare_evaluation_identity(
+        self, predictions: dict[str, dict[str, Any]]
+    ) -> dict[str, Any]:
+        merge_summary = _read_json(self.run_dir / "prediction_merge_summary.json")
+        if not isinstance(merge_summary, dict):
+            raise RunnerError("Prediction merge summary must be a JSON object")
+        predictions_sha256 = _canonical_hash(predictions)
+        if predictions_sha256 != merge_summary.get("predictions_sha256"):
+            raise RunnerError("preds_all.json changed after generation merge")
+
+        manifest = _read_json(self.manifest_path)
+        if not isinstance(manifest, dict) or not isinstance(
+            manifest.get("runtime_provenance"), dict
+        ):
+            raise RunnerError(f"Run manifest lacks runtime provenance: {self.manifest_path}")
+        official_run_id = build_official_run_id(self.run_id, predictions_sha256)
+        identity = {
+            "logical_run_id": self.run_id,
+            "official_run_id": official_run_id,
+            "predictions_sha256": predictions_sha256,
+            "runtime_provenance_sha256": _canonical_hash(manifest["runtime_provenance"]),
+        }
+        if self.evaluation_identity_path.exists():
+            existing = _read_json(self.evaluation_identity_path)
+            if existing != identity:
+                raise RunnerError(
+                    f"Evaluation identity differs from {self.evaluation_identity_path}; "
+                    "use a new --run-dir"
+                )
+        else:
+            _write_json(self.evaluation_identity_path, identity)
+
+        log_root = self.official_dir / "logs" / "run_evaluation" / official_run_id
+        marker_path = log_root / ".sparsevllm_adapter_identity.json"
+        if log_root.exists() and not marker_path.exists() and any(log_root.iterdir()):
+            raise RunnerError(
+                f"Refusing unowned SWE-bench cache directory without identity marker: {log_root}"
+            )
+        if marker_path.exists():
+            marker = _read_json(marker_path)
+            if marker != identity:
+                raise RunnerError(f"SWE-bench cache identity mismatch: {marker_path}")
+        else:
+            _write_json(marker_path, identity)
+
+        self.official_run_id = official_run_id
+        return identity
+
+    def _write_generation_failure_results(
+        self, *, failed_batch_index: int, error: Exception
+    ) -> None:
+        rows = []
+        for batch_index, instance_ids in enumerate(self._batches()):
+            batch_dir = self.run_dir / "batches" / f"batch_{batch_index:03d}"
+            predictions = {}
+            predictions_path = batch_dir / "preds.json"
+            if predictions_path.exists():
+                try:
+                    loaded = _read_json(predictions_path)
+                    if isinstance(loaded, dict):
+                        predictions = loaded
+                except RunnerError:
+                    predictions = {}
+            for instance_id in instance_ids:
+                prediction = predictions.get(instance_id)
+                try:
+                    info, trajectory_path = _trajectory_info(batch_dir, instance_id)
+                except RunnerError:
+                    info, trajectory_path = None, None
+                patch = prediction.get("model_patch") if isinstance(prediction, dict) else None
+                if failed_batch_index < 0:
+                    status = "invalid_input"
+                    detail = str(error)
+                elif batch_index > failed_batch_index:
+                    status = "skipped_by_policy"
+                    detail = "not attempted after an earlier generation batch failed"
+                elif trajectory_path is None:
+                    status = "parse_failed" if prediction is not None else "model_failed"
+                    detail = str(error)
+                elif not isinstance(patch, str) or not patch:
+                    status = "model_failed"
+                    detail = str(error)
+                else:
+                    status = "success"
+                    detail = None
+                rows.append(
+                    {
+                        "instance_id": instance_id,
+                        "status": status,
+                        "exit_status": (info or {}).get("exit_status"),
+                        "has_patch": isinstance(patch, str) and bool(patch),
+                        "model_patch_len": len(patch) if isinstance(patch, str) else 0,
+                        "model_stats": (info or {}).get("model_stats") or {},
+                        "trajectory_path": trajectory_path,
+                        "error": detail,
+                    }
+                )
+        _write_jsonl(self.generation_results_path, rows)
+
+    def _write_evaluation_failure_results(self, error: Exception) -> None:
+        generation_rows = _read_jsonl(self.generation_results_path)
+        generation_by_id = {row.get("instance_id"): row for row in generation_rows}
+        if set(generation_by_id) != set(self.instance_ids):
+            raise RunnerError(
+                "Cannot write evaluation failure statuses because generation results "
+                "do not cover the selected instances"
+            ) from error
+        rows = []
+        for instance_id in self.instance_ids:
+            generation = generation_by_id[instance_id]
+            generation_status = generation.get("status")
+            status = (
+                "metric_failed" if generation_status == "success" else generation_status
+            )
+            if status not in FINAL_STATUSES:
+                status = "parse_failed"
+            rows.append(
+                {
+                    "instance_id": instance_id,
+                    "status": status,
+                    "resolved": None,
+                    "official_outcome": "error",
+                    "generation_exit_status": generation.get("exit_status"),
+                    "has_patch": generation.get("has_patch", False),
+                    "model_patch_len": generation.get("model_patch_len", 0),
+                    "model_stats": generation.get("model_stats") or {},
+                    "trajectory_path": generation.get("trajectory_path"),
+                    "error": str(error),
+                }
+            )
+        _write_jsonl(self.per_sample_results_path, rows)
+
     def generate(self) -> None:
         batches = self._batches()
         model_env = self._model_env()
         mini_prefix = shlex.split(self.args.mini_command)
         if not mini_prefix:
-            raise RunnerError("--mini-command is empty")
+            error = RunnerError("--mini-command is empty")
+            self._write_generation_failure_results(
+                failed_batch_index=-1, error=error
+            )
+            raise error
 
         for index, instance_ids in enumerate(batches):
             batch_name = f"batch_{index:03d}"
@@ -867,9 +1286,14 @@ class SweBenchLiteRunner:
             done_path = batch_dir / "batch_done.json"
             predictions_path = batch_dir / "preds.json"
             if done_path.exists():
-                validate_predictions(
-                    _read_json(predictions_path), instance_ids, source=predictions_path
-                )
+                try:
+                    validate_completed_batch(batch_dir, instance_ids)
+                except Exception as exc:
+                    self._write_generation_failure_results(
+                        failed_batch_index=index, error=exc
+                    )
+                    self._status(batch_name, "failed", str(exc))
+                    raise
                 self._status(batch_name, "skipped", "validated completed batch")
                 continue
 
@@ -921,73 +1345,89 @@ class SweBenchLiteRunner:
                     },
                 )
             except Exception as exc:
+                self._write_generation_failure_results(
+                    failed_batch_index=index, error=exc
+                )
                 self._status(batch_name, "failed", str(exc))
                 raise
             self._status(batch_name, "completed", f"instances={len(instance_ids)}")
 
         self._status("merge", "running", "validating and merging batch predictions")
-        combined, generation_rows = merge_batch_predictions(self.run_dir, batches)
-        validate_predictions(combined, self.instance_ids, source=self.predictions_path)
-        _write_json(self.predictions_path, combined)
-        _write_jsonl(self.generation_results_path, generation_rows)
-        _write_json(
-            self.run_dir / "prediction_merge_summary.json",
-            {
-                "expected": len(self.instance_ids),
-                "combined": len(combined),
-                "predictions_sha256": _canonical_hash(combined),
-                "generation_results_sha256": _sha256_file(self.generation_results_path),
-            },
-        )
+        try:
+            combined, generation_rows = merge_batch_predictions(self.run_dir, batches)
+            validate_predictions(combined, self.instance_ids, source=self.predictions_path)
+            _write_json(self.predictions_path, combined)
+            _write_jsonl(self.generation_results_path, generation_rows)
+            _write_json(
+                self.run_dir / "prediction_merge_summary.json",
+                {
+                    "expected": len(self.instance_ids),
+                    "combined": len(combined),
+                    "predictions_sha256": _canonical_hash(combined),
+                    "generation_results_sha256": _sha256_file(self.generation_results_path),
+                },
+            )
+        except Exception as exc:
+            self._write_generation_failure_results(
+                failed_batch_index=len(batches), error=exc
+            )
+            self._status("merge", "failed", str(exc))
+            raise
         self._status("merge", "completed", f"predictions={len(combined)}")
 
     def _official_report_path(self) -> Path:
-        candidates = sorted(self.official_dir.glob(f"*.{self.run_id}.json"))
+        if self.official_run_id is None:
+            raise RunnerError("Official evaluation identity has not been initialized")
+        candidates = sorted(self.official_dir.glob(f"*.{self.official_run_id}.json"))
         if len(candidates) != 1:
             raise RunnerError(
-                f"Expected one official report matching *.{self.run_id}.json in "
+                f"Expected one official report matching *.{self.official_run_id}.json in "
                 f"{self.official_dir}, found {len(candidates)}"
             )
         return candidates[0]
 
     def evaluate(self) -> None:
-        predictions = validate_predictions(
-            _read_json(self.predictions_path), self.instance_ids, source=self.predictions_path
-        )
-        merge_summary = _read_json(self.run_dir / "prediction_merge_summary.json")
-        if _canonical_hash(predictions) != merge_summary["predictions_sha256"]:
-            raise RunnerError("preds_all.json changed after generation merge")
-        self.official_dir.mkdir(parents=True, exist_ok=True)
-        command = [
-            sys.executable,
-            "-m",
-            "swebench.harness.run_evaluation",
-            "--dataset_name",
-            self.args.dataset,
-            "--split",
-            self.args.split,
-            "--predictions_path",
-            str(self.predictions_path),
-            "--max_workers",
-            str(self.args.eval_workers),
-            "--timeout",
-            str(self.args.eval_timeout),
-            "--run_id",
-            self.run_id,
-            "--report_dir",
-            str(self.official_dir),
-            "--instance_ids",
-            *self.instance_ids,
-        ]
         self._status(
             "evaluate",
             "running",
             f"instances={len(self.instance_ids)} workers={self.args.eval_workers}",
         )
         try:
+            predictions = validate_predictions(
+                _read_json(self.predictions_path),
+                self.instance_ids,
+                source=self.predictions_path,
+            )
+            self.official_dir.mkdir(parents=True, exist_ok=True)
+            identity = self._prepare_evaluation_identity(predictions)
+            for stale_report in self.official_dir.glob(
+                f"*.{self.official_run_id}.json"
+            ):
+                stale_report.unlink()
+            command = [
+                sys.executable,
+                "-m",
+                "swebench.harness.run_evaluation",
+                "--dataset_name",
+                self.args.dataset,
+                "--split",
+                self.args.split,
+                "--predictions_path",
+                str(self.predictions_path),
+                "--max_workers",
+                str(self.args.eval_workers),
+                "--timeout",
+                str(self.args.eval_timeout),
+                "--run_id",
+                identity["official_run_id"],
+                "--report_dir",
+                str(self.official_dir),
+                "--instance_ids",
+                *self.instance_ids,
+            ]
             _run_logged(
                 command,
-                cwd=self.swe_bench_dir,
+                cwd=self.official_dir,
                 env=self._model_env(),
                 log_path=self.run_dir / "logs" / "official_eval.log",
             )
@@ -1020,12 +1460,12 @@ class SweBenchLiteRunner:
             generation_rows=generation_rows,
             official_report=official_report,
         )
-        per_sample_path = self.run_dir / "per_sample_results.jsonl"
-        _write_jsonl(per_sample_path, per_sample)
+        _write_jsonl(self.per_sample_results_path, per_sample)
         summary.update(
             {
                 "written_at": _now(),
                 "run_id": self.run_id,
+                "official_run_id": self.official_run_id,
                 "run_dir": str(self.run_dir),
                 "model": self.args.model,
                 "dataset": self.args.dataset,
@@ -1033,11 +1473,14 @@ class SweBenchLiteRunner:
                 "official_report_path": str(report_path),
                 "official_eval_log_path": str(self.run_dir / "logs" / "official_eval.log"),
                 "official_instance_log_root": str(
-                    self.swe_bench_dir / "logs" / "run_evaluation" / self.run_id
+                    self.official_dir
+                    / "logs"
+                    / "run_evaluation"
+                    / str(self.official_run_id)
                 ),
                 "predictions_path": str(self.predictions_path),
                 "generation_results_path": str(self.generation_results_path),
-                "per_sample_results_path": str(per_sample_path),
+                "per_sample_results_path": str(self.per_sample_results_path),
                 "run_config_path": str(self.run_config_path),
                 "run_manifest_path": str(self.manifest_path),
             }
@@ -1050,6 +1493,16 @@ class SweBenchLiteRunner:
         )
 
     def run(self) -> None:
+        if self.args.stage == "summarize":
+            try:
+                self._load_artifact_context()
+                self.summarize()
+            except Exception as exc:
+                self._status("summarize", "failed", str(exc))
+                if self.generation_results_path.exists() and self.instance_ids:
+                    self._write_evaluation_failure_results(exc)
+                raise
+            return
         try:
             self.prepare()
         except Exception as exc:
@@ -1058,7 +1511,12 @@ class SweBenchLiteRunner:
         if self.args.stage in {"generate", "all"}:
             self.generate()
         if self.args.stage in {"evaluate", "all"}:
-            self.evaluate()
+            try:
+                self.evaluate()
+            except Exception as exc:
+                if self.generation_results_path.exists():
+                    self._write_evaluation_failure_results(exc)
+                raise
         if self.args.stage in {"summarize", "all"}:
             try:
                 self.summarize()
@@ -1079,7 +1537,7 @@ def build_parser() -> argparse.ArgumentParser:
         choices=("prepare", "generate", "evaluate", "summarize", "all"),
         default="all",
     )
-    parser.add_argument("--swe-bench-dir", type=Path, required=True)
+    parser.add_argument("--swe-bench-dir", type=Path, default=None)
     parser.add_argument("--run-dir", type=Path, required=True)
     parser.add_argument("--run-id", default=None)
     parser.add_argument("--dataset", default="SWE-bench/SWE-bench_Lite")
@@ -1089,7 +1547,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--slice", default=None, help="START:STOP applied after --filter.")
 
     parser.add_argument(
-        "--model", required=True, help="LiteLLM model id, e.g. openai/sparsevllm-swe."
+        "--model", default=None, help="LiteLLM model id, e.g. openai/sparsevllm-swe."
     )
     parser.add_argument(
         "--api-base", default=None, help="OpenAI-compatible API base ending in /v1."
@@ -1140,7 +1598,7 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: Sequence[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
-    if args.served_model_name is None:
+    if args.served_model_name is None and args.model is not None:
         args.served_model_name = args.model.rsplit("/", 1)[-1]
     if args.cost_tracking is None:
         args.cost_tracking = "ignore_errors" if args.api_base else "default"

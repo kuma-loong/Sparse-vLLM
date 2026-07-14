@@ -153,9 +153,10 @@ bash scripts/benchmarks/run_swe_bench_lite.sh \
   --cost-limit 0
 ```
 
-Completed batches are validated and skipped on rerun. Partial mini-SWE-agent
-batch directories are passed back to mini-SWE-agent, whose default behavior is
-to skip completed trajectories. The adapter only merges declared numeric batch
+Completed batches are skipped only after both their predictions and
+`batch_done.json` prediction hash are validated. Partial mini-SWE-agent batch
+directories are passed back to mini-SWE-agent, whose default behavior is to
+skip completed trajectories. The adapter only merges declared numeric batch
 directories, so backup directories cannot introduce duplicate predictions.
 
 ## Separate Generation And Evaluation
@@ -186,14 +187,24 @@ bash scripts/benchmarks/run_swe_bench_lite.sh \
 bash scripts/benchmarks/run_swe_bench_lite.sh \
   --stage evaluate --eval-workers 6 "${COMMON_ARGS[@]}"
 
-# Requires only completed generation and official report artifacts.
+# Requires only completed artifacts in the run directory.
 bash scripts/benchmarks/run_swe_bench_lite.sh \
-  --stage summarize "${COMMON_ARGS[@]}"
+  --stage summarize \
+  --run-dir /path/to/outputs/swe-bench-lite/sparsevllm-lite300
 ```
 
 The adapter rejects semantic configuration changes in an existing run
 directory. Use a new run directory when changing the model, dataset selection,
 step limit, decoding settings, API endpoint, or server configuration.
+For all non-`summarize` stages it also compares the current adapter source,
+SWE-bench source, Python executable, and package versions with
+`run_manifest.json`; source or toolchain drift requires a new run directory.
+
+Official evaluation uses a prediction-bound run id such as
+`<RUN_ID>-pred-<HASH>`. Its report and per-instance cache live under
+`<RUN_DIR>/official/`. The adapter writes an identity marker before allowing
+cache reuse and rejects an existing cache directory that it cannot associate
+with the current prediction and runtime provenance.
 
 The shared adapter fixes `temperature=0`, `top_p=1`, and `max_tokens=4096` by
 default. It records `seed=null` because this OpenAI-compatible route does not
@@ -237,7 +248,9 @@ model:
 Provider-specific request fields, such as DeepSeek thinking controls, are not
 part of the shared adapter configuration. Pass them with a provider-specific
 `--mini-extra-config`; the adapter hashes and snapshots that file. Do not reuse
-such a config for Sparse-vLLM, and never store an API key in it.
+such a config for Sparse-vLLM, and never store credentials in it. Config and
+server-manifest validation rejects sensitive field names, common provider token
+formats, authorization headers, and URL credentials before snapshotting.
 
 ## Outputs
 
@@ -248,12 +261,14 @@ Each run directory contains:
 | `run_config.json` | Immutable semantic experiment configuration and selected instance ids. |
 | `run_manifest.json` | Code revisions, package versions, Python, credential variable name, and runtime policy. |
 | `server_manifest.json` | Snapshot of the local Sparse-vLLM server configuration, when applicable. |
+| `evaluation_identity.json` | Prediction hash, official run id, and runtime-provenance hash used for cache ownership. |
 | `invocations.jsonl` | Stage invocations and operational concurrency settings. |
 | `status.jsonl` | Append-only stage and batch status events. |
 | `batches/*/*traj.json` | Raw mini-SWE-agent trajectories and model responses. |
 | `preds_all.json` | Strictly validated patches in official SWE-bench prediction format. |
 | `generation_results.jsonl` | Parsed generation status and model statistics per instance. |
 | `official/*.json` | Unmodified official SWE-bench aggregate report. |
+| `official/logs/run_evaluation/` | Prediction-bound official per-instance evaluation cache and logs. |
 | `per_sample_results.jsonl` | Normalized per-instance status and official outcome. |
 | `final_summary.json` | Aggregate score, status counts, API calls, cost, and artifact paths. |
 

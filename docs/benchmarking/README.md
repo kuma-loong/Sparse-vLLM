@@ -264,7 +264,8 @@ Notes:
   `CLAW_EVAL_DOCKER_BUILD_ARGS`.
 - Set `CLAW_EVAL_UPDATE_REPO=0` to reuse an existing, pinned external checkout
   without fetching or changing it. The resolved Claw-Eval commit and sandbox
-  image ID/size are saved in `run_manifest.json`.
+  image ID/size are saved in `run_manifest.json`. The checkout must be clean;
+  local source changes fail before evaluation.
 - The shared OpenAI-compatible server is intentionally text-only for this
   benchmark route. Unsupported OpenAI request fields fail instead of being
   silently ignored.
@@ -275,6 +276,11 @@ Notes:
 - `OPENROUTER_API_KEY` is required for judge-enabled runs. Development smoke
   runs may pass `--no-judge`, but those scores are not official leaderboard
   results. Official Claw-Eval uses three trials and Pass^3.
+- The wrapper validates the batch artifacts produced by the current invocation.
+  A low task score is a valid evaluation result, but a missing result, malformed
+  trial, or task-level error makes the wrapper exit nonzero. Raw upstream files,
+  normalized `per_sample_results.jsonl`, and `final_summary.json` remain in the
+  run directory for diagnosis.
 - Default outputs go under
   `<OUTPUT_ROOT>/claw-eval/<RUN_NAME>/`; override `OUTPUT_ROOT` or
   `RUN_NAME` when needed.
