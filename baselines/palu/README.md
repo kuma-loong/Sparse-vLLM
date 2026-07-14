@@ -1,4 +1,7 @@
 # Palu: Compression KV-Cache with Low-Rank Decomposition
+
+> Sparse-vLLM vendors the runtime subset only. The upstream benchmark code is
+> intentionally omitted; use `../../benchmark/` for repository-owned runs.
 [[Paper](https://arxiv.org/abs/2407.21118)]
 
 <div align='center'>
@@ -39,9 +42,8 @@ conda activate Palu
 pip install -r requirements.txt
 ```
 
-3. Install 3rdparty libraries
+3. Install the runtime third-party library
 ```
-pip install -e 3rdparty/lm-evaluation-harness
 pip install -e 3rdparty/fast-hadamard-transform
 ```
 
@@ -60,80 +62,6 @@ python compress.py \
 ```
 
 After executing the above command, a compressed models with decomposed low-rank projection matrices will be dumped into the `{MODEL_NAME}-ratio-{TARGET_RATIO}_gs-{GROUP_SIZE}-{SEARCH_METHOD}-{DECOMPOSE_METHODS}` directory. Here, the dumped models is stored via the huggingface transformers format. 
-
-### Evaluation
-With the compressed model dumped, we can evaluate the performance of the compressed model on the various tasks. We provide the scripts for evaluating the perplexity, zero-shot evaluation, and LongBench. By default, we will keep the compressed KV-Cache in fp16.
-
-#### Perplexity
-To evaluate the perplexity of the compressed model on the `wikitext2` dataset with sequence length 2048, we can use the `ppl_eval.py` script.
-```bash
-python run_ppl_eval.py \
---model_name_or_path /Path/To/Palu/Model \
---datasets wikitext2 \
---seqlen 2048
-```
-To reproduce the evalaution of `c4` perplexity, simply change the `datasets` argument to `c4`. 
-
-To evaluate the performance of quantization being integrated, please pass `--lt_bit {num_bits}` and `--lr_haramard` in the arguments to enable our low-rank aware quantization.
-For example, to evaluate the Palu with 3-bit low-rank aware quantization, please run:
-```bash
-python run_ppl_eval.py \
---model_name_or_path /Path/To/Palu/Model \
---datasets wikitext2 \
---seqlen 4096 \
---lt_bits 3 \
---lt_hadamard 
-```
-
-*Note*: `run_ppl_eval.py` does not support multi-gpu evaluation. If your machine has multiple GPUs, please set `CUDA_VISIBLE_DEVICES` to the desired GPU id.
-
-#### Zero-shot Evaluation
-To run zero-shot evaluations, please use the `run_lm_eval.py` script, which implements a wrapper around the [lm-evaluation-harness](https://github.com/EleutherAI/lm-evaluation-harness/tree/big-refactor) library. 
-
-Before we start, please make sure the `lm-eval==0.4.2` library is installed.
-
-To reproduce the results in our paper, simply execute:
-```bash 
-CUDA_VISIBLE_DEVICES=0 python run_lm_eval.py --model_name_or_path /Path/To/Palu/Model \
---tasks "openbookqa,hellaswag,piqa,arc_easy,arc_challenge,winogrande"
-```
-
-#### Long-Bench
-
-We also provide a script to run the long-bench evaluation on the compressed model. 
-```bash
-CUDA_VISIBLE_DEVICES=0 python run_long_bench.py \
---model_name_or_path /Path/To/Palu/Model
-```
-The scrips will evaluate on "triviaqa", "qasper", "trec", "samsum", "lcc", "repobench-p", "qmsum" and "multi_news" datasets by default.
-User may also leverage the `--datasets` argument to specify the tasks to evaluate. For example, add `--datasets "triviaqa,qasper"` to evaluate on "triviaqa" and "qasper" datasets only.
-
-
-### Latency Evaluation
-
-#### Attention Module
-We provide a script to evaluate the compressed attention module latency under different settings. Below is an example demonstrating how to use this script to evaluate the latency of Palu attention module.
-
-```bash
-CUDA_VISIBLE_DEVICES=0 python run_latency_attention.py \
-    --rank_k 1024 --rank_v 3072 --group_size 4 \
-    --prompt_len 65536 --palu
-```
-
-The above command will run the latency evaluation with the following arguments:
-- `--rank_k`: Set the rank of the key matrix.
-- `--rank_v`: Set the rank of the value matrix.
-- `--group_size`: Set the group size, which is used in the low-rank decomposition.
-- `--prompt_len`: Set the prompt length.
-- `--palu`: Enable Palu compression technique.
-
-#### Reconstruction Kernel
-We also provide a script to evaluate our reconstruction kernel latency. Below is an example demonstrating how to use this script to evaluate the latency of Palu reconstruction kernel.
-
-```bash
-CUDA_VISIBLE_DEVICES=0 python run_latency_kernel.py \
-    --total_rank 1024  --group_size 4
-```
 
 ## Reference
 If you find this work useful, please consider citing our paper:

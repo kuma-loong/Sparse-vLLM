@@ -19,9 +19,7 @@ from datasets import load_dataset
 from eval_utils import DATA_NAME_TO_MAX_NEW_TOKENS, dump_jsonl
 from tqdm import tqdm
 
-sys.path.insert(0, str(REPO_ROOT / "baselines" / "kvzip"))
-
-from results.metric import evaluate_answer
+from kvzip_metrics import evaluate_answer
 
 
 def parse_args():

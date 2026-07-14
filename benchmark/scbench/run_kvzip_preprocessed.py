@@ -20,9 +20,25 @@ from datasets import load_dataset
 from eval_utils import DATA_NAME_TO_MAX_NEW_TOKENS, dump_jsonl
 from tqdm import tqdm
 
-from data.wrapper import get_query
+from kvzip_metrics import evaluate_answer
 from model import ModelKVzip
-from results.metric import evaluate_answer
+
+
+def get_query(task: str, query: str | None = None) -> str:
+    if task == "repeat":
+        return "Repeat the previous context exactly."
+    if task == "qa":
+        if query is None:
+            return "Q: Answer the question based on the previous context."
+        return f"Q: {query}"
+    if task == "reason":
+        return (
+            "Reason and answer the question. You must say the answer in the last "
+            f"sentence beginning with 'The answer is'. Q: {query}"
+        )
+    if task == "summarize":
+        return "Please summarize the previous context."
+    raise ValueError(f"Invalid task: {task}")
 
 
 def parse_args():

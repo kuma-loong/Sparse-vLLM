@@ -4,9 +4,6 @@
 [submodule "kernels/3rdparty/googletest"]
 	path = kernels/3rdparty/googletest
 	url = https://github.com/google/googletest
-[submodule "kernels/3rdparty/nvbench"]
-	path = kernels/3rdparty/nvbench
-	url = https://github.com/NVIDIA/nvbench
 [submodule "kernels/3rdparty/pybind"]
 	path = kernels/3rdparty/pybind
 	url = https://github.com/pybind/pybind11

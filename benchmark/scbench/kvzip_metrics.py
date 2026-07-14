@@ -6,7 +6,7 @@ import re
 import string
 from collections import Counter, defaultdict
 from rouge import Rouge
-from results.repo_qa_utils import compute_score as compute_repoqa_score
+from repo_qa_utils import compute_score as compute_repoqa_score
 
 
 def normalize_answer(s):
@@ -148,8 +148,8 @@ def repoqa_score(preds, refs, subtask=None):
         result["ground_truth"] = refs["ground_truth"][idx]
         pred_list.append(result)
 
-    acc = compute_repoqa_score(pred_list, None, needle_by_repo)
-    acc = acc["scores"]["all"][0.8]["pass@1"]
+    acc = compute_repoqa_score("kvzip", pred_list, None, needle_by_repo)
+    acc = acc["kvzip"]["scores"]["all"][0.8]["pass@1"]
     return acc
 
 

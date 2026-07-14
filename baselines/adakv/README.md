@@ -1,5 +1,8 @@
 # AdaKV
 
+> Sparse-vLLM vendors the runtime subset only. The upstream benchmark code is
+> intentionally omitted; use `../../benchmark/` for repository-owned runs.
+
 AdaKV has been accepted at NeurIPS 2025! 🎉
 
 <p align="center">

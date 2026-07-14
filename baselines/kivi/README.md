@@ -1,5 +1,8 @@
 # KIVI: A Tuning-Free Asymmetric 2bit Quantization for KV Cache
 
+> Sparse-vLLM vendors the runtime subset only. The upstream benchmark code is
+> intentionally omitted; use `../../benchmark/` for repository-owned runs.
+
 Implementation of [ICML24] [KIVI: A Tuning-Free Asymmetric 2bit Quantization for KV Cache](https://arxiv.org/abs/2402.02750)
 
 ## Updates
@@ -8,11 +11,7 @@ Implementation of [ICML24] [KIVI: A Tuning-Free Asymmetric 2bit Quantization for
 - [2024.06.07]: 🎉 KIVI largely inspires the [HuggingFace Transformers KV Cache quantization](https://huggingface.co/docs/transformers/main/en/kv_cache)
 - [2024.06.06]: (Beta) We extensively optimize the codebase in [branch develop](https://github.com/jy-yuan/KIVI/tree/develop) to reduce the latency of KIVI. Note that **you need to reinstall our CUDA implementation** under the ```quant``` folder.
 - [2024.05.01]: 🎉 KIVI has been accepted by ICML 2024! See you in Vienna!
-- [2024.04.12]: We add support for the Mistral model family. The performance of LongChat-7b-v1.5-32K and Mistral-7B-Instruct-v0.2 on 15 tasks from LongBench can be found in [long_bench.md](./docs/long_bench.md).
-
 - [2024.04.05]: We release the code for reproducing our CoQA/TruthfulQA/GSM8K results using LM-Eval. Please check the [README of branch lmeval](https://github.com/jy-yuan/KIVI/tree/lmeval).
-
-- [2024.04.04]: 🔥🔥We add a new 5-digit [passkey example](./long_context_example.py) with 12k context length to show the performance of 2bit KIVI under the long context senario.
 
 - [2024.04.04]: (Beta) We add the flash-attention support for KIVI during the prefill phase. 
 
@@ -99,22 +98,6 @@ We use GSM8K as an example to show how to use KIVI. You can check [example.py](.
 
 ```bash
 python example.py
-```
-
-#### Passkey retrieval example
-
-Passkey retrieval with KIVI. You can check [long_context_example.py](./long_context_example.py):
-
-```bash
-python long_context_example.py
-```
-
-#### Evaluate KIVI on LongBench
-
-We currently support Llama and Mistral family of models. We recently test KIVI on Mistral-7B-Instruct-v0.2 and Longchat-7b-v1.5-32k. Please check [long_bench.md](./docs/long_bench.md) for more details.
-```bash
-bash scripts/long_test.sh {GPU_ID} {K_BITS} {V_BITS} {GROUP_LENGTH} {RESIDUAL_LENGTH} {MODEL_NAME}
-python eval_long_bench.py --model {MODEL} # MODEL is the dir name under pred/ Currently it support Llama family model and Mistral model.
 ```
 
 ## Citation
