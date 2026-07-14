@@ -131,6 +131,27 @@ def test_moe_block_dispatches_only_the_selected_backend():
     pytorch_forward.assert_not_called()
 
 
+def test_moe_backend_warmup_uses_one_local_decode_assignment():
+    config = _config(num_experts_per_tok=3)
+    config.moe_backend = "triton"
+    context = _ep_context(1, 2)
+    model = _instantiate_model(config, context)
+    experts = model.model.layers[0].mlp.experts
+    expected = torch.zeros(1, config.hidden_size)
+
+    with (
+        patch.object(experts, "forward_triton", return_value=expected) as forward,
+        patch("torch.cuda.synchronize") as synchronize,
+    ):
+        model.warmup_moe_backend()
+
+    hidden_states, topk_ids, topk_weights = forward.call_args.args
+    assert hidden_states.shape == (1, config.hidden_size)
+    assert topk_ids.tolist() == [[2, 3, 2]]
+    assert torch.allclose(topk_weights, torch.full((1, 3), 1 / 3))
+    synchronize.assert_called_once()
+
+
 def test_packed_expert_weight_mapping_and_oracle():
     torch.manual_seed(1)
     config = _config()

@@ -21,7 +21,13 @@ class MoeAlignment:
     naive: bool
 
 
-@triton.jit
+@triton.jit(
+    do_not_specialize=[
+        "num_assignments",
+        "local_expert_start",
+        "local_expert_end",
+    ]
+)
 def _count_local_assignments_kernel(
     topk_ids_ptr,
     counts_ptr,
@@ -42,7 +48,13 @@ def _count_local_assignments_kernel(
     tl.atomic_add(counts_ptr + local_expert_ids, 1, mask=is_local)
 
 
-@triton.jit
+@triton.jit(
+    do_not_specialize=[
+        "num_assignments",
+        "local_expert_start",
+        "local_expert_end",
+    ]
+)
 def _fill_local_assignments_kernel(
     topk_ids_ptr,
     write_positions_ptr,
@@ -210,15 +222,16 @@ def moe_align_block_size(
 
 
 def _gemm_launch_config(num_assignments: int, output_size: int) -> dict[str, int]:
-    block_m = 16 if num_assignments <= 256 else 32
-    block_n = 64 if output_size <= 4096 else 128
+    block_m = 16
+    is_small_batch = num_assignments <= 32
+    block_n = 128 if is_small_batch or output_size > 4096 else 64
     return {
         "BLOCK_SIZE_M": block_m,
         "BLOCK_SIZE_N": block_n,
-        "BLOCK_SIZE_K": 64,
+        "BLOCK_SIZE_K": 32 if is_small_batch else 64,
         "GROUP_SIZE_M": 8,
-        "num_warps": 4 if block_m == 16 and block_n == 64 else 8,
-        "num_stages": 3,
+        "num_warps": 4,
+        "num_stages": 4 if is_small_batch else 3,
     }
 
 
@@ -270,7 +283,7 @@ def _prepare_expert_assignment(
     )
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["EM", "num_assignments"])
 def _routed_gemm_kernel(
     a_ptr,
     b_ptr,
@@ -438,11 +451,20 @@ def _routed_gemm(
     )
 
 
-@triton.jit
+@triton.jit(
+    do_not_specialize=[
+        "num_tokens",
+        "local_expert_start",
+        "local_expert_end",
+    ]
+)
 def _moe_sum_kernel(
     inputs_ptr,
+    topk_ids_ptr,
     output_ptr,
     num_tokens,
+    local_expert_start,
+    local_expert_end,
     hidden_size: tl.constexpr,
     top_k: tl.constexpr,
     stride_im,
@@ -450,6 +472,7 @@ def _moe_sum_kernel(
     stride_in,
     stride_om,
     stride_on,
+    FILTER_REMOTE: tl.constexpr,
     BLOCK_SIZE_M: tl.constexpr,
     BLOCK_SIZE_N: tl.constexpr,
 ):
@@ -460,12 +483,23 @@ def _moe_sum_kernel(
     )
     accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
     for topk_slot in tl.static_range(top_k):
+        slot_mask = mask
+        if FILTER_REMOTE:
+            expert_ids = tl.load(
+                topk_ids_ptr + token_offsets * top_k + topk_slot,
+                mask=token_offsets < num_tokens,
+                other=-1,
+            )
+            is_local = (expert_ids >= local_expert_start) & (
+                expert_ids < local_expert_end
+            )
+            slot_mask = mask & is_local[:, None]
         values = tl.load(
             inputs_ptr
             + token_offsets[:, None] * stride_im
             + topk_slot * stride_ik
             + hidden_offsets[None, :] * stride_in,
-            mask=mask,
+            mask=slot_mask,
             other=0.0,
         ).to(tl.float32)
         accumulator += values
@@ -478,9 +512,16 @@ def _moe_sum_kernel(
     )
 
 
-def _moe_sum(inputs: torch.Tensor) -> torch.Tensor:
+def _moe_sum(
+    inputs: torch.Tensor,
+    topk_ids: torch.Tensor,
+    *,
+    num_experts: int,
+    local_expert_start: int,
+    local_expert_end: int,
+) -> torch.Tensor:
     num_tokens, top_k, hidden_size = (int(dim) for dim in inputs.shape)
-    block_m = 1 if num_tokens <= 4 else (4 if num_tokens <= 128 else 8)
+    block_m = 1 if num_tokens <= 4 else 8
     block_n = 256
     output = torch.empty(
         (num_tokens, hidden_size),
@@ -493,8 +534,11 @@ def _moe_sum(inputs: torch.Tensor) -> torch.Tensor:
     )
     _moe_sum_kernel[grid](
         inputs,
+        topk_ids,
         output,
         num_tokens,
+        local_expert_start,
+        local_expert_end,
         hidden_size=hidden_size,
         top_k=top_k,
         stride_im=inputs.stride(0),
@@ -502,6 +546,9 @@ def _moe_sum(inputs: torch.Tensor) -> torch.Tensor:
         stride_in=inputs.stride(2),
         stride_om=output.stride(0),
         stride_on=output.stride(1),
+        FILTER_REMOTE=(
+            local_expert_start != 0 or local_expert_end != int(num_experts)
+        ),
         BLOCK_SIZE_M=block_m,
         BLOCK_SIZE_N=block_n,
         num_warps=4 if block_m <= 4 else 8,
@@ -643,7 +690,7 @@ def fused_moe(
         local_expert_end=local_expert_end,
     )
 
-    w13_output = torch.zeros(
+    w13_output = torch.empty(
         (num_assignments, 2 * intermediate_size),
         dtype=hidden_states.dtype,
         device=hidden_states.device,
@@ -662,7 +709,7 @@ def fused_moe(
 
     w2_config = dict(_gemm_launch_config(num_assignments, hidden_size))
     w2_config["BLOCK_SIZE_M"] = alignment.block_size
-    w2_output = torch.zeros(
+    w2_output = torch.empty(
         (num_assignments, hidden_size),
         dtype=hidden_states.dtype,
         device=hidden_states.device,
@@ -677,4 +724,10 @@ def fused_moe(
         multiply_routing_weight=True,
         launch_config=w2_config,
     )
-    return _moe_sum(w2_output.view(num_tokens, top_k, hidden_size))
+    return _moe_sum(
+        w2_output.view(num_tokens, top_k, hidden_size),
+        topk_ids,
+        num_experts=num_experts,
+        local_expert_start=local_expert_start,
+        local_expert_end=local_expert_end,
+    )

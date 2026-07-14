@@ -248,6 +248,35 @@ class Qwen3MoeForCausalLM(nn.Module):
             self.lm_head.weight.data = self.model.embed_tokens.weight.data
         self._intentionally_skipped_expert_weights: set[str] = set()
 
+    @torch.inference_mode()
+    def warmup_moe_backend(self) -> None:
+        block = self.model.layers[0].mlp
+        if block.moe_backend != "triton":
+            return
+        experts = block.experts
+        top_k = int(self.config.num_experts_per_tok)
+        device = experts.w13_weight.device
+        dtype = experts.w13_weight.dtype
+        hidden_states = torch.zeros(
+            (1, experts.hidden_size),
+            dtype=dtype,
+            device=device,
+        )
+        topk_ids = (
+            torch.arange(top_k, dtype=torch.int64, device=device)
+            .remainder(experts.num_local_experts)
+            .add(experts.local_expert_start)
+            .view(1, top_k)
+        )
+        topk_weights = torch.full(
+            (1, top_k),
+            1.0 / top_k,
+            dtype=dtype,
+            device=device,
+        )
+        experts.forward_triton(hidden_states, topk_ids, topk_weights)
+        torch.cuda.synchronize(device)
+
     def map_weight_name(self, source_weight_name: str) -> str | None:
         match = _EXPERT_SOURCE_RE.match(source_weight_name)
         if match is None:

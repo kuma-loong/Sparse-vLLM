@@ -147,6 +147,8 @@ class ModelRunner:
             tp_rank=self.parallel_context.tp_rank,
             tp_size=self.parallel_context.tp_size,
         )
+        if hf_config.model_type == "qwen3_moe" and config.moe_backend == "triton":
+            self.model.warmup_moe_backend()
         
         self.sampler = Sampler()
 
