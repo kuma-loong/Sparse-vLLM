@@ -5,6 +5,28 @@ import triton
 import triton.language as tl
 
 
+_STAGE1_AUTOTUNE_CONFIGS = [
+    triton.Config({"BLOCK_N": 16}, num_warps=2, num_stages=2),
+    triton.Config({"BLOCK_N": 32}, num_warps=2, num_stages=2),
+    triton.Config({"BLOCK_N": 64}, num_warps=2, num_stages=2),
+    triton.Config({"BLOCK_N": 64}, num_warps=2, num_stages=3),
+]
+
+
+@triton.autotune(
+    configs=_STAGE1_AUTOTUNE_CONFIGS,
+    key=[
+        "AUTOTUNE_SEQ_BUCKET",
+        "AUTOTUNE_PROGRAM_BUCKET",
+        "HEAD_DIM",
+        "BLOCK_SEQ",
+        "GQA_GROUP_SIZE",
+        "Q_HEAD_TILE",
+        "STORE_SCORE_3D",
+        "STORE_SCORE_2D",
+    ],
+    cache_results=True,
+)
 @triton.jit
 def _fwd_kernel_flash_decode_stage1(
     Q,
@@ -38,6 +60,8 @@ def _fwd_kernel_flash_decode_stage1(
     stride_asbs,
     stride_ash,
     stride_asl,
+    AUTOTUNE_SEQ_BUCKET: tl.constexpr,
+    AUTOTUNE_PROGRAM_BUCKET: tl.constexpr,
     GQA_GROUP_SIZE: tl.constexpr,
     Q_TILES_PER_KV_HEAD: tl.constexpr,
     STORE_SCORE_3D: tl.constexpr,
@@ -396,14 +420,6 @@ def _validate_inputs(
     return validated
 
 
-def _kernel_config(head_dim: int, max_len_in_batch: int, total_programs: int):
-    if head_dim >= 96 and total_programs <= 256:
-        return 64, 2, 3
-    if head_dim >= 96 and max_len_in_batch > 4096:
-        return (64, 2, 2) if head_dim <= 128 else (16, 2, 2)
-    return 16, 2, 2
-
-
 def _launch_stage1(
     q,
     k,
@@ -443,9 +459,10 @@ def _launch_stage1(
     group_size = num_q_heads // num_kv_heads
     q_head_tile = min(32, max(16, triton.next_power_of_2(group_size)))
     q_tiles_per_kv_head = triton.cdiv(group_size, q_head_tile)
-    total_programs = q.shape[0] * num_kv_heads * q_tiles_per_kv_head * num_blocks
-    block_n, num_warps, num_stages = _kernel_config(
-        head_dim, max_len_in_batch, total_programs
+    programs_per_block = q.shape[0] * num_kv_heads * q_tiles_per_kv_head
+    seq_bucket = max(1, triton.next_power_of_2(max_len_in_batch + block_seq))
+    program_bucket = max(
+        1, triton.next_power_of_2(programs_per_block * (num_blocks + 1))
     )
     score_3d = attn_score is not None and attn_score.ndim == 3
     score_2d = attn_score is not None and attn_score.ndim == 2
@@ -487,6 +504,8 @@ def _launch_stage1(
         stride_asbs,
         stride_ash,
         stride_asl,
+        AUTOTUNE_SEQ_BUCKET=seq_bucket,
+        AUTOTUNE_PROGRAM_BUCKET=program_bucket,
         GQA_GROUP_SIZE=group_size,
         Q_TILES_PER_KV_HEAD=q_tiles_per_kv_head,
         STORE_SCORE_3D=score_3d,
@@ -494,9 +513,6 @@ def _launch_stage1(
         Q_HEAD_TILE=q_head_tile,
         BLOCK_SEQ=block_seq,
         HEAD_DIM=head_dim,
-        BLOCK_N=block_n,
-        num_warps=num_warps,
-        num_stages=num_stages,
     )
 
 
