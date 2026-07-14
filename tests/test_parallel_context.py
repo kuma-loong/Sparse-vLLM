@@ -158,6 +158,28 @@ def test_parallel_context_rejects_world_size_mismatch():
             init_parallel_context(tp_size=1, ep_size=4, dp_size=1)
 
 
+def test_ep_broadcast_uses_source_world_rank():
+    context = _replicated_ep_context(world_rank=2, world_size=4)
+    tensor = torch.tensor([1.0])
+
+    with patch.object(dist, "broadcast", return_value=None) as broadcast:
+        returned = context.ep_broadcast(tensor, src_ep_rank=1)
+
+    assert returned is tensor
+    broadcast.assert_called_once_with(
+        tensor,
+        src=1,
+        group=context.expert.process_group,
+    )
+
+
+def test_ep_broadcast_rejects_invalid_source_rank():
+    context = _replicated_ep_context()
+
+    with pytest.raises(ValueError, match="EP broadcast source"):
+        context.ep_broadcast(torch.tensor([1.0]), src_ep_rank=4)
+
+
 def test_qwen3_moe_parallel_config_validation(tmp_path):
     with patch("sparsevllm.config.AutoConfig.from_pretrained", return_value=_hf_config()):
         config = Config(model=str(tmp_path), expert_parallel_size=4)

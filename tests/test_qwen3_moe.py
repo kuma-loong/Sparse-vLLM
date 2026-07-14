@@ -131,6 +131,47 @@ def test_moe_block_dispatches_only_the_selected_backend():
     pytorch_forward.assert_not_called()
 
 
+def test_moe_block_reduces_high_precision_and_casts_once():
+    config = _config()
+    config.moe_backend = "triton"
+    context = _ep_context(0, 1)
+    with patch("sparsevllm.models.qwen3_moe.get_parallel_context", return_value=context):
+        block = Qwen3MoeSparseMoeBlock(config)
+    hidden_states = torch.randn(3, config.hidden_size, dtype=torch.bfloat16)
+    local_output = torch.randn(3, config.hidden_size, dtype=torch.float32)
+
+    with (
+        patch.object(
+            block.gate,
+            "forward",
+            return_value=(
+                torch.empty(3, config.num_experts, dtype=torch.bfloat16),
+                torch.empty(3, config.num_experts_per_tok, dtype=torch.bfloat16),
+                torch.empty(3, config.num_experts_per_tok, dtype=torch.int64),
+            ),
+        ),
+        patch.object(block.experts, "forward_triton", return_value=local_output),
+    ):
+        output = block(hidden_states)
+
+    assert output.dtype == hidden_states.dtype
+    assert torch.equal(output, local_output.to(hidden_states.dtype))
+
+
+def test_pytorch_moe_uses_exact_accumulator_for_low_precision_input():
+    config = _config()
+    context = _ep_context(0, 1)
+    with patch("sparsevllm.models.qwen3_moe.get_parallel_context", return_value=context):
+        experts = Qwen3MoePackedExperts(config).to(torch.bfloat16)
+    hidden_states = torch.randn(3, config.hidden_size, dtype=torch.bfloat16)
+    topk_ids = torch.tensor([[0, 1], [2, 3], [1, 2]])
+    topk_weights = torch.rand(3, 2, dtype=torch.bfloat16)
+
+    output = experts.forward_pytorch(hidden_states, topk_ids, topk_weights)
+
+    assert output.dtype == torch.float64
+
+
 def test_moe_backend_warmup_uses_one_local_decode_assignment():
     config = _config(num_experts_per_tok=3)
     config.moe_backend = "triton"

@@ -239,6 +239,64 @@ def test_triton_moe_ep_local_output_matches_oracle_and_ignores_remote_experts():
 
 
 @unittest.skipUnless(torch.cuda.is_available(), "CUDA is required for Triton MoE tests.")
+def test_triton_moe_can_preserve_fp32_topk_sum():
+    torch.manual_seed(15)
+    device = torch.device("cuda")
+    hidden_states = torch.randn(5, 31, device=device, dtype=torch.bfloat16)
+    w13_weight = torch.randn(4, 38, 31, device=device, dtype=torch.bfloat16)
+    w2_weight = torch.randn(4, 31, 19, device=device, dtype=torch.bfloat16)
+    topk_ids = torch.tensor(
+        [[0, 3], [1, 2], [2, 0], [3, 1], [0, 2]],
+        dtype=torch.int64,
+        device=device,
+    )
+    topk_weights = torch.rand(5, 2, device=device, dtype=torch.bfloat16)
+
+    actual = fused_moe(
+        hidden_states,
+        w13_weight,
+        w2_weight,
+        topk_ids,
+        topk_weights,
+        num_experts=4,
+        local_expert_start=0,
+        output_dtype=torch.float32,
+    )
+    torch.cuda.synchronize()
+
+    assert actual.dtype == torch.float32
+
+
+@unittest.skipUnless(torch.cuda.is_available(), "CUDA is required for Triton MoE tests.")
+def test_triton_moe_can_preserve_fp64_topk_sum():
+    torch.manual_seed(16)
+    device = torch.device("cuda")
+    hidden_states = torch.randn(3, 17, device=device, dtype=torch.bfloat16)
+    w13_weight = torch.randn(4, 22, 17, device=device, dtype=torch.bfloat16)
+    w2_weight = torch.randn(4, 17, 11, device=device, dtype=torch.bfloat16)
+    topk_ids = torch.tensor(
+        [[0, 3], [1, 2], [2, 0]],
+        dtype=torch.int64,
+        device=device,
+    )
+    topk_weights = torch.rand(3, 2, device=device, dtype=torch.bfloat16)
+
+    actual = fused_moe(
+        hidden_states,
+        w13_weight,
+        w2_weight,
+        topk_ids,
+        topk_weights,
+        num_experts=4,
+        local_expert_start=0,
+        output_dtype=torch.float64,
+    )
+    torch.cuda.synchronize()
+
+    assert actual.dtype == torch.float64
+
+
+@unittest.skipUnless(torch.cuda.is_available(), "CUDA is required for Triton MoE tests.")
 def test_triton_moe_returns_zero_when_all_assignments_are_remote():
     torch.manual_seed(14)
     device = torch.device("cuda")

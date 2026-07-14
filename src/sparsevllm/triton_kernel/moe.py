@@ -473,6 +473,7 @@ def _moe_sum_kernel(
     stride_om,
     stride_on,
     FILTER_REMOTE: tl.constexpr,
+    FP64_ACCUMULATION: tl.constexpr,
     BLOCK_SIZE_M: tl.constexpr,
     BLOCK_SIZE_N: tl.constexpr,
 ):
@@ -481,7 +482,10 @@ def _moe_sum_kernel(
     mask = (token_offsets[:, None] < num_tokens) & (
         hidden_offsets[None, :] < hidden_size
     )
-    accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
+    if FP64_ACCUMULATION:
+        accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float64)
+    else:
+        accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
     for topk_slot in tl.static_range(top_k):
         slot_mask = mask
         if FILTER_REMOTE:
@@ -501,7 +505,11 @@ def _moe_sum_kernel(
             + hidden_offsets[None, :] * stride_in,
             mask=slot_mask,
             other=0.0,
-        ).to(tl.float32)
+        )
+        if FP64_ACCUMULATION:
+            values = values.to(tl.float64)
+        else:
+            values = values.to(tl.float32)
         accumulator += values
     tl.store(
         output_ptr
@@ -519,13 +527,21 @@ def _moe_sum(
     num_experts: int,
     local_expert_start: int,
     local_expert_end: int,
+    output_dtype: torch.dtype | None = None,
 ) -> torch.Tensor:
     num_tokens, top_k, hidden_size = (int(dim) for dim in inputs.shape)
     block_m = 1 if num_tokens <= 4 else 8
     block_n = 256
+    if output_dtype is None:
+        output_dtype = inputs.dtype
+    if output_dtype not in (*_SUPPORTED_DTYPES, torch.float32, torch.float64):
+        raise TypeError(
+            "Triton MoE sum output must use BF16, FP16, FP32, or FP64, got "
+            f"dtype={output_dtype}."
+        )
     output = torch.empty(
         (num_tokens, hidden_size),
-        dtype=inputs.dtype,
+        dtype=output_dtype,
         device=inputs.device,
     )
     grid = (
@@ -549,6 +565,7 @@ def _moe_sum(
         FILTER_REMOTE=(
             local_expert_start != 0 or local_expert_end != int(num_experts)
         ),
+        FP64_ACCUMULATION=output_dtype == torch.float64,
         BLOCK_SIZE_M=block_m,
         BLOCK_SIZE_N=block_n,
         num_warps=4 if block_m <= 4 else 8,
@@ -659,8 +676,14 @@ def fused_moe(
     *,
     num_experts: int,
     local_expert_start: int,
+    output_dtype: torch.dtype | None = None,
 ) -> torch.Tensor:
-    """Run unquantized routed experts with a generic Triton MoE pipeline."""
+    """Run unquantized routed experts with a generic Triton MoE pipeline.
+
+    The default output dtype matches ``hidden_states``. Expert-parallel callers
+    can request FP32 or FP64 so local TopK sums and the cross-rank reduction
+    round only once after all expert contributions have been combined.
+    """
 
     num_experts = int(num_experts)
     local_expert_start = int(local_expert_start)
@@ -730,4 +753,5 @@ def fused_moe(
         num_experts=num_experts,
         local_expert_start=local_expert_start,
         local_expert_end=local_expert_end,
+        output_dtype=output_dtype,
     )

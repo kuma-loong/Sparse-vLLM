@@ -201,6 +201,25 @@ class ParallelContext:
     ) -> torch.Tensor:
         return self._all_reduce(tensor, self.expert, op)
 
+    def ep_broadcast(
+        self,
+        tensor: torch.Tensor,
+        *,
+        src_ep_rank: int = 0,
+    ) -> torch.Tensor:
+        src_ep_rank = int(src_ep_rank)
+        if not 0 <= src_ep_rank < self.ep_size:
+            raise ValueError(
+                f"EP broadcast source must be in [0, {self.ep_size}), got {src_ep_rank}."
+            )
+        if self.ep_size > 1:
+            dist.broadcast(
+                tensor,
+                src=self.expert.ranks[src_ep_rank],
+                group=self.expert.process_group,
+            )
+        return tensor
+
     def dp_all_reduce(
         self,
         tensor: torch.Tensor,

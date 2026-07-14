@@ -133,7 +133,16 @@ class Qwen3MoePackedExperts(nn.Module):
         topk_ids: torch.Tensor,
         topk_weights: torch.Tensor,
     ) -> torch.Tensor:
-        local_output = torch.zeros_like(hidden_states)
+        accumulation_dtype = (
+            torch.float64
+            if hidden_states.dtype in (torch.bfloat16, torch.float16)
+            else torch.float32
+        )
+        local_output = torch.zeros(
+            hidden_states.shape,
+            dtype=accumulation_dtype,
+            device=hidden_states.device,
+        )
         for local_expert_id in range(self.num_local_experts):
             global_expert_id = self.local_expert_start + local_expert_id
             token_ids, topk_slots = torch.where(topk_ids == global_expert_id)
@@ -146,8 +155,10 @@ class Qwen3MoePackedExperts(nn.Module):
                 F.silu(gate) * up,
                 self.w2_weight[local_expert_id],
             )
-            expert_output = expert_output * topk_weights[token_ids, topk_slots, None]
-            local_output.index_add_(0, token_ids, expert_output.to(local_output.dtype))
+            expert_output = expert_output.to(accumulation_dtype) * topk_weights[
+                token_ids, topk_slots, None
+            ].to(accumulation_dtype)
+            local_output.index_add_(0, token_ids, expert_output)
         return local_output
 
     def forward_triton(
@@ -166,6 +177,7 @@ class Qwen3MoePackedExperts(nn.Module):
             topk_weights,
             num_experts=self.num_experts,
             local_expert_start=self.local_expert_start,
+            output_dtype=torch.float64,
         )
 
 
@@ -187,6 +199,9 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
             raise ValueError(
                 f"Qwen3MoeSparseMoeBlock expects [tokens, hidden], got {tuple(hidden_states.shape)}."
             )
+        debug_enabled = os.getenv("SPARSEVLLM_DEBUG_MOE", "0") == "1"
+        if debug_enabled:
+            self.debug_last_input = hidden_states.detach().clone()
         with profiler.record("moe_router"):
             router_logits, topk_weights, topk_ids = self.gate(hidden_states)
         expert_forward = (
@@ -201,7 +216,6 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
                 topk_weights,
             )
 
-        debug_enabled = os.getenv("SPARSEVLLM_DEBUG_MOE", "0") == "1"
         if debug_enabled:
             self.debug_last_router_logits = router_logits.detach().clone()
             self.debug_last_topk_ids = topk_ids.detach().clone()
@@ -214,6 +228,7 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
 
         with profiler.record("moe_ep_all_reduce"):
             output = self.parallel_context.ep_all_reduce(local_output)
+        output = output.to(hidden_states.dtype)
         if debug_enabled:
             self.debug_last_output = output.detach().clone()
         return output
@@ -222,7 +237,30 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
 class Qwen3MoeDecoderLayer(Qwen3DecoderLayerBase):
     def __init__(self, config: Qwen3MoeConfig) -> None:
         super().__init__(config)
+        self.parallel_context = get_parallel_context()
         self.mlp = Qwen3MoeSparseMoeBlock(config)
+
+    def forward(
+        self,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        residual: torch.Tensor | None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if residual is None:
+            hidden_states, residual = self.input_layernorm(hidden_states), hidden_states
+        else:
+            hidden_states, residual = self.input_layernorm(hidden_states, residual)
+        hidden_states = self.self_attn(positions, hidden_states)
+        hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
+
+        if self.parallel_context.ep_size > 1:
+            with profiler.record("moe_ep_replicated_state_sync"):
+                replicated_state = torch.stack((hidden_states, residual), dim=0)
+                self.parallel_context.ep_broadcast(replicated_state, src_ep_rank=0)
+                hidden_states, residual = replicated_state.unbind(dim=0)
+
+        hidden_states = self.mlp(hidden_states)
+        return hidden_states, residual
 
 
 class Qwen3MoeModel(Qwen3ModelBase):
