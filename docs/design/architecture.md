@@ -75,6 +75,14 @@ chunked long-prefill steps with RawKV offload staging while keeping the same
 public policy name. This is an internal cache-manager implementation detail, not
 a third public prefill policy.
 
+For those methods, the effective offload threshold cannot exceed
+`max_num_batched_tokens`. The optional
+`SPARSEVLLM_LONG_PREFILL_OFFLOAD_MIN_TOKENS` setting may force offload earlier,
+but it cannot force a full-prefill step above the scheduler token cap. Once
+offload is active, each single-sequence step is capped independently by
+`chunk_prefill_size` and `max_num_batched_tokens`; the two settings do not need
+to be equal.
+
 Do not encode a method's prefill policy in benchmark scripts or one-off config
 defaults. Add the method-to-policy mapping to the registry and update
 `tests/test_prefill_schedule_policy.py`.

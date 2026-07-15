@@ -1452,6 +1452,7 @@ class SchedulerPrefillPolicyTest(unittest.TestCase):
             pyramid_layer_ratios=[1.0],
             prefill_schedule_policy=PREFILL_POLICY_LONG_BS1FULL_SHORT_BATCH,
             chunk_prefill_size=1024,
+            max_num_batched_tokens=2048,
         )
         manager.pyramidkv_prefill_staging_num_slots = 4096
         manager.pyramidkv_prefill_staging_kv_cache = torch.empty((2, 4096, 1, 1), dtype=torch.float32)
@@ -1463,6 +1464,31 @@ class SchedulerPrefillPolicyTest(unittest.TestCase):
             self.assertFalse(SnapKVCacheManager.requires_full_prefill_step(manager, seq))
             self.assertFalse(SnapKVCacheManager._should_use_pyramidkv_full_prefill_staging(manager, [seq]))
             self.assertTrue(SnapKVCacheManager._should_use_pyramidkv_long_prefill_offload_staging(manager, [seq]))
+
+    def test_long_prefill_step_cap_forces_offload_below_default_threshold(self):
+        pyramid = object.__new__(SnapKVCacheManager)
+        pyramid.config = SimpleNamespace(
+            vllm_sparse_method="pyramidkv",
+            pyramid_layer_ratios=[1.0],
+            prefill_schedule_policy=PREFILL_POLICY_LONG_BS1FULL_SHORT_BATCH,
+            chunk_prefill_size=4096,
+            max_num_batched_tokens=128000,
+        )
+        pyramid.pyramidkv_prefill_staging_num_slots = 128356
+        pyramid.pyramidkv_prefill_staging_kv_cache = torch.empty((2, 1, 1, 1), dtype=torch.float32)
+
+        deltakv = object.__new__(DeltaKVCacheManager)
+        deltakv.config = SimpleNamespace(
+            prefill_schedule_policy=PREFILL_POLICY_LONG_BS1FULL_SHORT_BATCH,
+            chunk_prefill_size=4096,
+            max_num_batched_tokens=128000,
+        )
+
+        seq = seq_with_len(128000)
+        with patch.dict(os.environ, {}, clear=True):
+            self.assertTrue(SnapKVCacheManager.requires_long_prefill_offload(pyramid, seq))
+            self.assertFalse(SnapKVCacheManager.requires_full_prefill_step(pyramid, seq))
+            self.assertTrue(DeltaKVCacheManager.requires_long_prefill_offload(deltakv, seq))
 
     def test_pyramidkv_long_prefill_offload_restores_prefix_to_staging(self):
         from sparsevllm.engine.cache_manager.raw_kv_offload import RawKVOffloadBuffer
@@ -1845,6 +1871,7 @@ class DeltaKVFullPrefillStagingTest(unittest.TestCase):
         manager.config = SimpleNamespace(
             prefill_schedule_policy=PREFILL_POLICY_LONG_BS1FULL_SHORT_BATCH,
             chunk_prefill_size=2,
+            max_num_batched_tokens=16,
             num_sink_tokens=1,
             num_recent_tokens=1,
             cluster_ratio=0.5,
@@ -2018,6 +2045,7 @@ class DeltaKVFullPrefillStagingTest(unittest.TestCase):
         manager.config = SimpleNamespace(
             prefill_schedule_policy=PREFILL_POLICY_LONG_BS1FULL_SHORT_BATCH,
             chunk_prefill_size=5,
+            max_num_batched_tokens=64,
         )
         manager.deltakv_layer_ids = [0]
         seq = seq_with_len(20)
@@ -2045,6 +2073,7 @@ class DeltaKVFullPrefillStagingTest(unittest.TestCase):
         manager.config = SimpleNamespace(
             prefill_schedule_policy=PREFILL_POLICY_LONG_BS1FULL_SHORT_BATCH,
             chunk_prefill_size=8192,
+            max_num_batched_tokens=16384,
         )
         manager.deltakv_layer_ids = [0]
 
@@ -2516,6 +2545,7 @@ class DeltaKVLessMemoryStorageContractTest(unittest.TestCase):
         manager.config = SimpleNamespace(
             prefill_schedule_policy=PREFILL_POLICY_LONG_BS1FULL_SHORT_BATCH,
             chunk_prefill_size=1024,
+            max_num_batched_tokens=2048,
             enable_full_layer_kivi_quant=True,
             full_layer_kv_quant_bits=4,
         )

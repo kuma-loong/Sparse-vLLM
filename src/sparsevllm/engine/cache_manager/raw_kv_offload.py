@@ -28,6 +28,25 @@ def resolve_long_prefill_offload_min_tokens(default: int = 262144) -> int:
     return max(0, value)
 
 
+def resolve_long_prefill_offload_threshold(
+    max_num_batched_tokens: int,
+    default: int = 262144,
+) -> int:
+    """Resolve the prompt length that must use chunked RawKV offload.
+
+    The environment threshold may force offload earlier, but it cannot allow a
+    full-prefill step to exceed the scheduler's per-step token cap.
+    """
+    max_num_batched_tokens = int(max_num_batched_tokens)
+    if max_num_batched_tokens <= 0:
+        raise ValueError(
+            "max_num_batched_tokens must be > 0 when resolving long-prefill offload, "
+            f"got {max_num_batched_tokens}."
+        )
+    configured_threshold = resolve_long_prefill_offload_min_tokens(default)
+    return min(configured_threshold, max_num_batched_tokens)
+
+
 @dataclass
 class _RawKVEntry:
     k: torch.Tensor | None

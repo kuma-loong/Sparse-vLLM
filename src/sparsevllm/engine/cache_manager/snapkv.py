@@ -15,7 +15,7 @@ from sparsevllm.utils.log import logger, log_level
 from sparsevllm.utils.profiler import profiler
 
 from .base import CacheManager, LayerBatchStates, PrefillComputeView, SparseSelection
-from .raw_kv_offload import RawKVOffloadBuffer, resolve_long_prefill_offload_min_tokens
+from .raw_kv_offload import RawKVOffloadBuffer, resolve_long_prefill_offload_threshold
 
 
 class SnapKVCacheManager(CacheManager):
@@ -140,8 +140,8 @@ class SnapKVCacheManager(CacheManager):
         self._pyramidkv_long_prefill_offload_total_len = 0
         self._pyramidkv_long_prefill_offload_is_last_chunk = False
 
-    def _long_prefill_offload_min_tokens(self) -> int:
-        return resolve_long_prefill_offload_min_tokens()
+    def _long_prefill_offload_threshold(self) -> int:
+        return resolve_long_prefill_offload_threshold(self.config.max_num_batched_tokens)
 
     def requires_long_prefill_offload(self, seq: Sequence) -> bool:
         if not self._pyramidkv_can_use_full_prefill_staging():
@@ -152,7 +152,7 @@ class SnapKVCacheManager(CacheManager):
         remaining = prompt_len - int(seq.num_prefilled_tokens)
         return (
             prompt_len > int(self.config.chunk_prefill_size)
-            and prompt_len >= self._long_prefill_offload_min_tokens()
+            and prompt_len >= self._long_prefill_offload_threshold()
             and prompt_len <= int(self.pyramidkv_prefill_staging_num_slots)
             and remaining > 0
         )

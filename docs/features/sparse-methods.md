@@ -31,7 +31,7 @@ should not redefine method semantics.
 | Policy | Runtime Semantics | Current Default Methods |
 | --- | --- | --- |
 | `all_chunked` | Every prefill request is capped by `chunk_prefill_size` and normal scheduler batch limits. | `vanilla`, `streamingllm`, `attention-sink`, `snapkv`, `quest`, `omnikv` |
-| `long_bs1full_short_batch` | Long requests run as one complete prefill with batch size 1; short requests still use chunked batching. This is for methods whose intended sparse/cache transformation depends on a complete long-prefill representation. | `pyramidkv` and DeltaKV-family methods |
+| `long_bs1full_short_batch` | Long requests are isolated at batch size 1 and normally use complete prefill; their cache manager may request chunked RawKV offload at the effective threshold. Short requests still use chunked batching. | `pyramidkv` and DeltaKV-family methods |
 
 DeltaKV-family methods and PyramidKV keep `long_bs1full_short_batch` as the only
 public policy. For prompts above the long-prefill offload threshold, their cache
@@ -39,6 +39,14 @@ managers use `requires_long_prefill_offload()` to ask the scheduler for chunked
 long-prefill steps backed by RawKV offload staging. That path exists to avoid
 full-prefill activation OOM at extreme context lengths; it is not a separate
 policy name and should not be set in configs.
+
+The effective threshold is the smaller of the configured offload threshold and
+`max_num_batched_tokens`. The configured threshold defaults to `262144` and may
+be overridden with `SPARSEVLLM_LONG_PREFILL_OFFLOAD_MIN_TOKENS`.
+`chunk_prefill_size` remains the per-sequence chunk cap, while
+`max_num_batched_tokens` is the total per-step cap. Keep them separately tuned:
+forcing both to the same large value can reintroduce the activation-memory spike
+that RawKV offload is intended to avoid.
 
 `Config` resolves `None`, empty string, and `auto` to the registry default. An
 explicit policy that does not match the method default fails fast so experiments

@@ -19,7 +19,7 @@ from sparsevllm.layers.rotary_embedding import get_rope, apply_rotary_emb
 from sparsevllm.platforms import device_runtime
 
 from .base import CacheManager, DecodeComputeView, LayerBatchStates, PrefillComputeView, SparseSelection
-from .raw_kv_offload import RawKVOffloadBuffer, resolve_long_prefill_offload_min_tokens
+from .raw_kv_offload import RawKVOffloadBuffer, resolve_long_prefill_offload_threshold
 
 
 @dataclass(frozen=True)
@@ -313,8 +313,8 @@ class DeltaKVCacheManager(CacheManager):
             and remaining > int(self.config.chunk_prefill_size)
         )
 
-    def _long_prefill_offload_min_tokens(self) -> int:
-        return resolve_long_prefill_offload_min_tokens()
+    def _long_prefill_offload_threshold(self) -> int:
+        return resolve_long_prefill_offload_threshold(self.config.max_num_batched_tokens)
 
     def requires_long_prefill_offload(self, seq: Sequence) -> bool:
         if (
@@ -326,7 +326,7 @@ class DeltaKVCacheManager(CacheManager):
         prompt_len = int(seq.num_prompt_tokens)
         return (
             prompt_len > int(self.config.chunk_prefill_size)
-            and prompt_len >= self._long_prefill_offload_min_tokens()
+            and prompt_len >= self._long_prefill_offload_threshold()
             and remaining > 0
         )
 

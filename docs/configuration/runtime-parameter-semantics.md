@@ -659,10 +659,10 @@ queueing, and whether a benchmark measures the intended batch.
 
 | Parameter | Backend | Meaning |
 | --- | --- | --- |
-| `engine_prefill_chunk_size` | Sparse-vLLM | Max prefill chunk scheduled per sequence per step; used in warmup, long-text bucket, admission, memory estimates. |
+| `engine_prefill_chunk_size` | Sparse-vLLM | Max prefill chunk scheduled per sequence per step; used in warmup, long-text bucket, admission, memory estimates. It remains independent of the aggregate step cap. |
 | `hf_prefill_chunk_size` | HF | Wrapper/model chunk size for long input forwarding. Often a large value means "do not chunk". |
 | `max_model_len` | Sparse-vLLM | Hard engine capacity for prompt plus generated tokens. Affects allocation and request validation. |
-| `max_num_batched_tokens` | Sparse-vLLM | Scheduler cap for tokens in one step. Auto-raised to at least `2 * engine_prefill_chunk_size` after normalization. May also be reduced by memory heuristics. |
+| `max_num_batched_tokens` | Sparse-vLLM | Aggregate scheduler cap for tokens in one step. Auto-raised to at least `2 * engine_prefill_chunk_size` after normalization and may be reduced by memory heuristics. For `long_bs1full_short_batch` methods, it also bounds the effective full-prefill/offload threshold, so a prompt at or above the cap uses chunked RawKV offload. |
 | `max_num_seqs_in_batch` | Sparse-vLLM | Max active sequences in a prefill/decode step. |
 | `max_decoding_seqs` | Sparse-vLLM | Max sequences in decode queue. |
 | `gpu_memory_utilization` | Sparse-vLLM | Fraction of total GPU memory used for cache planning. |
