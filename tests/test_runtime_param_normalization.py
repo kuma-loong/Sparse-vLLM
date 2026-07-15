@@ -132,6 +132,14 @@ class RuntimeParamNormalizationTest(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, "Unknown Sparse-vLLM config keys"):
                     LLM("/tmp/unused-model", **{key: [0]})
 
+    def test_removed_omnikv_decode_graph_keys_are_unknown(self):
+        from sparsevllm import LLM
+
+        for key in ("omnikv_decode_cuda_graph", "omnikv_decode_graph"):
+            with self.subTest(key=key):
+                with self.assertRaisesRegex(ValueError, "Unknown Sparse-vLLM config keys"):
+                    LLM("/tmp/unused-model", **{key: True})
+
     def test_hf_config_accepts_canonical_aliases(self):
         cfg = KVQwen2Config()
         cfg.set_infer_args(

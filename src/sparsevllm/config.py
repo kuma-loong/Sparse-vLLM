@@ -598,6 +598,8 @@ class Config:
     # OmniKV Config
     obs_layer_ids: list[int] = field(default=None, init=False)
     full_attn_layers: str | list[int] = "0" # useful for omnikv
+
+    # Decode CUDA Graph Config
     decode_cuda_graph: bool = False
     decode_cuda_graph_capture_sampling: bool = False
     decode_cuda_graph_capture_sizes: str | int | list[int] | tuple[int, ...] | None = "auto"
@@ -610,12 +612,10 @@ class Config:
     decode_cuda_graph_context_policy: str = "current"
     # Optional LRU cap for captured graphs.  None keeps all bucketed graphs.
     decode_cuda_graph_max_cached_graphs: int | None = None
-    omnikv_decode_cuda_graph: bool = False
     sparse_attn_score_dtype: str = "float32"
     decode_graph: bool | None = None
     decode_graph_capture_sampling: bool | None = None
     decode_graph_capture_sizes: str | int | list[int] | tuple[int, ...] | None = None
-    omnikv_decode_graph: bool | None = None
 
     # QuEST Config
     quest_chunk_size: int = 16
@@ -752,18 +752,6 @@ class Config:
 
         if self.decode_graph_capture_sizes is not None:
             self.decode_cuda_graph_capture_sizes = self.decode_graph_capture_sizes
-
-        if self.omnikv_decode_graph is not None:
-            self.omnikv_decode_cuda_graph = _coerce_bool_config(
-                "omnikv_decode_graph",
-                self.omnikv_decode_graph,
-            )
-        else:
-            self.omnikv_decode_cuda_graph = _coerce_bool_config(
-                "omnikv_decode_cuda_graph",
-                self.omnikv_decode_cuda_graph,
-            )
-        self.omnikv_decode_graph = bool(self.omnikv_decode_cuda_graph)
 
     def __post_init__(self):
         if os.getenv("PROFILER_SVLLM"):
@@ -932,12 +920,6 @@ class Config:
                     "decode_cuda_graph_max_cached_graphs must be a positive integer or None, "
                     f"got {self.decode_cuda_graph_max_cached_graphs}."
                 )
-        if self.omnikv_decode_cuda_graph:
-            if self.vllm_sparse_method != "omnikv":
-                raise ValueError(
-                    "omnikv_decode_cuda_graph is only valid with vllm_sparse_method='omnikv'."
-                )
-            self.decode_cuda_graph = True
         if self.decode_cuda_graph_capture_sampling and not self.decode_cuda_graph:
             raise ValueError("decode_cuda_graph_capture_sampling requires decode_cuda_graph=True.")
         self.decode_cuda_graph_context_policy = _normalize_decode_cuda_graph_context_policy(
@@ -989,7 +971,6 @@ class Config:
         self.decode_graph = bool(self.decode_cuda_graph)
         self.decode_graph_capture_sampling = bool(self.decode_cuda_graph_capture_sampling)
         self.decode_graph_capture_sizes = self.decode_cuda_graph_capture_sizes
-        self.omnikv_decode_graph = bool(self.omnikv_decode_cuda_graph)
         if isinstance(self.deltakv_path, str):
             deltakv_path = self.deltakv_path.strip()
             self.deltakv_path = None if deltakv_path.lower() in {"", "none", "null"} else deltakv_path

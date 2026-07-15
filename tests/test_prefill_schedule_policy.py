@@ -568,12 +568,11 @@ class PrefillPolicyConfigTest(unittest.TestCase):
                 self.assertTrue(cfg.decode_cuda_graph)
                 self.assertTrue(is_decode_cuda_graph_supported(cfg.vllm_sparse_method))
 
-        cfg = self.make_config(vllm_sparse_method="omnikv", omnikv_decode_cuda_graph=True)
-        self.assertTrue(cfg.decode_cuda_graph)
-        self.assertTrue(cfg.omnikv_decode_cuda_graph)
-
-        with self.assertRaisesRegex(ValueError, "only valid"):
-            self.make_config(vllm_sparse_method="snapkv", omnikv_decode_cuda_graph=True)
+    def test_removed_omnikv_decode_graph_keys_are_rejected(self):
+        for key in ("omnikv_decode_cuda_graph", "omnikv_decode_graph"):
+            with self.subTest(key=key):
+                with self.assertRaisesRegex(TypeError, key):
+                    self.make_config(vllm_sparse_method="omnikv", **{key: True})
 
     def test_decode_cuda_graph_supports_all_deltakv_methods(self):
         for method in ("deltakv", "deltakv-less-memory", "deltakv-less-memory-cudagraph"):
@@ -636,13 +635,12 @@ class PrefillPolicyConfigTest(unittest.TestCase):
         self.assertTrue(cfg.decode_graph)
         self.assertEqual(cfg.decode_graph_capture_sizes, [1, 2, 4, 8])
 
-    def test_decode_graph_aliases_normalize_to_legacy_fields(self):
+    def test_decode_graph_aliases_normalize_to_canonical_fields(self):
         cfg = self.make_config(
             vllm_sparse_method="omnikv",
             decode_graph=True,
             decode_graph_capture_sizes="1,4",
             decode_graph_capture_sampling=True,
-            omnikv_decode_graph=True,
             max_decoding_seqs=4,
             device_memory_utilization=0.7,
         )
@@ -652,8 +650,6 @@ class PrefillPolicyConfigTest(unittest.TestCase):
         self.assertTrue(cfg.decode_graph_capture_sampling)
         self.assertEqual(cfg.decode_cuda_graph_capture_sizes, [1, 4])
         self.assertEqual(cfg.decode_graph_capture_sizes, [1, 4])
-        self.assertTrue(cfg.omnikv_decode_cuda_graph)
-        self.assertTrue(cfg.omnikv_decode_graph)
         self.assertEqual(cfg.gpu_memory_utilization, 0.7)
         self.assertEqual(cfg.device_memory_utilization, 0.7)
 
