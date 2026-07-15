@@ -198,6 +198,18 @@ def test_qwen3_moe_parallel_config_validation(tmp_path):
         with pytest.raises(ValueError, match="divisible"):
             Config(model=str(tmp_path), expert_parallel_size=4)
 
+    invalid_layout = _hf_config()
+    invalid_layout.decoder_sparse_step = 0
+    with patch("sparsevllm.config.AutoConfig.from_pretrained", return_value=invalid_layout):
+        with pytest.raises(NotImplementedError, match="every decoder layer"):
+            Config(model=str(tmp_path))
+
+    invalid_dtype = _hf_config()
+    invalid_dtype.torch_dtype = torch.float32
+    with patch("sparsevllm.config.AutoConfig.from_pretrained", return_value=invalid_dtype):
+        with pytest.raises(NotImplementedError, match="BF16/FP16 checkpoints"):
+            Config(model=str(tmp_path))
+
 
 def test_dense_config_rejects_expert_or_data_parallelism(tmp_path):
     with patch("sparsevllm.config.AutoConfig.from_pretrained", return_value=_hf_config("qwen3")):

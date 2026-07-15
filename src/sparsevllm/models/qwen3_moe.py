@@ -11,6 +11,7 @@ from transformers import Qwen3MoeConfig
 from sparsevllm.distributed import get_parallel_context
 from sparsevllm.layers.embed_head import ParallelLMHead
 from sparsevllm.models.qwen3 import Qwen3DecoderLayerBase, Qwen3ModelBase
+from sparsevllm.platforms import device_runtime
 from sparsevllm.utils.log import logger
 from sparsevllm.utils.profiler import profiler
 
@@ -313,7 +314,7 @@ class Qwen3MoeForCausalLM(nn.Module):
             device=device,
         )
         experts.forward_triton(hidden_states, topk_ids, topk_weights)
-        torch.cuda.synchronize(device)
+        device_runtime.synchronize()
 
     def map_weight_name(self, source_weight_name: str) -> str | None:
         match = _EXPERT_SOURCE_RE.match(source_weight_name)

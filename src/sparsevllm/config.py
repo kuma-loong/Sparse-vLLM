@@ -5,6 +5,7 @@ from dataclasses import dataclass, field
 from types import SimpleNamespace
 from typing import Any, Union
 
+import torch
 from transformers import AutoConfig
 
 from sparsevllm.method_registry import (
@@ -1151,7 +1152,7 @@ class Config:
                     f"got top_k={top_k}, num_experts={num_experts}."
                 )
             decoder_sparse_step = int(
-                getattr(self.hf_config, "decoder_sparse_step", 1) or 1
+                getattr(self.hf_config, "decoder_sparse_step", 1)
             )
             mlp_only_layers = tuple(
                 int(layer_idx)
@@ -1174,6 +1175,12 @@ class Config:
             if self.quantization_config.enabled:
                 raise NotImplementedError(
                     "Qwen3MoE v1 supports BF16/FP16 expert weights only; quantized MoE is unsupported."
+                )
+            model_dtype = getattr(self.hf_config, "torch_dtype", None)
+            if model_dtype not in {torch.bfloat16, torch.float16}:
+                raise NotImplementedError(
+                    "Qwen3MoE v1 supports BF16/FP16 checkpoints only, "
+                    f"got torch_dtype={model_dtype}."
                 )
             validate_model_runtime_compatibility(
                 model_type=model_type,

@@ -182,7 +182,9 @@ def test_moe_backend_warmup_uses_one_local_decode_assignment():
 
     with (
         patch.object(experts, "forward_triton", return_value=expected) as forward,
-        patch("torch.cuda.synchronize") as synchronize,
+        patch(
+            "sparsevllm.models.qwen3_moe.device_runtime.synchronize"
+        ) as synchronize,
     ):
         model.warmup_moe_backend()
 
