@@ -1,14 +1,18 @@
 import random
 import unittest
+from types import SimpleNamespace
 
 import numpy as np
 
 from sparsevllm.analysis.select_omnikv_full_layers import (
     CalibrationPoint,
     add_topk_to_pair_scores,
+    attention_layer_indices_from_config,
     compute_segment_scores,
+    prepare_fp8_hf_config,
     sample_decode_points,
     select_full_layers_dp,
+    selected_segment_breakdown,
 )
 
 
@@ -73,6 +77,65 @@ class OmniKVFullLayerSelectorTest(unittest.TestCase):
         self.assertEqual(points[-1].query_token_id, 999)
         self.assertTrue(all(point.prefix_len >= 32 for point in points if point.kind == "random"))
         self.assertEqual([point.prefix_len for point in points], sorted(point.prefix_len for point in points))
+
+    def test_hybrid_config_exposes_only_full_attention_candidates(self):
+        config = SimpleNamespace(
+            text_config=SimpleNamespace(
+                num_hidden_layers=8,
+                layer_types=[
+                    "linear_attention",
+                    "full_attention",
+                    "linear_attention",
+                    "full_attention",
+                    "linear_attention",
+                    "full_attention",
+                    "linear_attention",
+                    "full_attention",
+                ],
+            )
+        )
+
+        self.assertEqual(attention_layer_indices_from_config(config), [1, 3, 5, 7])
+
+    def test_segment_breakdown_maps_candidate_positions_to_physical_layers(self):
+        pair_scores = np.zeros((4, 4), dtype=np.int64)
+        pair_scores[0, 1:] = [2, 3, 5]
+        segment_scores = compute_segment_scores(pair_scores)
+
+        breakdown = selected_segment_breakdown(segment_scores, [0, 2], [3, 7, 11, 15])
+
+        self.assertEqual(breakdown[0]["anchor"], 3)
+        self.assertEqual(breakdown[0]["next_full_or_end"], 11)
+        self.assertEqual(breakdown[0]["sparse_layers"], [7])
+        self.assertEqual(breakdown[1]["anchor"], 11)
+        self.assertEqual(breakdown[1]["sparse_layers"], [15])
+
+    def test_fp8_config_removes_only_nonlinear_gate_exclusions(self):
+        config = SimpleNamespace(
+            quantization_config={
+                "quant_method": "fp8",
+                "modules_to_not_convert": [
+                    "model.layers.0.mlp.gate",
+                    "model.layers.0.mlp.shared_expert_gate",
+                    "model.layers.0.mlp.gate_proj",
+                    "lm_head",
+                ],
+            }
+        )
+
+        removed = prepare_fp8_hf_config(config)
+
+        self.assertEqual(
+            removed,
+            [
+                "model.layers.0.mlp.gate",
+                "model.layers.0.mlp.shared_expert_gate",
+            ],
+        )
+        self.assertEqual(
+            config.quantization_config["modules_to_not_convert"],
+            ["model.layers.0.mlp.gate_proj", "lm_head"],
+        )
 
 
 if __name__ == "__main__":

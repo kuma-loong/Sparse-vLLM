@@ -50,6 +50,44 @@ def require_path(path: str | Path, kind: str) -> Path:
     return resolved
 
 
+def text_model_config(config):
+    return getattr(config, "text_config", config)
+
+
+def attention_layer_indices_from_config(config) -> list[int]:
+    text_config = text_model_config(config)
+    num_hidden_layers = int(text_config.num_hidden_layers)
+    layer_types = getattr(text_config, "layer_types", None)
+    if layer_types is None:
+        return list(range(num_hidden_layers))
+    if len(layer_types) != num_hidden_layers:
+        raise ValueError(
+            "layer_types length does not match num_hidden_layers: "
+            f"{len(layer_types)} != {num_hidden_layers}."
+        )
+    indices = [idx for idx, layer_type in enumerate(layer_types) if layer_type == "full_attention"]
+    if not indices:
+        raise ValueError("Model layer_types does not contain any full_attention layer.")
+    return indices
+
+
+def prepare_fp8_hf_config(config) -> list[str]:
+    quantization_config = getattr(config, "quantization_config", None)
+    if not isinstance(quantization_config, dict) or quantization_config.get("quant_method") != "fp8":
+        return []
+    modules = quantization_config.get("modules_to_not_convert")
+    if not isinstance(modules, list):
+        return []
+    removed = [
+        name
+        for name in modules
+        if name.endswith(".mlp.gate") or name.endswith(".mlp.shared_expert_gate")
+    ]
+    if removed:
+        quantization_config["modules_to_not_convert"] = [name for name in modules if name not in removed]
+    return removed
+
+
 def git_text(args: list[str]) -> str:
     return subprocess.check_output(args, text=True).strip()
 
@@ -310,17 +348,28 @@ def select_full_layers_dp(segment_scores: np.ndarray, num_full_layers: int) -> t
     return [0, *suffix], int(score)
 
 
-def selected_segment_breakdown(segment_scores: np.ndarray, selected_layers: list[int]) -> list[dict[str, Any]]:
+def selected_segment_breakdown(
+    segment_scores: np.ndarray,
+    selected_positions: list[int],
+    attention_layer_indices: list[int] | None = None,
+) -> list[dict[str, Any]]:
     num_layers = int(segment_scores.shape[0])
+    layer_indices = attention_layer_indices or list(range(num_layers))
+    if len(layer_indices) != num_layers:
+        raise ValueError(
+            f"attention_layer_indices has {len(layer_indices)} entries for {num_layers} score layers."
+        )
     out = []
-    for idx, anchor in enumerate(selected_layers):
-        next_full = selected_layers[idx + 1] if idx + 1 < len(selected_layers) else num_layers
+    for idx, anchor_position in enumerate(selected_positions):
+        next_position = selected_positions[idx + 1] if idx + 1 < len(selected_positions) else num_layers
         out.append(
             {
-                "anchor": int(anchor),
-                "next_full_or_end": int(next_full),
-                "sparse_layers": list(range(anchor + 1, next_full)),
-                "score": int(segment_scores[anchor, next_full]),
+                "anchor": int(layer_indices[anchor_position]),
+                "next_full_or_end": (
+                    int(layer_indices[next_position]) if next_position < num_layers else int(layer_indices[-1] + 1)
+                ),
+                "sparse_layers": [int(layer) for layer in layer_indices[anchor_position + 1 : next_position]],
+                "score": int(segment_scores[anchor_position, next_position]),
             }
         )
     return out
@@ -372,8 +421,11 @@ def collect_sample_topk(
     num_sink_tokens: int,
     num_recent_tokens: int,
     prefill_chunk_size: int,
+    attention_layer_indices: list[int],
 ) -> tuple[list[dict[str, Any]], np.ndarray, list[dict[str, Any]]]:
-    num_layers = int(model.config.num_hidden_layers)
+    num_layers = len(attention_layer_indices)
+    if num_layers <= 0:
+        raise ValueError("attention_layer_indices must not be empty.")
     pair_scores = np.zeros((num_layers, num_layers), dtype=np.int64)
     point_records: list[dict[str, Any]] = []
     saveable_topk: list[dict[str, Any]] = []
@@ -736,7 +788,9 @@ def run_calibration(args: argparse.Namespace) -> dict[str, Any]:
 
     tokenizer = AutoTokenizer.from_pretrained(str(model_path), trust_remote_code=True)
     base_config = AutoConfig.from_pretrained(str(model_path), trust_remote_code=True)
-    max_length = int(args.max_length or getattr(base_config, "max_position_embeddings", 32000))
+    text_config = text_model_config(base_config)
+    attention_layer_indices = attention_layer_indices_from_config(base_config)
+    max_length = int(args.max_length or getattr(text_config, "max_position_embeddings", 32000))
     if max_length <= 0:
         raise ValueError(f"Resolved max_length must be > 0, got {max_length}.")
 
@@ -745,22 +799,33 @@ def run_calibration(args: argparse.Namespace) -> dict[str, Any]:
     if device.type == "cuda" and not torch.cuda.is_available():
         raise RuntimeError("CUDA device requested, but torch.cuda.is_available() is False.")
 
+    removed_fp8_exclusions = prepare_fp8_hf_config(base_config)
+    model_kwargs = {
+        "config": base_config,
+        "torch_dtype": dtype,
+        "trust_remote_code": True,
+        "attn_implementation": "eager",
+    }
+    if device.type == "cuda":
+        model_kwargs["device_map"] = {"": str(device)}
     model = AutoModelForCausalLM.from_pretrained(
         str(model_path),
-        torch_dtype=dtype,
-        trust_remote_code=True,
-        attn_implementation="eager",
+        **model_kwargs,
     )
-    model.to(device)
+    if device.type != "cuda":
+        model.to(device)
     model.eval()
 
-    num_layers = int(model.config.num_hidden_layers)
-    if args.num_full_layers > num_layers:
-        raise ValueError(f"num_full_layers={args.num_full_layers} exceeds num_hidden_layers={num_layers}.")
+    num_hidden_layers = int(text_config.num_hidden_layers)
+    num_attention_layers = len(attention_layer_indices)
+    if args.num_full_layers > num_attention_layers:
+        raise ValueError(
+            f"num_full_layers={args.num_full_layers} exceeds full-attention candidates={num_attention_layers}."
+        )
 
     samples = read_jsonl_prefix(data_path, args.num_samples)
     rng = random.Random(args.seed)
-    total_pair_scores = np.zeros((num_layers, num_layers), dtype=np.int64)
+    total_pair_scores = np.zeros((num_attention_layers, num_attention_layers), dtype=np.int64)
     all_point_records: list[dict[str, Any]] = []
     all_topk: list[dict[str, Any]] = []
     prompt_records: list[dict[str, Any]] = []
@@ -795,6 +860,7 @@ def run_calibration(args: argparse.Namespace) -> dict[str, Any]:
             num_sink_tokens=args.num_sink_tokens,
             num_recent_tokens=args.num_recent_tokens,
             prefill_chunk_size=args.prefill_chunk_size,
+            attention_layer_indices=attention_layer_indices,
         )
         total_pair_scores += sample_pair_scores
         all_point_records.extend(point_records)
@@ -817,11 +883,12 @@ def run_calibration(args: argparse.Namespace) -> dict[str, Any]:
             torch.cuda.empty_cache()
 
     segment_scores = compute_segment_scores(total_pair_scores)
-    selected_layers, best_score = select_full_layers_dp(segment_scores, args.num_full_layers)
+    selected_positions, best_score = select_full_layers_dp(segment_scores, args.num_full_layers)
+    selected_layers = [attention_layer_indices[position] for position in selected_positions]
     full_layers_str = ",".join(str(layer) for layer in selected_layers)
 
     point_topk_sum = sum(int(record["effective_topk"]) for record in all_point_records)
-    denominator = point_topk_sum * (num_layers - len(selected_layers))
+    denominator = point_topk_sum * (num_attention_layers - len(selected_layers))
     normalized = float(best_score / denominator) if denominator else 0.0
 
     np.save(output_dir / "pair_scores.npy", total_pair_scores)
@@ -837,9 +904,11 @@ def run_calibration(args: argparse.Namespace) -> dict[str, Any]:
     selected_payload = {
         "selected_full_layers": selected_layers,
         "full_attention_layers": full_layers_str,
-        "num_hidden_layers": num_layers,
+        "num_hidden_layers": num_hidden_layers,
+        "attention_layer_indices": attention_layer_indices,
+        "num_attention_layers": num_attention_layers,
         "num_full_layers": int(args.num_full_layers),
-        "forced_full_layers": [0],
+        "forced_full_layers": [attention_layer_indices[0]],
         "topk": int(args.topk),
         "num_sink_tokens": int(args.num_sink_tokens),
         "num_recent_tokens": int(args.num_recent_tokens),
@@ -851,7 +920,11 @@ def run_calibration(args: argparse.Namespace) -> dict[str, Any]:
         "token_coverage_score": int(best_score),
         "coverage_denominator": int(denominator),
         "normalized_token_coverage": normalized,
-        "segment_breakdown": selected_segment_breakdown(segment_scores, selected_layers),
+        "segment_breakdown": selected_segment_breakdown(
+            segment_scores,
+            selected_positions,
+            attention_layer_indices,
+        ),
     }
     json_dump(output_dir / "selected_full_layers.json", selected_payload)
 
@@ -865,7 +938,9 @@ def run_calibration(args: argparse.Namespace) -> dict[str, Any]:
         "prompt_path": str(prompt_path),
         "output_dir": str(output_dir),
         "model_config_model_type": getattr(base_config, "model_type", None),
-        "model_config_num_hidden_layers": getattr(base_config, "num_hidden_layers", None),
+        "model_config_num_hidden_layers": num_hidden_layers,
+        "attention_layer_indices": attention_layer_indices,
+        "removed_fp8_modules_to_not_convert": removed_fp8_exclusions,
         "attention_implementation": "eager",
         "torch_dtype": args.torch_dtype,
         "device": args.device,
