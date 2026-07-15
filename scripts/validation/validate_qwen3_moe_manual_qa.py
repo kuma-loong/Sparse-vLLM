@@ -208,6 +208,7 @@ def main() -> None:
     llm = None
     generated: list[dict[str, Any]] | None = None
     failure: BaseException | None = None
+    cleanup_failure: BaseException | None = None
     started = time.perf_counter()
     try:
         llm = LLM(str(model_path), **engine_kwargs)
@@ -224,7 +225,12 @@ def main() -> None:
         failure = exc
     finally:
         if llm is not None:
-            llm.exit()
+            try:
+                llm.exit()
+            except BaseException as exc:
+                cleanup_failure = exc
+
+    run_failure = failure if failure is not None else cleanup_failure
 
     raw_records = []
     per_sample = []
@@ -235,7 +241,7 @@ def main() -> None:
         automatic_passed = False
         criterion = "model execution failed before this sample produced output"
         reference_matches = None
-        status = "model_failed" if failure is not None else "metric_failed"
+        status = "model_failed" if run_failure is not None else "metric_failed"
         if output is not None:
             automatic_passed, criterion = evaluate_answer(str(case["case_id"]), text)
             if reference_path is not None:
@@ -271,7 +277,7 @@ def main() -> None:
     num_success = sum(record["status"] == "success" for record in per_sample)
     aggregate_status = (
         "model_failed"
-        if failure is not None
+        if run_failure is not None
         else ("success" if num_success == len(per_sample) else "metric_failed")
     )
     raw_payload = {"records": raw_records}
@@ -318,12 +324,24 @@ def main() -> None:
                 if failure is not None
                 else None
             ),
+            "cleanup_failure": (
+                repr(cleanup_failure) if cleanup_failure is not None else None
+            ),
+            "cleanup_traceback": (
+                "".join(traceback.format_exception(cleanup_failure))
+                if cleanup_failure is not None
+                else None
+            ),
             "elapsed_seconds": time.perf_counter() - started,
             "peak_memory_bytes": int(torch.cuda.max_memory_allocated()),
         },
     )
     if failure is not None:
+        if cleanup_failure is not None:
+            failure.add_note(f"Engine cleanup also failed: {cleanup_failure!r}")
         raise failure
+    if cleanup_failure is not None:
+        raise cleanup_failure
     if aggregate_status != "success":
         raise RuntimeError(
             f"Qwen3MoE manual QA failed; inspect {output_dir}."

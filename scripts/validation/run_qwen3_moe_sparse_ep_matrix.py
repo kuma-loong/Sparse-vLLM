@@ -24,6 +24,7 @@ ALL_METHODS = (
     "rkv",
 )
 PREFIX_METHODS = {"vanilla", "omnikv", "quest"}
+SUPPORTED_EP_SIZES = (1, 2, 4, 8)
 
 
 def _write_json(path: Path, payload: Any) -> None:
@@ -53,6 +54,22 @@ def _physical_gpu_count() -> int:
         text=True,
     )
     return len([line for line in result.stdout.splitlines() if line.strip()])
+
+
+def _parse_ep_sizes(value: str) -> tuple[int, ...]:
+    sizes = tuple(int(part.strip()) for part in value.split(",") if part.strip())
+    if not sizes:
+        raise ValueError("--ep-sizes must contain at least one EP size.")
+    if len(sizes) != len(set(sizes)):
+        raise ValueError(f"--ep-sizes contains duplicates: {sizes}.")
+    invalid = sorted(set(sizes) - set(SUPPORTED_EP_SIZES))
+    if invalid:
+        raise ValueError(
+            f"Unsupported EP sizes {invalid}; supported={SUPPORTED_EP_SIZES}."
+        )
+    if sizes[0] != 1:
+        raise ValueError("--ep-sizes must start with EP=1 as the reference topology.")
+    return sizes
 
 
 def _active_compute_processes() -> list[str]:
@@ -145,7 +162,7 @@ def _run_case(
         prefix=prefix,
     )
     env = os.environ.copy()
-    env["CUDA_VISIBLE_DEVICES"] = "0" if ep_size == 1 else "0,1"
+    env["CUDA_VISIBLE_DEVICES"] = ",".join(str(index) for index in range(ep_size))
     env["SPARSEVLLM_MASTER_PORT"] = str(port)
     env["PYTHONPATH"] = str(REPO_ROOT / "src")
     case_name = f"{method}-{'prefix-' if prefix else ''}ep{ep_size}"
@@ -204,11 +221,16 @@ def _require_case_success(record: dict[str, Any]) -> None:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Run the reproducible Qwen3MoE sparse/prefix EP1-vs-EP2 matrix."
+        description="Run a reproducible Qwen3MoE sparse/prefix EP matrix."
     )
     parser.add_argument("--model", required=True)
     parser.add_argument("--output-root", required=True)
     parser.add_argument("--methods", default=",".join(ALL_METHODS))
+    parser.add_argument(
+        "--ep-sizes",
+        default="1,2",
+        help="Comma-separated EP topologies; must start with 1 and use 1/2/4/8.",
+    )
     parser.add_argument("--skip-prefix", action="store_true")
     parser.add_argument("--prompt-len", type=int, default=96)
     parser.add_argument("--output-tokens", type=int, default=12)
@@ -224,14 +246,19 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
+    ep_sizes = _parse_ep_sizes(args.ep_sizes)
     methods = tuple(part.strip() for part in args.methods.split(",") if part.strip())
     invalid = sorted(set(methods) - set(ALL_METHODS))
     if invalid:
         raise ValueError(f"Unknown methods: {invalid}; supported={ALL_METHODS}.")
     if len(methods) != len(set(methods)):
         raise ValueError(f"--methods contains duplicates: {methods}.")
-    if _physical_gpu_count() < 2:
-        raise RuntimeError("The EP validation matrix requires at least two visible physical GPUs.")
+    physical_gpu_count = _physical_gpu_count()
+    if physical_gpu_count < max(ep_sizes):
+        raise RuntimeError(
+            "The EP validation matrix does not have enough physical GPUs: "
+            f"requested EP={max(ep_sizes)}, detected={physical_gpu_count}."
+        )
     output_root = Path(args.output_root).resolve()
     if output_root.exists() and any(output_root.iterdir()):
         raise FileExistsError(f"Output root must be absent or empty: {output_root}.")
@@ -247,9 +274,9 @@ def main() -> None:
         "git_dirty": bool(_git_value("status", "--porcelain")),
         "model": str(Path(args.model).resolve()),
         "methods": list(methods),
-        "hardware_validated_ep_sizes": [1, 2],
-        "unavailable_hardware_topologies": [4, 8],
-        "unavailable_reason": "The requested validation host exposes two H20 GPUs.",
+        "requested_ep_sizes": list(ep_sizes),
+        "detected_physical_gpu_count": physical_gpu_count,
+        "not_run_ep_sizes": sorted(set(SUPPORTED_EP_SIZES) - set(ep_sizes)),
         "cases": records,
     }
     _write_json(output_root / "matrix_results.json", matrix_info)
@@ -261,13 +288,14 @@ def main() -> None:
             for method in methods:
                 if prefix and method not in PREFIX_METHODS:
                     continue
-                label = f"{method}-{'prefix-' if prefix else ''}ep1"
+                reference_ep_size = ep_sizes[0]
+                label = f"{method}-{'prefix-' if prefix else ''}ep{reference_ep_size}"
                 ep1_dir = output_root / label
                 print(f"[matrix] starting {label}", flush=True)
                 ep1 = _run_case(
                     args,
                     method=method,
-                    ep_size=1,
+                    ep_size=reference_ep_size,
                     output_dir=ep1_dir,
                     reference=None,
                     prefix=prefix,
@@ -278,22 +306,23 @@ def main() -> None:
                 _write_json(output_root / "matrix_results.json", matrix_info)
                 _require_case_success(ep1)
 
-                label = f"{method}-{'prefix-' if prefix else ''}ep2"
-                ep2_dir = output_root / label
-                print(f"[matrix] starting {label}", flush=True)
-                ep2 = _run_case(
-                    args,
-                    method=method,
-                    ep_size=2,
-                    output_dir=ep2_dir,
-                    reference=ep1_dir / "raw_outputs.pt",
-                    prefix=prefix,
-                    port=port,
-                )
-                port += 1
-                records.append(ep2)
-                _write_json(output_root / "matrix_results.json", matrix_info)
-                _require_case_success(ep2)
+                for ep_size in ep_sizes[1:]:
+                    label = f"{method}-{'prefix-' if prefix else ''}ep{ep_size}"
+                    ep_dir = output_root / label
+                    print(f"[matrix] starting {label}", flush=True)
+                    candidate = _run_case(
+                        args,
+                        method=method,
+                        ep_size=ep_size,
+                        output_dir=ep_dir,
+                        reference=ep1_dir / "raw_outputs.pt",
+                        prefix=prefix,
+                        port=port,
+                    )
+                    port += 1
+                    records.append(candidate)
+                    _write_json(output_root / "matrix_results.json", matrix_info)
+                    _require_case_success(candidate)
     except BaseException as exc:
         matrix_info["failure"] = repr(exc)
         _write_json(output_root / "matrix_results.json", matrix_info)
@@ -302,6 +331,7 @@ def main() -> None:
     matrix_info["status"] = "success"
     matrix_info["failure"] = None
     matrix_info["num_cases"] = len(records)
+    matrix_info["hardware_validated_ep_sizes"] = list(ep_sizes)
     _write_json(output_root / "matrix_results.json", matrix_info)
     print(f"[matrix] completed {len(records)} cases", flush=True)
 

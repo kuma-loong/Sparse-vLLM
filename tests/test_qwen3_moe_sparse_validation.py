@@ -1,7 +1,9 @@
 from types import SimpleNamespace
 
+import pytest
 import torch
 
+from scripts.validation.run_qwen3_moe_sparse_ep_matrix import _parse_ep_sizes
 from scripts.validation.validate_qwen3_moe_sparse_ep import (
     _cache_max_row_len,
     _compare_reference,
@@ -42,6 +44,14 @@ def _summary(rank: int, start: int, end: int):
 
 def test_rank_sync_accepts_replicated_state_with_sharded_experts():
     assert _rank_sync_error([_summary(0, 0, 64), _summary(1, 64, 128)]) is None
+
+
+def test_matrix_ep_sizes_require_an_ep1_reference():
+    assert _parse_ep_sizes("1,2,4,8") == (1, 2, 4, 8)
+    with pytest.raises(ValueError, match="start with EP=1"):
+        _parse_ep_sizes("2,4")
+    with pytest.raises(ValueError, match="Unsupported EP sizes"):
+        _parse_ep_sizes("1,3")
 
 
 def test_rank_sync_rejects_replicated_state_divergence():

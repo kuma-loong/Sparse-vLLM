@@ -644,7 +644,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--model", required=True)
     parser.add_argument("--output-dir", required=True)
     parser.add_argument("--method", choices=SUPPORTED_METHODS, required=True)
-    parser.add_argument("--expert-parallel-size", type=int, choices=(1, 2), required=True)
+    parser.add_argument(
+        "--expert-parallel-size",
+        type=int,
+        choices=(1, 2, 4, 8),
+        required=True,
+    )
     parser.add_argument("--reference", default=None)
     parser.add_argument("--prompt-len", type=int, default=96)
     parser.add_argument("--output-tokens", type=int, default=12)
@@ -705,6 +710,7 @@ def main() -> None:
     llm = None
     started = time.perf_counter()
     failure: BaseException | None = None
+    cleanup_failure: BaseException | None = None
     reference_metrics = None
     trigger_errors: list[str] = []
     try:
@@ -727,7 +733,10 @@ def main() -> None:
         profiler_stats = profiler.snapshot()
     finally:
         if llm is not None:
-            llm.exit()
+            try:
+                llm.exit()
+            except BaseException as exc:
+                cleanup_failure = exc
 
     rank_errors = [
         step["error"] for step in per_step if step["status"] != "success"
@@ -776,7 +785,12 @@ def main() -> None:
     metric_errors = rank_errors + trigger_errors + prefix_errors
     if reference_metrics is not None and reference_metrics["status"] != "success":
         metric_errors.extend(reference_metrics["errors"])
-    status = "model_failed" if failure is not None else ("metric_failed" if metric_errors else "success")
+    run_failure = failure if failure is not None else cleanup_failure
+    status = (
+        "model_failed"
+        if run_failure is not None
+        else ("metric_failed" if metric_errors else "success")
+    )
 
     raw_outputs = {"steps": raw_steps, "requests": requests}
     torch.save(raw_outputs, output_dir / "raw_outputs.pt")
@@ -836,12 +850,24 @@ def main() -> None:
             "traceback": (
                 "".join(traceback.format_exception(failure)) if failure is not None else None
             ),
+            "cleanup_failure": (
+                repr(cleanup_failure) if cleanup_failure is not None else None
+            ),
+            "cleanup_traceback": (
+                "".join(traceback.format_exception(cleanup_failure))
+                if cleanup_failure is not None
+                else None
+            ),
             "elapsed_seconds": time.perf_counter() - started,
             "peak_memory_bytes": int(torch.cuda.max_memory_allocated()),
         },
     )
     if failure is not None:
+        if cleanup_failure is not None:
+            failure.add_note(f"Engine cleanup also failed: {cleanup_failure!r}")
         raise failure
+    if cleanup_failure is not None:
+        raise cleanup_failure
     if metric_errors:
         raise RuntimeError(
             f"Qwen3MoE sparse EP validation failed; inspect {output_dir}. Errors: {metric_errors}"
