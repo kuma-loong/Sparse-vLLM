@@ -478,6 +478,14 @@ def benchmark_task(method, length, bs, args, results_dict):
         full_admission_reached = not staged_admission
         impossible_full_admission = False
         decode_steps_after_full = 0
+        decode_warmup_steps_after_full = int(getattr(args, "decode_warmup_steps_after_full", 0) or 0)
+        max_decode_steps_after_full = int(getattr(args, "max_decode_steps_after_full", 0) or 0)
+        if decode_warmup_steps_after_full < 0:
+            raise ValueError("decode_warmup_steps_after_full must be non-negative.")
+        if max_decode_steps_after_full > 0 and max_decode_steps_after_full <= decode_warmup_steps_after_full:
+            raise ValueError(
+                "max_decode_steps_after_full must exceed decode_warmup_steps_after_full when both are set."
+            )
         
         t_start = perf_counter()
         decode_started = False
@@ -544,10 +552,11 @@ def benchmark_task(method, length, bs, args, results_dict):
                 decode_times.append(step_dt)
                 decode_tokens += (-num_tokens)
                 if full_admission_reached:
-                    decode_times_after_full.append(step_dt)
-                    decode_tokens_after_full += (-num_tokens)
-                    decode_bs_after_full.append(len(llm.scheduler.decoding))
                     decode_steps_after_full += 1
+                    if decode_steps_after_full > decode_warmup_steps_after_full:
+                        decode_times_after_full.append(step_dt)
+                        decode_tokens_after_full += (-num_tokens)
+                        decode_bs_after_full.append(len(llm.scheduler.decoding))
                 zero_steps = 0
                 # Fallback: if output_len==0/1 or internal behavior changes, ensure TTFT is set.
                 if ttft is None:
@@ -564,9 +573,14 @@ def benchmark_task(method, length, bs, args, results_dict):
                     impossible_full_admission = True
                     break
 
-            max_decode_steps_after_full = int(getattr(args, "max_decode_steps_after_full", 0) or 0)
             if full_admission_reached and max_decode_steps_after_full > 0 and decode_steps_after_full >= max_decode_steps_after_full:
                 break
+
+        if decode_warmup_steps_after_full > 0 and not decode_times_after_full:
+            raise RuntimeError(
+                "No measured decode steps remained after discarding "
+                f"{decode_warmup_steps_after_full} warmup steps."
+            )
 
         print(f'@@@ {decode_tokens=}')
                 
@@ -645,7 +659,9 @@ def benchmark_task(method, length, bs, args, results_dict):
             "admission_wave_size": admission_wave_size if staged_admission else None,
             "wave_decode_gap_steps": wave_decode_gap_steps if staged_admission else None,
             "max_decode_steps_after_full": int(getattr(args, "max_decode_steps_after_full", 0) or 0),
+            "decode_warmup_steps_after_full": decode_warmup_steps_after_full,
             "decode_steps_after_full": int(decode_steps_after_full),
+            "measured_decode_steps_after_full": len(decode_times_after_full),
             "scheduler_preemptions": preemptions,
             "decode_cuda_graph_expected": bool(base_hyper_params.get("decode_cuda_graph")),
             **graph_status,
@@ -728,7 +744,13 @@ def main():
         "--max_decode_steps_after_full",
         type=int,
         default=0,
-        help="If >0 in staged mode, stop after this many decode steps after full admission is reached.",
+        help="If >0, stop after this many decode steps after full admission is reached.",
+    )
+    parser.add_argument(
+        "--decode_warmup_steps_after_full",
+        type=int,
+        default=0,
+        help="Discard this many initial full-admission decode steps from throughput and ITL metrics.",
     )
     parser.add_argument(
         "--wave_decode_gap_steps",
