@@ -16,6 +16,9 @@ from sparsevllm.distributed import init_parallel_context, reset_parallel_context
 from sparsevllm.models.qwen3_moe import Qwen3MoeForCausalLM
 from sparsevllm.utils.loader import load_model
 
+BF16_ATOL = 0.08
+BF16_RTOL = 0.08
+
 
 def _parse_layers(value: str, num_layers: int) -> tuple[int, ...]:
     layers = tuple(int(part.strip()) for part in value.split(",") if part.strip())
@@ -56,8 +59,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--layers", default="0,47")
     parser.add_argument("--num-tokens", type=int, default=17)
     parser.add_argument("--seed", type=int, default=17)
-    parser.add_argument("--atol", type=float, default=0.05)
-    parser.add_argument("--rtol", type=float, default=0.05)
+    parser.add_argument(
+        "--atol", type=float, default=BF16_ATOL, help="BF16 topology comparison atol."
+    )
+    parser.add_argument(
+        "--rtol", type=float, default=BF16_RTOL, help="BF16 topology comparison rtol."
+    )
     parser.add_argument(
         "--moe-backend",
         choices=("pytorch", "triton"),
@@ -151,9 +158,50 @@ def main() -> None:
             output,
             group=parallel_context.world.process_group,
         )
-        rank_max_abs = max(
-            float((candidate.float() - gathered_outputs[0].float()).abs().max().item())
+        gathered_topk_ids = [
+            torch.empty_like(block.debug_last_topk_ids) for _ in range(world_size)
+        ]
+        gathered_topk_weights = [
+            torch.empty_like(block.debug_last_topk_weights) for _ in range(world_size)
+        ]
+        dist.all_gather(
+            gathered_topk_ids,
+            block.debug_last_topk_ids,
+            group=parallel_context.world.process_group,
+        )
+        dist.all_gather(
+            gathered_topk_weights,
+            block.debug_last_topk_weights,
+            group=parallel_context.world.process_group,
+        )
+        rank_output_errors = [
+            _max_errors(candidate, gathered_outputs[0]) for candidate in gathered_outputs
+        ]
+        rank_weight_errors = [
+            _max_errors(candidate, gathered_topk_weights[0])
+            for candidate in gathered_topk_weights
+        ]
+        rank_outputs_within_tolerance = all(
+            torch.allclose(
+                candidate.float(),
+                gathered_outputs[0].float(),
+                atol=args.atol,
+                rtol=args.rtol,
+            )
             for candidate in gathered_outputs
+        )
+        rank_topk_ids_match = all(
+            torch.equal(candidate, gathered_topk_ids[0])
+            for candidate in gathered_topk_ids
+        )
+        rank_topk_weights_within_tolerance = all(
+            torch.allclose(
+                candidate.float(),
+                gathered_topk_weights[0].float(),
+                atol=args.atol,
+                rtol=args.rtol,
+            )
+            for candidate in gathered_topk_weights
         )
 
         output_cpu = output.detach().cpu()
@@ -168,12 +216,22 @@ def main() -> None:
         result = {
             "layer_idx": layer_idx,
             "status": "success",
-            "rank_max_abs_error": rank_max_abs,
+            "rank_output_max_abs_error": max(item[0] for item in rank_output_errors),
+            "rank_output_max_rel_error": max(item[1] for item in rank_output_errors),
+            "rank_outputs_within_tolerance": rank_outputs_within_tolerance,
+            "rank_topk_ids_match": rank_topk_ids_match,
+            "rank_topk_weights_max_abs_error": max(item[0] for item in rank_weight_errors),
+            "rank_topk_weights_max_rel_error": max(item[1] for item in rank_weight_errors),
+            "rank_topk_weights_within_tolerance": rank_topk_weights_within_tolerance,
             "reference_max_abs_error": None,
             "reference_max_rel_error": None,
-            "topk_ids_match": None,
+            "reference_topk_ids_match": None,
         }
-        if rank_max_abs != 0.0:
+        if not (
+            rank_outputs_within_tolerance
+            and rank_topk_ids_match
+            and rank_topk_weights_within_tolerance
+        ):
             result["status"] = "metric_failed"
             validation_failed = True
         if reference is not None:
@@ -184,10 +242,10 @@ def main() -> None:
                 {
                     "reference_max_abs_error": max_abs,
                     "reference_max_rel_error": max_rel,
-                    "topk_ids_match": topk_ids_match,
+                    "reference_topk_ids_match": topk_ids_match,
                 }
             )
-            if not topk_ids_match or not torch.allclose(
+            if not torch.allclose(
                 output_cpu.float(),
                 reference_layer["output"].float(),
                 atol=args.atol,

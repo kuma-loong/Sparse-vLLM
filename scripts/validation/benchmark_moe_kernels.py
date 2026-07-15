@@ -172,9 +172,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--configs", default=None)
     parser.add_argument(
         "--output-dtype",
-        choices=("bfloat16", "float32", "float64"),
+        choices=("bfloat16", "float32"),
         default="bfloat16",
-        help="Final TopK-sum dtype. Qwen3MoE EP uses float64 before its final cast.",
+        help=(
+            "Final TopK-sum dtype. Production Qwen3MoE EP uses bfloat16; "
+            "float32 is a diagnostic mode."
+        ),
     )
     return parser.parse_args()
 
@@ -216,7 +219,6 @@ def main() -> None:
     output_dtype = {
         "bfloat16": torch.bfloat16,
         "float32": torch.float32,
-        "float64": torch.float64,
     }[args.output_dtype]
     num_local_experts = args.num_experts // args.ep_size
     local_expert_start = args.ep_rank * num_local_experts

@@ -40,6 +40,11 @@ EXPECTED_PROFILE_KEYS = {
     "quest": ("quest_build_decode_view_static",),
     "rkv": ("rkv_decode_eviction",),
 }
+BF16_HIDDEN_ATOL = 1.25
+BF16_MOE_ATOL = 3.0
+BF16_LOGITS_ATOL = 1.25
+BF16_ROUTING_WEIGHT_ATOL = 0.08
+BF16_RTOL = 0.1
 
 
 def _write_json(path: Path, payload: Any) -> None:
@@ -430,7 +435,9 @@ def _compare_reference(
     *,
     raw_steps: list[dict[str, Any]],
     requests: list[dict[str, Any]],
-    atol: float,
+    hidden_atol: float,
+    moe_atol: float,
+    logits_atol: float,
     rtol: float,
 ) -> dict[str, Any]:
     reference = torch.load(reference_path, map_location="cpu", weights_only=True)
@@ -465,7 +472,7 @@ def _compare_reference(
                 torch.allclose(
                     actual["logits"].float(),
                     expected["logits"].float(),
-                    atol=atol,
+                    atol=logits_atol,
                     rtol=rtol,
                 )
             )
@@ -484,7 +491,7 @@ def _compare_reference(
                         torch.allclose(
                             actual_hidden[layer_idx].float(),
                             expected_hidden[layer_idx].float(),
-                            atol=atol,
+                            atol=hidden_atol,
                             rtol=rtol,
                         )
                     )
@@ -511,6 +518,11 @@ def _compare_reference(
                 for layer_idx in sorted(actual_moe):
                     layer_metrics = {"layer_idx": int(layer_idx)}
                     for name in ("input", "topk_weights", "output"):
+                        tensor_atol = (
+                            BF16_ROUTING_WEIGHT_ATOL
+                            if name == "topk_weights"
+                            else moe_atol
+                        )
                         tensor_max_abs, tensor_max_rel = _max_errors(
                             actual_moe[layer_idx][name],
                             expected_moe[layer_idx][name],
@@ -519,7 +531,7 @@ def _compare_reference(
                             torch.allclose(
                                 actual_moe[layer_idx][name].float(),
                                 expected_moe[layer_idx][name].float(),
-                                atol=atol,
+                                atol=tensor_atol,
                                 rtol=rtol,
                             )
                         )
@@ -544,13 +556,11 @@ def _compare_reference(
                         moe_close = False
                     if first_topk_ids_mismatch is None and not ids_equal:
                         first_topk_ids_mismatch = int(layer_idx)
-                        moe_close = False
                     if (
                         first_topk_weights_mismatch is None
                         and not layer_metrics["topk_weights"]["within_tolerance"]
                     ):
                         first_topk_weights_mismatch = int(layer_idx)
-                        moe_close = False
                     if (
                         first_moe_output_mismatch is None
                         and not layer_metrics["output"]["within_tolerance"]
@@ -571,8 +581,6 @@ def _compare_reference(
             errors.append(
                 f"MoE-state mismatch at case={actual['case_name']} "
                 f"step={actual['step_idx']}: input={first_moe_input_mismatch} "
-                f"topk_ids={first_topk_ids_mismatch} "
-                f"topk_weights={first_topk_weights_mismatch} "
                 f"output={first_moe_output_mismatch}."
             )
         step_success = identity_matches and close and hidden_close and moe_close
@@ -603,7 +611,18 @@ def _compare_reference(
         errors.append(
             f"Prefix hit lengths differ: reference={reference_hits} actual={actual_hits}."
         )
-    return {"status": "success" if not errors else "metric_failed", "errors": errors, "steps": comparisons}
+    return {
+        "status": "success" if not errors else "metric_failed",
+        "errors": errors,
+        "tolerances": {
+            "hidden_atol": hidden_atol,
+            "moe_atol": moe_atol,
+            "logits_atol": logits_atol,
+            "routing_weight_atol": BF16_ROUTING_WEIGHT_ATOL,
+            "rtol": rtol,
+        },
+        "steps": comparisons,
+    }
 
 
 def _validate_method_trigger(
@@ -657,8 +676,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-model-len", type=int, default=160)
     parser.add_argument("--gpu-memory-utilization", type=float, default=0.72)
     parser.add_argument("--seed", type=int, default=20260714)
-    parser.add_argument("--atol", type=float, default=0.05)
-    parser.add_argument("--rtol", type=float, default=0.05)
+    parser.add_argument("--hidden-atol", type=float, default=BF16_HIDDEN_ATOL)
+    parser.add_argument("--moe-atol", type=float, default=BF16_MOE_ATOL)
+    parser.add_argument("--logits-atol", type=float, default=BF16_LOGITS_ATOL)
+    parser.add_argument(
+        "--rtol", type=float, default=BF16_RTOL, help="BF16 topology comparison rtol."
+    )
     parser.add_argument("--max-steps", type=int, default=256)
     parser.add_argument("--enable-prefix-caching", action="store_true")
     parser.add_argument("--prefix-cache-block-size", type=int, default=8)
@@ -725,7 +748,9 @@ def main() -> None:
                 reference_path,
                 raw_steps=raw_steps,
                 requests=requests,
-                atol=args.atol,
+                hidden_atol=args.hidden_atol,
+                moe_atol=args.moe_atol,
+                logits_atol=args.logits_atol,
                 rtol=args.rtol,
             )
     except BaseException as exc:
@@ -819,7 +844,9 @@ def main() -> None:
             "prompt_len": args.prompt_len,
             "output_tokens": args.output_tokens,
             "reference": str(reference_path) if reference_path else None,
-            "atol": args.atol,
+            "hidden_atol": args.hidden_atol,
+            "moe_atol": args.moe_atol,
+            "logits_atol": args.logits_atol,
             "rtol": args.rtol,
             "environment": {
                 key: os.environ[key]

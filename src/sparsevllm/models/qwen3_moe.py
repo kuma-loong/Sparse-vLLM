@@ -134,16 +134,7 @@ class Qwen3MoePackedExperts(nn.Module):
         topk_ids: torch.Tensor,
         topk_weights: torch.Tensor,
     ) -> torch.Tensor:
-        accumulation_dtype = (
-            torch.float64
-            if hidden_states.dtype in (torch.bfloat16, torch.float16)
-            else torch.float32
-        )
-        local_output = torch.zeros(
-            hidden_states.shape,
-            dtype=accumulation_dtype,
-            device=hidden_states.device,
-        )
+        local_output = torch.zeros_like(hidden_states)
         for local_expert_id in range(self.num_local_experts):
             global_expert_id = self.local_expert_start + local_expert_id
             token_ids, topk_slots = torch.where(topk_ids == global_expert_id)
@@ -156,9 +147,7 @@ class Qwen3MoePackedExperts(nn.Module):
                 F.silu(gate) * up,
                 self.w2_weight[local_expert_id],
             )
-            expert_output = expert_output.to(accumulation_dtype) * topk_weights[
-                token_ids, topk_slots, None
-            ].to(accumulation_dtype)
+            expert_output = expert_output * topk_weights[token_ids, topk_slots, None]
             local_output.index_add_(0, token_ids, expert_output)
         return local_output
 
@@ -178,7 +167,6 @@ class Qwen3MoePackedExperts(nn.Module):
             topk_weights,
             num_experts=self.num_experts,
             local_expert_start=self.local_expert_start,
-            output_dtype=torch.float64,
         )
 
 
@@ -229,7 +217,6 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
 
         with profiler.record("moe_ep_all_reduce"):
             output = self.parallel_context.ep_all_reduce(local_output)
-        output = output.to(hidden_states.dtype)
         if debug_enabled:
             self.debug_last_output = output.detach().clone()
         return output

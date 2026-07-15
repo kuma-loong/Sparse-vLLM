@@ -473,7 +473,6 @@ def _moe_sum_kernel(
     stride_om,
     stride_on,
     FILTER_REMOTE: tl.constexpr,
-    FP64_ACCUMULATION: tl.constexpr,
     BLOCK_SIZE_M: tl.constexpr,
     BLOCK_SIZE_N: tl.constexpr,
 ):
@@ -482,10 +481,7 @@ def _moe_sum_kernel(
     mask = (token_offsets[:, None] < num_tokens) & (
         hidden_offsets[None, :] < hidden_size
     )
-    if FP64_ACCUMULATION:
-        accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float64)
-    else:
-        accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
+    accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
     for topk_slot in tl.static_range(top_k):
         slot_mask = mask
         if FILTER_REMOTE:
@@ -506,10 +502,7 @@ def _moe_sum_kernel(
             mask=slot_mask,
             other=0.0,
         )
-        if FP64_ACCUMULATION:
-            values = values.to(tl.float64)
-        else:
-            values = values.to(tl.float32)
+        values = values.to(tl.float32)
         accumulator += values
     tl.store(
         output_ptr
@@ -534,9 +527,9 @@ def _moe_sum(
     block_n = 256
     if output_dtype is None:
         output_dtype = inputs.dtype
-    if output_dtype not in (*_SUPPORTED_DTYPES, torch.float32, torch.float64):
+    if output_dtype not in (*_SUPPORTED_DTYPES, torch.float32):
         raise TypeError(
-            "Triton MoE sum output must use BF16, FP16, FP32, or FP64, got "
+            "Triton MoE sum output must use BF16, FP16, or FP32, got "
             f"dtype={output_dtype}."
         )
     output = torch.empty(
@@ -565,7 +558,6 @@ def _moe_sum(
         FILTER_REMOTE=(
             local_expert_start != 0 or local_expert_end != int(num_experts)
         ),
-        FP64_ACCUMULATION=output_dtype == torch.float64,
         BLOCK_SIZE_M=block_m,
         BLOCK_SIZE_N=block_n,
         num_warps=4 if block_m <= 4 else 8,
@@ -680,9 +672,8 @@ def fused_moe(
 ) -> torch.Tensor:
     """Run unquantized routed experts with a generic Triton MoE pipeline.
 
-    The default output dtype matches ``hidden_states``. Expert-parallel callers
-    can request FP32 or FP64 so local TopK sums and the cross-rank reduction
-    round only once after all expert contributions have been combined.
+    The default output dtype matches ``hidden_states`` and is the production EP
+    path. Explicit FP32 output is retained for numerical diagnostics.
     """
 
     num_experts = int(num_experts)

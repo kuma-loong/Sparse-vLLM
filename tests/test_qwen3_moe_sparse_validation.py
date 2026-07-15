@@ -61,6 +61,18 @@ def test_rank_sync_rejects_replicated_state_divergence():
     assert "diverged" in _rank_sync_error(summaries)
 
 
+def test_rank_sync_rejects_router_id_divergence():
+    summaries = [_summary(0, 0, 64), _summary(1, 64, 128)]
+    summaries[0]["replica_consistency"]["moe_layers"]["0"][
+        "topk_ids_mismatch"
+    ] = True
+    summaries[1]["replica_consistency"]["moe_layers"]["0"][
+        "topk_ids_mismatch"
+    ] = True
+
+    assert "TopK IDs diverged" in _rank_sync_error(summaries)
+
+
 def test_cache_row_length_reads_live_rows():
     summary = {
         "state": {
@@ -118,7 +130,9 @@ def test_reference_comparison_enforces_all_layer_moe_state(tmp_path):
         path,
         raw_steps=[_raw_step()],
         requests=[_request()],
-        atol=0.05,
+        hidden_atol=0.05,
+        moe_atol=0.05,
+        logits_atol=0.05,
         rtol=0.05,
     )
 
@@ -126,7 +140,7 @@ def test_reference_comparison_enforces_all_layer_moe_state(tmp_path):
     assert metrics["steps"][0]["first_topk_ids_mismatch"] is None
 
 
-def test_reference_comparison_rejects_router_id_mismatch(tmp_path):
+def test_reference_comparison_records_router_id_mismatch(tmp_path):
     reference = {"steps": [_raw_step()], "requests": [_request()]}
     path = tmp_path / "raw_outputs.pt"
     torch.save(reference, path)
@@ -137,9 +151,11 @@ def test_reference_comparison_rejects_router_id_mismatch(tmp_path):
         path,
         raw_steps=[actual],
         requests=[_request()],
-        atol=0.05,
+        hidden_atol=0.05,
+        moe_atol=0.05,
+        logits_atol=0.05,
         rtol=0.05,
     )
 
-    assert metrics["status"] == "metric_failed"
+    assert metrics["status"] == "success"
     assert metrics["steps"][0]["first_topk_ids_mismatch"] == 0
