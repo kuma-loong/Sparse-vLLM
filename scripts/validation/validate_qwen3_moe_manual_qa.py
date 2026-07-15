@@ -8,6 +8,7 @@ import subprocess
 import sys
 import time
 import traceback
+from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Any
 
@@ -90,6 +91,29 @@ def evaluate_answer(case_id: str, text: str) -> tuple[bool, str]:
     raise ValueError(f"Unknown QA case_id={case_id!r}.")
 
 
+def chat_template_token_ids(value: Any) -> list[int]:
+    if isinstance(value, Mapping):
+        if "input_ids" not in value:
+            raise ValueError(
+                "Tokenized chat template returned a mapping without input_ids: "
+                f"keys={sorted(str(key) for key in value)}."
+            )
+        value = value["input_ids"]
+    if isinstance(value, torch.Tensor):
+        value = value.tolist()
+    if (
+        not isinstance(value, Sequence)
+        or isinstance(value, (str, bytes))
+        or not value
+        or any(not isinstance(token_id, int) for token_id in value)
+    ):
+        raise TypeError(
+            "Tokenized chat template must provide a non-empty integer sequence, "
+            f"got {type(value).__name__}: {value!r}."
+        )
+    return [int(token_id) for token_id in value]
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Run a fixed, reviewable Qwen3MoE manual-QA smoke set."
@@ -141,10 +165,12 @@ def main() -> None:
     torch.cuda.reset_peak_memory_stats()
     tokenizer = AutoTokenizer.from_pretrained(str(model_path), use_fast=True)
     prompt_token_ids = [
-        tokenizer.apply_chat_template(
-            [{"role": "user", "content": str(case["prompt"])}],
-            tokenize=True,
-            add_generation_prompt=True,
+        chat_template_token_ids(
+            tokenizer.apply_chat_template(
+                [{"role": "user", "content": str(case["prompt"])}],
+                tokenize=True,
+                add_generation_prompt=True,
+            )
         )
         for case in QA_CASES
     ]
