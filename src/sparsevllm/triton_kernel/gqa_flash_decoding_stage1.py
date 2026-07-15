@@ -295,6 +295,37 @@ def _fwd_kernel_flash_decode_stage1_with_score_2d(
     return
 
 
+def _assert_supported_layout(
+    q,
+    k,
+    v,
+    req_to_tokens,
+    b_req_idx,
+    b_seqlen,
+    mid_out,
+    mid_out_logsumexp,
+):
+    assert q.stride(-1) == 1, f"q head_dim must be contiguous, got stride={q.stride()}."
+    assert k.stride(-1) == 1, f"k head_dim must be contiguous, got stride={k.stride()}."
+    assert v.stride(-1) == 1, f"v head_dim must be contiguous, got stride={v.stride()}."
+    assert k.stride() == v.stride(), (
+        "k and v must have identical layouts because the GQA decode kernel shares their strides, "
+        f"got k_stride={k.stride()} v_stride={v.stride()}."
+    )
+    assert req_to_tokens.stride(-1) == 1, (
+        f"req_to_tokens sequence dimension must be contiguous, got stride={req_to_tokens.stride()}."
+    )
+    assert b_req_idx.stride(0) == 1, f"b_req_idx must be contiguous, got stride={b_req_idx.stride()}."
+    assert b_seqlen.stride(0) == 1, f"b_seqlen must be contiguous, got stride={b_seqlen.stride()}."
+    assert mid_out.stride(-1) == 1, (
+        f"mid_out head_dim must be contiguous, got stride={mid_out.stride()}."
+    )
+    assert mid_out_logsumexp.stride(-1) == 1, (
+        "mid_out_logsumexp block dimension must be contiguous, "
+        f"got stride={mid_out_logsumexp.stride()}."
+    )
+
+
 @torch.no_grad()
 def flash_decode_stage1(
     q, k, v, Req_to_tokens, B_req_idx, B_Seqlen, max_len_in_batch, mid_out, mid_out_logsumexp, block_seq
@@ -305,7 +336,8 @@ def flash_decode_stage1(
     # shape constraints
     Lq, Lk = q.shape[-1], k.shape[-1]
     assert Lq == Lk
-    assert Lk in {16, 32, 64, 128}
+    assert Lk in {16, 32, 64, 128, 256}
+    _assert_supported_layout(q, k, v, Req_to_tokens, B_req_idx, B_Seqlen, mid_out, mid_out_logsumexp)
     sm_scale = 1.0 / (Lk ** 0.5)
     batch, kv_head_num = B_req_idx.shape[0], k.shape[1]
     grid = (batch, kv_head_num, triton.cdiv(max_len_in_batch, BLOCK_SEQ))
@@ -360,9 +392,9 @@ def flash_decode_stage1_with_score(
     assert BLOCK_SEQ % BLOCK_N == 0
     Lq, Lk = q.shape[-1], k.shape[-1]
     assert Lq == Lk
-    assert Lk in {16, 32, 64, 128}
+    assert Lk in {16, 32, 64, 128, 256}
     assert q.dtype == k.dtype and k.dtype == v.dtype
-    assert q.stride(-1) == 1 and k.stride(-1) == 1 and v.stride(-1) == 1
+    _assert_supported_layout(q, k, v, Req_to_tokens, B_req_idx, B_Seqlen, mid_out, mid_out_logsumexp)
     sm_scale = 1.0 / (Lk**0.5)
     batch, kv_head_num = B_req_idx.shape[0], k.shape[1]
     grid = (batch, kv_head_num, triton.cdiv(max_len_in_batch, BLOCK_SEQ))

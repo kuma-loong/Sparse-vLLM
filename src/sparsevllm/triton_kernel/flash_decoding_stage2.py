@@ -28,11 +28,11 @@ def _fwd_kernel_flash_decode_stage2(
     max_logic = -float("inf")
     acc = tl.zeros([BLOCK_DMODEL], dtype=tl.float32)
 
-    offs_v = cur_batch * stride_mid_ob + cur_head * stride_mid_oh + offs_d
+    offs_v = cur_batch * stride_mid_ob + cur_head * stride_mid_oh + offs_d * stride_mid_od
     offs_logic = cur_batch * stride_mid_o_eb + cur_head * stride_mid_o_eh
     for block_seq_n in range(0, block_n_size, 1):
         tv = tl.load(Mid_O + offs_v + block_seq_n * stride_mid_os)
-        tlogic = tl.load(Mid_O_LogExpSum + offs_logic + block_seq_n)
+        tlogic = tl.load(Mid_O_LogExpSum + offs_logic + block_seq_n * stride_mid_o_es)
         new_max_logic = tl.maximum(tlogic, max_logic)
         
         old_scale = tl.exp(max_logic - new_max_logic)
@@ -42,14 +42,15 @@ def _fwd_kernel_flash_decode_stage2(
         sum_exp = sum_exp * old_scale + exp_logic
         max_logic = new_max_logic
     
-    tl.store(O + cur_batch * stride_obs + cur_head * stride_oh + offs_d, acc / sum_exp)
+    tl.store(O + cur_batch * stride_obs + cur_head * stride_oh + offs_d * stride_od, acc / sum_exp)
     return
 
 
 @torch.no_grad()
 def flash_decode_stage2(mid_out, mid_out_logexpsum, B_Seqlen, O, block_seq):
     Lk = mid_out.shape[-1]
-    assert Lk in {16, 32, 64, 128}
+    assert Lk in {16, 32, 64, 128, 256}
+    assert B_Seqlen.stride(0) == 1, f"B_Seqlen must be contiguous, got stride={B_Seqlen.stride()}."
     batch, head_num = mid_out.shape[0], mid_out.shape[1]
     grid = (batch, head_num)
     if (
@@ -74,7 +75,7 @@ def flash_decode_stage2(mid_out, mid_out_logexpsum, B_Seqlen, O, block_seq):
         O.stride(0), O.stride(1), O.stride(2),
         BLOCK_SEQ=block_seq,
         BLOCK_DMODEL=Lk,
-        num_warps=4,
+        num_warps=8 if Lk == 256 else 4,
         num_stages=2,
     )
     return
