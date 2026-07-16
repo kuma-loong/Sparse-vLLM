@@ -160,6 +160,44 @@ def test_moe_block_reduces_in_activation_dtype():
     assert torch.equal(output, local_output)
 
 
+def test_decoder_layer_broadcasts_attention_output_before_post_norm():
+    config = _config()
+    context = _ep_context(0, 2)
+    model = _instantiate_model(config, context)
+    layer = model.model.layers[0]
+    hidden_states = torch.randn(3, config.hidden_size)
+    residual = torch.randn_like(hidden_states)
+    calls = []
+
+    with (
+        patch.object(
+            layer.input_layernorm,
+            "forward",
+            return_value=(hidden_states, residual),
+        ),
+        patch.object(layer.self_attn, "forward", return_value=hidden_states),
+        patch.object(
+            ParallelContext,
+            "ep_broadcast",
+            side_effect=lambda state, **_: calls.append(("broadcast", state.shape)),
+        ),
+        patch.object(
+            layer.post_attention_layernorm,
+            "forward",
+            side_effect=lambda state, res: (
+                calls.append(("post_norm", state.shape)) or (state, res)
+            ),
+        ),
+        patch.object(layer.mlp, "forward", return_value=hidden_states),
+    ):
+        layer(torch.arange(3), hidden_states, residual)
+
+    assert calls == [
+        ("broadcast", hidden_states.shape),
+        ("post_norm", hidden_states.shape),
+    ]
+
+
 def test_pytorch_moe_returns_activation_dtype_for_low_precision_input():
     config = _config()
     context = _ep_context(0, 1)

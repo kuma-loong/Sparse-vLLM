@@ -261,13 +261,14 @@ class Qwen3MoeDecoderLayer(Qwen3DecoderLayerBase):
         else:
             hidden_states, residual = self.input_layernorm(hidden_states, residual)
         hidden_states = self.self_attn(positions, hidden_states)
-        hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
 
         if self.parallel_context.ep_size > 1:
-            replicated_state = torch.stack((hidden_states, residual), dim=0)
-            self.parallel_context.ep_broadcast(replicated_state, src_ep_rank=0)
-            hidden_states, residual = replicated_state.unbind(dim=0)
+            # The incoming residual is already replicated, so syncing attention
+            # output before RMSNorm preserves the old post-norm state with half
+            # the broadcast payload.
+            self.parallel_context.ep_broadcast(hidden_states, src_ep_rank=0)
 
+        hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
         hidden_states = self.mlp(hidden_states)
         return hidden_states, residual
 
