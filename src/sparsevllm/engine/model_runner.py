@@ -262,6 +262,12 @@ class ModelRunner:
 
     def exit(self):
         """释放资源并注销分布式进程组"""
+        # Graph replay is asynchronous on every rank. Drain and release captured
+        # NCCL work before entering the shutdown barrier or destroying its group.
+        self.platform.synchronize()
+        if self.config.decode_cuda_graph:
+            self.decode_cuda_graph_runner.clear_captured_graphs()
+            self.platform.synchronize()
         if self.world_size > 1:
             self.shm.close()
             self.parallel_context.world_barrier(
@@ -269,7 +275,6 @@ class ModelRunner:
             )
             if self.rank == 0:
                 self.shm.unlink()
-        self.platform.synchronize()
         reset_parallel_context()
         dist.destroy_process_group()
 

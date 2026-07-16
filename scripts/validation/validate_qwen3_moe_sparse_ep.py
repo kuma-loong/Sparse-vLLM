@@ -155,15 +155,17 @@ def _cache_max_row_len(summary: dict[str, Any]) -> int | None:
 
 
 def _engine_kwargs(args: argparse.Namespace) -> dict[str, Any]:
+    decode_cuda_graph = bool(args.decode_cuda_graph)
+    max_num_seqs = 2 if args.enable_prefix_caching else 1
     kwargs: dict[str, Any] = {
         "sparse_method": args.method,
-        "enforce_eager": True,
-        "decode_cuda_graph": False,
+        "enforce_eager": not decode_cuda_graph,
+        "decode_cuda_graph": decode_cuda_graph,
         "gpu_memory_utilization": args.gpu_memory_utilization,
         "engine_prefill_chunk_size": args.chunk_prefill_size,
         "max_model_len": args.max_model_len,
-        "max_num_seqs_in_batch": 2 if args.enable_prefix_caching else 1,
-        "max_decoding_seqs": 2 if args.enable_prefix_caching else 1,
+        "max_num_seqs_in_batch": max_num_seqs,
+        "max_decoding_seqs": max_num_seqs,
         "tensor_parallel_size": 1,
         "expert_parallel_size": args.expert_parallel_size,
         "data_parallel_size": 1,
@@ -190,6 +192,12 @@ def _engine_kwargs(args: argparse.Namespace) -> dict[str, Any]:
         "prefix_cache_max_blocks": args.prefix_cache_max_blocks,
         "prefix_cache_salt": "qwen3-moe-ep-validation-v1",
     }
+    if decode_cuda_graph:
+        kwargs.update(
+            decode_cuda_graph_capture_sizes=[max_num_seqs],
+            decode_cuda_graph_context_sizes=[args.max_model_len],
+            decode_cuda_graph_context_policy="requested",
+        )
     return kwargs
 
 
@@ -683,6 +691,7 @@ def parse_args() -> argparse.Namespace:
         "--rtol", type=float, default=BF16_RTOL, help="BF16 topology comparison rtol."
     )
     parser.add_argument("--max-steps", type=int, default=256)
+    parser.add_argument("--decode-cuda-graph", action="store_true")
     parser.add_argument("--enable-prefix-caching", action="store_true")
     parser.add_argument("--prefix-cache-block-size", type=int, default=8)
     parser.add_argument("--prefix-cache-max-blocks", type=int, default=32)

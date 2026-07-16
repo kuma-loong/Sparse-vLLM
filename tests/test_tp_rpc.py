@@ -245,6 +245,51 @@ def test_model_runner_reset_after_warmup_resets_local_runtime_state():
     assert calls == ["runtime"]
 
 
+def test_model_runner_exit_drains_graphs_before_barrier():
+    calls = []
+    runner = object.__new__(ModelRunner)
+    runner.platform = SimpleNamespace(
+        synchronize=lambda: calls.append("sync"),
+        barrier_device_ids=lambda rank: [rank],
+    )
+    runner.config = SimpleNamespace(decode_cuda_graph=True)
+    runner.decode_cuda_graph_runner = SimpleNamespace(
+        clear_captured_graphs=lambda: calls.append("clear_graphs")
+    )
+    runner.world_size = 2
+    runner.rank = 0
+    runner.shm = SimpleNamespace(
+        close=lambda: calls.append("close_shm"),
+        unlink=lambda: calls.append("unlink_shm"),
+    )
+    runner.parallel_context = SimpleNamespace(
+        world_barrier=lambda **_: calls.append("barrier")
+    )
+
+    with (
+        patch(
+            "sparsevllm.engine.model_runner.reset_parallel_context",
+            side_effect=lambda: calls.append("reset"),
+        ),
+        patch(
+            "sparsevllm.engine.model_runner.dist.destroy_process_group",
+            side_effect=lambda: calls.append("destroy"),
+        ),
+    ):
+        ModelRunner.exit(runner)
+
+    assert calls == [
+        "sync",
+        "clear_graphs",
+        "sync",
+        "close_shm",
+        "barrier",
+        "unlink_shm",
+        "reset",
+        "destroy",
+    ]
+
+
 def test_tp_worker_decode_skips_rank0_sampling_path():
     calls: list[str] = []
 

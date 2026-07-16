@@ -236,7 +236,12 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
             local_mask = (topk_ids >= self.experts.local_expert_start) & (
                 topk_ids < self.experts.local_expert_end
             )
-            self.debug_last_local_hit_count = int(local_mask.sum().item())
+            local_hit_count = local_mask.sum()
+            self.debug_last_local_hit_count = (
+                local_hit_count
+                if torch.cuda.is_available() and torch.cuda.is_current_stream_capturing()
+                else int(local_hit_count.item())
+            )
 
         output = self.parallel_context.ep_all_reduce(local_output)
         if debug_enabled:

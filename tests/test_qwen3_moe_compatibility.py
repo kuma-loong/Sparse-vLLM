@@ -35,6 +35,8 @@ def test_qwen3_moe_registry_lists_only_v1_validated_combinations():
         "rkv",
     }
     assert QWEN3_MOE_EP_COMPATIBILITY.prefix_cache_methods == {"", "omnikv", "quest"}
+    assert QWEN3_MOE_EP_COMPATIBILITY.requires_eager is False
+    assert QWEN3_MOE_EP_COMPATIBILITY.decode_cuda_graph_methods == {""}
 
 
 @pytest.mark.parametrize("method", sorted(QWEN3_MOE_EP_COMPATIBILITY.sparse_methods))
@@ -60,13 +62,15 @@ def test_qwen3_moe_registry_rejects_conditional_and_out_of_scope_methods():
         _validate("deltakv")
 
 
-def test_qwen3_moe_registry_rejects_unvalidated_parallel_and_graph_modes():
+def test_qwen3_moe_registry_rejects_unvalidated_parallel_modes():
     with pytest.raises(ValueError, match="requires TP=1 and DP=1"):
         _validate(tensor_parallel_size=2)
-    with pytest.raises(ValueError, match="enforce_eager=True"):
-        _validate(enforce_eager=False)
-    with pytest.raises(ValueError, match="does not support decode_cuda_graph"):
-        _validate(decode_cuda_graph=True)
+
+
+def test_qwen3_moe_registry_accepts_decode_cuda_graph():
+    assert _validate(enforce_eager=False, decode_cuda_graph=True) is QWEN3_MOE_EP_COMPATIBILITY
+    with pytest.raises(ValueError, match="validated only for 'vanilla'"):
+        _validate("omnikv", enforce_eager=False, decode_cuda_graph=True)
 
 
 def test_dense_models_do_not_inherit_qwen3_moe_compatibility():

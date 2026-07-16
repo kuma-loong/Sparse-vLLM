@@ -53,6 +53,7 @@ class ModelRuntimeCompatibility:
     sparse_methods: frozenset[str]
     prefix_cache_methods: frozenset[str]
     requires_eager: bool = True
+    decode_cuda_graph_methods: frozenset[str] = frozenset()
 
 
 QWEN3_MOE_EP_COMPATIBILITY = ModelRuntimeCompatibility(
@@ -69,6 +70,8 @@ QWEN3_MOE_EP_COMPATIBILITY = ModelRuntimeCompatibility(
         }
     ),
     prefix_cache_methods=frozenset({"", "omnikv", "quest"}),
+    requires_eager=False,
+    decode_cuda_graph_methods=frozenset({""}),
 )
 
 MODEL_RUNTIME_COMPATIBILITY = {
@@ -163,8 +166,15 @@ def validate_model_runtime_compatibility(
         )
     if compatibility.requires_eager and not bool(enforce_eager):
         raise ValueError(f"{model_type} v1 requires enforce_eager=True.")
-    if bool(decode_cuda_graph):
-        raise ValueError(f"{model_type} v1 does not support decode_cuda_graph.")
+    if bool(decode_cuda_graph) and method not in compatibility.decode_cuda_graph_methods:
+        supported = ", ".join(
+            "'vanilla'" if item == "" else repr(item)
+            for item in sorted(compatibility.decode_cuda_graph_methods)
+        )
+        raise ValueError(
+            f"{model_type} v1 decode_cuda_graph is validated only for {supported}; "
+            f"got method={method!r}."
+        )
     if method == "skipkv":
         raise NotImplementedError(
             "Qwen3MoE + SkipKV requires a Qwen3MoE-matched steering asset and validation; "

@@ -7,9 +7,32 @@ from scripts.validation.run_qwen3_moe_sparse_ep_matrix import _parse_ep_sizes
 from scripts.validation.validate_qwen3_moe_sparse_ep import (
     _cache_max_row_len,
     _compare_reference,
+    _engine_kwargs,
     _rank_sync_error,
     _validate_method_trigger,
 )
+
+
+def test_validation_graph_config_uses_one_requested_context_bucket():
+    args = SimpleNamespace(
+        method="vanilla",
+        decode_cuda_graph=True,
+        gpu_memory_utilization=0.72,
+        chunk_prefill_size=64,
+        max_model_len=160,
+        expert_parallel_size=2,
+        enable_prefix_caching=False,
+        prefix_cache_block_size=8,
+        prefix_cache_max_blocks=32,
+    )
+
+    kwargs = _engine_kwargs(args)
+
+    assert kwargs["enforce_eager"] is False
+    assert kwargs["decode_cuda_graph"] is True
+    assert kwargs["decode_cuda_graph_capture_sizes"] == [1]
+    assert kwargs["decode_cuda_graph_context_sizes"] == [160]
+    assert kwargs["decode_cuda_graph_context_policy"] == "requested"
 
 
 def _summary(rank: int, start: int, end: int):
