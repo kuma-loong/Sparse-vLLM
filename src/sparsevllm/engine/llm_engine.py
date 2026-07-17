@@ -194,7 +194,7 @@ class LLMEngine:
         ctx = mp.get_context("spawn")
         tp_shm_name = make_tp_shm_name() if config.world_size > 1 else None
         for i in range(1, config.world_size):
-            event = ctx.Event()
+            event = (ctx.Event(), ctx.Event())
             # 为每一个非零 Rank 启动一个独立的 ModelRunner 进程
             process = ctx.Process(target=ModelRunner, args=(config, i, event, tp_shm_name))
             process.start()

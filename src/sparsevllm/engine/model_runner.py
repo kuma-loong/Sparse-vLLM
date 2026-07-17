@@ -51,6 +51,10 @@ except ImportError as exc:
 
 
 TP_SHM_NAME_PREFIX = "sparsevllm_"
+TP_SHM_SIZE = 2**20
+TP_RUN_STATUS_PENDING = 0
+TP_RUN_STATUS_SUCCESS = 1
+TP_RUN_STATUS_FAILED = 2
 PREFIX_CACHE_CONTROL_RPC_METHODS = {
     "prefix_cache_inspect",
     "prefix_cache_match",
@@ -75,7 +79,13 @@ class ModelRunner:
     主要职责：权重加载、显存分配 (KV Cache)、槽位管理 (Rank-Local)、前向计算。
     """
 
-    def __init__(self, config: Config, rank: int, event: Event | list[Event], tp_shm_name: str | None = None):
+    def __init__(
+        self,
+        config: Config,
+        rank: int,
+        event: tuple[Event, Event] | list[tuple[Event, Event]],
+        tp_shm_name: str | None = None,
+    ):
         self.config = config
         # Inference-only engine: disable autograd graph construction globally in this process.
         # (This is process-local; must be set inside every spawned TP worker.)
@@ -248,7 +258,7 @@ class ModelRunner:
                 raise ValueError("tp_shm_name is required when world_size > 1.")
             if rank == 0:
                 # Rank 0 创建共享内存用于发送方法调用指令
-                self.shm = SharedMemory(name=self.tp_shm_name, create=True, size=2**20)
+                self.shm = SharedMemory(name=self.tp_shm_name, create=True, size=TP_SHM_SIZE)
                 self.parallel_context.world_barrier(
                     device_ids=self.platform.barrier_device_ids(rank)
                 )
@@ -295,10 +305,11 @@ class ModelRunner:
     def read_shm(self):
         """反序列化共享内存中的方法名和参数"""
         assert self.world_size > 1 and self.rank > 0
-        self.event.wait()
+        command_event, _ = self.event
+        command_event.wait()
         n = int.from_bytes(self.shm.buf[0:4], "little")
         method_name, *args = pickle.loads(self.shm.buf[4:n+4])
-        self.event.clear()
+        command_event.clear()
         return method_name, args
 
     def write_shm(self, method_name, *args):
@@ -306,18 +317,21 @@ class ModelRunner:
         assert self.world_size > 1 and self.rank == 0
         data = pickle.dumps([method_name, *args])
         n = len(data)
-        if n + 4 > len(self.shm.buf):
+        command_capacity = len(self.shm.buf) - self.world_size
+        if n + 4 > command_capacity:
             raise RuntimeError(
-                f"Shared memory command is too large: {n + 4} > {len(self.shm.buf)}"
+                f"Shared memory command is too large: {n + 4} > {command_capacity}"
             )
         self.shm.buf[0:4] = n.to_bytes(4, "little")
         self.shm.buf[4:n+4] = data
-        for event in self.event:
-            event.set()
+        for rank, (command_event, completion_event) in enumerate(self.event, start=1):
+            completion_event.clear()
+            self.shm.buf[self._run_status_offset(rank)] = TP_RUN_STATUS_PENDING
+            command_event.set()
         timeout_s = float(os.getenv("SPARSEVLLM_TP_RPC_ACK_TIMEOUT_S", "30"))
         deadline = time.monotonic() + timeout_s
-        for event in self.event:
-            while event.is_set():
+        for command_event, _ in self.event:
+            while command_event.is_set():
                 if time.monotonic() > deadline:
                     raise TimeoutError(
                         f"Timed out waiting for TP worker to read shared-memory RPC "
@@ -340,7 +354,10 @@ class ModelRunner:
                     result = method(*args)
             except BaseException as exc:
                 local_error = exc
-            self._sync_tp_rpc_status(method_name, local_error)
+            if method_name == "run" and self.config.decode_cuda_graph:
+                self._sync_tp_run_status(local_error)
+            else:
+                self._sync_tp_rpc_status(method_name, local_error)
             if local_error is not None:
                 raise local_error
             if method_name == "refresh_prefix_cache_hit":
@@ -348,6 +365,68 @@ class ModelRunner:
             return result
         with torch.inference_mode():
             return method(*args)
+
+    def _run_status_offset(self, rank: int) -> int:
+        if not 0 < rank < self.world_size:
+            raise ValueError(f"Invalid TP worker rank {rank} for world_size={self.world_size}.")
+        return len(self.shm.buf) - self.world_size + rank
+
+    def _synchronize_tp_run_stream(self) -> None:
+        if self.device.type == "cuda":
+            torch.cuda.current_stream(self.device).synchronize()
+        else:
+            self.platform.synchronize()
+
+    def _sync_tp_run_status(self, local_error: BaseException | None) -> None:
+        if self.world_size <= 1:
+            return
+
+        sync_error: BaseException | None = None
+        if local_error is None:
+            try:
+                # Preserve the old all-reduce + item error boundary without
+                # launching a per-token NCCL collective.
+                self._synchronize_tp_run_stream()
+            except BaseException as exc:
+                sync_error = exc
+
+        if self.rank > 0:
+            _, completion_event = self.event
+            status = (
+                TP_RUN_STATUS_FAILED
+                if local_error is not None or sync_error is not None
+                else TP_RUN_STATUS_SUCCESS
+            )
+            self.shm.buf[self._run_status_offset(self.rank)] = status
+            completion_event.set()
+            if sync_error is not None:
+                raise sync_error
+            return
+
+        timeout_s = float(os.getenv("SPARSEVLLM_TP_RPC_STATUS_TIMEOUT_S", "300"))
+        deadline = time.monotonic() + timeout_s
+        failed_ranks: list[int] = []
+        for rank, (_, completion_event) in enumerate(self.event, start=1):
+            remaining = deadline - time.monotonic()
+            if remaining <= 0 or not completion_event.wait(timeout=remaining):
+                raise TimeoutError(
+                    f"Timed out waiting for TP worker {rank} to complete 'run' "
+                    f"after {timeout_s:.1f}s."
+                )
+            status = int(self.shm.buf[self._run_status_offset(rank)])
+            completion_event.clear()
+            if status == TP_RUN_STATUS_FAILED:
+                failed_ranks.append(rank)
+            elif status != TP_RUN_STATUS_SUCCESS:
+                raise RuntimeError(
+                    f"TP worker {rank} returned invalid run status {status}."
+                )
+
+        if sync_error is not None:
+            raise sync_error
+        if failed_ranks and local_error is None:
+            ranks = ", ".join(str(rank) for rank in failed_ranks)
+            raise RuntimeError(f"TP worker rank(s) {ranks} failed during run.")
 
     def _sync_tp_rpc_status(
         self,

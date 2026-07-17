@@ -13,6 +13,8 @@ import torch.distributed as dist
 from sparsevllm.engine.model_runner import (
     ModelRunner,
     PREFIX_CACHE_CONTROL_RPC_METHODS,
+    TP_RUN_STATUS_FAILED,
+    TP_RUN_STATUS_SUCCESS,
     TP_RPC_STATUS_SYNC_METHODS,
     TP_SHM_NAME_PREFIX,
     make_tp_shm_name,
@@ -21,13 +23,21 @@ from sparsevllm.engine.model_runner import (
 
 def test_write_shm_waits_until_worker_reads_command():
     ctx = get_context("spawn")
-    event = ctx.Event()
+    command_event = ctx.Event()
+    completion_event = ctx.Event()
+    event = (command_event, completion_event)
     shm = SharedMemory(
         name=f"sparsevllm_test_rpc_{os.getpid()}_{uuid4().hex}",
         create=True,
         size=2**20,
     )
-    rank0 = SimpleNamespace(world_size=2, rank=0, event=[event], shm=shm)
+    rank0 = SimpleNamespace(
+        world_size=2,
+        rank=0,
+        event=[event],
+        shm=shm,
+        _run_status_offset=lambda rank: len(shm.buf) - 2 + rank,
+    )
     worker = SimpleNamespace(world_size=2, rank=1, event=event, shm=shm)
     errors: list[BaseException] = []
 
@@ -41,7 +51,7 @@ def test_write_shm_waits_until_worker_reads_command():
     writer.start()
 
     try:
-        assert event.wait(timeout=1.0)
+        assert command_event.wait(timeout=1.0)
         time.sleep(0.02)
         assert writer.is_alive()
 
@@ -53,8 +63,8 @@ def test_write_shm_waits_until_worker_reads_command():
         assert method_name == "free_slots"
         assert args == [123]
     finally:
-        if event.is_set():
-            event.clear()
+        if command_event.is_set():
+            command_event.clear()
         writer.join(timeout=1.0)
         shm.close()
         shm.unlink()
@@ -110,24 +120,110 @@ def test_prefix_cache_match_uses_tp_failure_synchronized_control_path():
 
 
 def test_run_rpc_reports_any_tp_worker_failure():
-    runner = object.__new__(ModelRunner)
-    runner.world_size = 2
-    runner.device = torch.device("cpu")
-    runner.parallel_context = SimpleNamespace(
-        world_all_reduce=lambda tensor, op: dist.all_reduce(tensor, op=op)
+    ctx = get_context("spawn")
+    events = (ctx.Event(), ctx.Event())
+    shm = SharedMemory(
+        name=f"sparsevllm_test_status_{os.getpid()}_{uuid4().hex}",
+        create=True,
+        size=2**20,
     )
+    rank0 = object.__new__(ModelRunner)
+    rank0.world_size = 2
+    rank0.rank = 0
+    rank0.event = [events]
+    rank0.shm = shm
+    rank0.device = torch.device("cpu")
+    rank0.platform = SimpleNamespace(synchronize=lambda: None)
+    worker = object.__new__(ModelRunner)
+    worker.world_size = 2
+    worker.rank = 1
+    worker.event = events
+    worker.shm = shm
+    worker.device = torch.device("cpu")
+    worker.platform = SimpleNamespace(synchronize=lambda: None)
 
-    def mark_failed(tensor, op=None):
-        assert op == dist.ReduceOp.MAX
-        tensor.fill_(1)
-
-    with patch.object(dist, "is_initialized", return_value=True), patch.object(dist, "all_reduce", side_effect=mark_failed):
+    try:
+        ModelRunner._sync_tp_run_status(worker, RuntimeError("worker failed"))
+        assert shm.buf[ModelRunner._run_status_offset(worker, 1)] == TP_RUN_STATUS_FAILED
         try:
-            ModelRunner._sync_tp_rpc_status(runner, "run", None)
+            ModelRunner._sync_tp_run_status(rank0, None)
         except RuntimeError as exc:
-            assert "At least one world worker failed during run" in str(exc)
+            assert "TP worker rank(s) 1 failed during run" in str(exc)
         else:
             raise AssertionError("expected worker failure to be surfaced on rank 0")
+    finally:
+        shm.close()
+        shm.unlink()
+
+
+def test_run_rpc_uses_host_completion_without_collective():
+    ctx = get_context("spawn")
+    events = (ctx.Event(), ctx.Event())
+    shm = SharedMemory(
+        name=f"sparsevllm_test_status_{os.getpid()}_{uuid4().hex}",
+        create=True,
+        size=2**20,
+    )
+    sync_calls: list[int] = []
+    rank0 = object.__new__(ModelRunner)
+    rank0.world_size = 2
+    rank0.rank = 0
+    rank0.event = [events]
+    rank0.shm = shm
+    rank0.device = torch.device("cpu")
+    rank0.platform = SimpleNamespace(synchronize=lambda: sync_calls.append(0))
+    worker = object.__new__(ModelRunner)
+    worker.world_size = 2
+    worker.rank = 1
+    worker.event = events
+    worker.shm = shm
+    worker.device = torch.device("cpu")
+    worker.platform = SimpleNamespace(synchronize=lambda: sync_calls.append(1))
+
+    try:
+        ModelRunner._sync_tp_run_status(worker, None)
+        assert shm.buf[ModelRunner._run_status_offset(worker, 1)] == TP_RUN_STATUS_SUCCESS
+        ModelRunner._sync_tp_run_status(rank0, None)
+        assert sync_calls == [1, 0]
+    finally:
+        shm.close()
+        shm.unlink()
+
+
+def test_run_rpc_uses_host_status_with_decode_graph():
+    runner = object.__new__(ModelRunner)
+    runner.world_size = 1
+    runner.rank = 0
+    runner.config = SimpleNamespace(decode_cuda_graph=True)
+    runner.run = lambda seqs, is_prefill: (seqs, is_prefill)
+    calls = []
+    runner._sync_tp_run_status = lambda error: calls.append(("host", error))
+    runner._sync_tp_rpc_status = lambda method, error: calls.append(
+        ("collective", method, error)
+    )
+
+    result = ModelRunner.call(runner, "run", [1], False)
+
+    assert result == ([1], False)
+    assert calls == [("host", None)]
+
+
+def test_run_rpc_keeps_collective_status_without_decode_graph():
+    runner = object.__new__(ModelRunner)
+    runner.world_size = 1
+    runner.rank = 0
+    runner.config = SimpleNamespace(decode_cuda_graph=False)
+    runner.run = lambda seqs, is_prefill: (seqs, is_prefill)
+    calls = []
+    runner._sync_tp_run_status = lambda error: calls.append(("host", error))
+    runner._sync_tp_rpc_status = lambda method, error: calls.append(
+        ("collective", method, error)
+    )
+
+    result = ModelRunner.call(runner, "run", [1], False)
+
+    assert result == ([1], False)
+    assert calls == [("collective", "run", None)]
 
 
 def test_warmup_reset_uses_failure_synchronized_world_rpc():
