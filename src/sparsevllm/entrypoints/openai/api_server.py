@@ -205,6 +205,19 @@ def build_arg_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _run_server(app: FastAPI, *, host: str, port: int) -> int:
+    import uvicorn
+
+    server = uvicorn.Server(uvicorn.Config(app, host=host, port=port))
+
+    def _stop_after_fatal_engine_error(_message: str) -> None:
+        server.should_exit = True
+
+    app.state.dispatcher.set_fatal_callback(_stop_after_fatal_engine_error)
+    server.run()
+    return 1 if app.state.dispatcher.failure_message is not None else 0
+
+
 def main():
     parser = build_arg_parser()
     args, raw_engine_args = parser.parse_known_args()
@@ -225,9 +238,9 @@ def main():
         reasoning_parser=args.reasoning_parser,
     )
 
-    import uvicorn
-
-    uvicorn.run(app, host=args.host, port=args.port)
+    exit_code = _run_server(app, host=args.host, port=args.port)
+    if exit_code:
+        raise SystemExit(exit_code)
 
 
 if __name__ == "__main__":

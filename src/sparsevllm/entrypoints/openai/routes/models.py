@@ -2,14 +2,37 @@ import time
 
 from fastapi import APIRouter
 from fastapi import Request
+from fastapi.responses import JSONResponse
 
 
 router = APIRouter()
 
 
 @router.get("/health")
-def health():
-    return {"status": "ok"}
+def health(request: Request):
+    return _readiness_response(request)
+
+
+@router.get("/readyz")
+def ready(request: Request):
+    return _readiness_response(request)
+
+
+@router.get("/livez")
+def live():
+    return JSONResponse({"status": "ok"})
+
+
+def _readiness_response(request: Request) -> JSONResponse:
+    dispatcher = request.app.state.dispatcher
+    if dispatcher.is_ready:
+        return JSONResponse({"status": "ok"})
+    failure_message = dispatcher.failure_message
+    reason = failure_message.split(":", 1)[0] if failure_message else "dispatcher_unavailable"
+    return JSONResponse(
+        {"status": "unavailable", "reason": reason},
+        status_code=503,
+    )
 
 
 @router.get("/v1/models")

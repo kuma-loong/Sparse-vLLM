@@ -177,6 +177,7 @@ class SweBenchLiteRunnerTest(unittest.TestCase):
 
     def test_secret_validation_rejects_provider_tokens_and_url_credentials(self):
         bad_values = (
+            {"token": "plain-token-value"},
             {"access_token": "plain-token-value"},
             {"header": "Bearer abcdefghijklmnop"},
             {"model": {"value": "hf_abcdefghijklmnopqrstuvwxyz"}},
@@ -188,6 +189,12 @@ class SweBenchLiteRunnerTest(unittest.TestCase):
             with self.subTest(value=value):
                 with self.assertRaisesRegex(RunnerError, "secret"):
                     _reject_secrets(value, source=Path("config.yaml"))
+
+    def test_secret_validation_allows_token_budget_config(self):
+        _reject_secrets(
+            {"engine_kwargs": {"quest_token_budget": 2048}},
+            source=Path("server_manifest.json"),
+        )
 
     @mock.patch("benchmark.swe_bench_lite.run.subprocess.run")
     def test_docker_daemon_failure_is_not_reported_as_missing_images(self, run_mock):

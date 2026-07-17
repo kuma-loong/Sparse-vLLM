@@ -232,7 +232,6 @@ async def _chat_completion_response(
                 final.get("raw_text", final["text"]),
                 prefix=prompt,
                 parse_tools=parse_tools,
-                finish_reason=final["finish_reason"],
             )
         except ResponseParseError as exc:
             raise HTTPException(status_code=500, detail=f"Chat Completions parse failed: {exc}") from exc
@@ -372,7 +371,7 @@ async def _chat_completion_stream(
                 if parser is not None:
                     parser_text = item.get("raw_text", item["text"])
                     deltas = parser.feed(parser_text[raw_text_len:])
-                    deltas.extend(parser.finish(item["finish_reason"]))
+                    deltas.extend(parser.finish())
                 else:
                     parser_text = item["text"]
                     suffix = parser_text[visible_text_len:]

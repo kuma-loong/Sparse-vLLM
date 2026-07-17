@@ -198,7 +198,6 @@ async def _response_response(
                 final.get("raw_text", final["text"]),
                 prefix=prompt,
                 parse_tools=parse_tools,
-                finish_reason=final["finish_reason"],
             )
         except ResponseParseError as exc:
             raise HTTPException(status_code=500, detail=f"Responses parse failed: {exc}") from exc
@@ -280,7 +279,7 @@ async def _response_stream(
                 if parser is not None:
                     parser_text = item.get("raw_text", item["text"])
                     parsed_deltas = parser.feed(parser_text[raw_text_len:])
-                    parsed_deltas.extend(parser.finish(item["finish_reason"]))
+                    parsed_deltas.extend(parser.finish())
                 else:
                     suffix = item["text"][visible_text_len:]
                     parsed_deltas = [{"content": suffix}] if suffix else []

@@ -872,6 +872,14 @@ The `/v1/models` entry also advertises the engine's effective
 real context window instead of treating it as unknown. A smart router reports
 the smallest context window among healthy workers serving the same model.
 
+`/livez` reports process liveness. `/health` and `/readyz` report traffic
+readiness and return HTTP 503 after a fatal engine-step error. The CLI server
+then exits with status 1 so an external supervisor can replace the process and
+its CUDA context. The smart router probes worker readiness before routing,
+removes failed workers, and automatically admits restarted workers once they
+are ready. It deliberately does not replay interrupted requests. See
+`deploy/systemd/README.md` for per-GPU worker and router service templates.
+
 Additional `--kebab-case` flags are parsed as Sparse-vLLM engine kwargs. Use
 the canonical semantic keys accepted by
 `normalize_runtime_params(..., backend="sparsevllm")` for public runtime

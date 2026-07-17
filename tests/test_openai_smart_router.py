@@ -10,6 +10,58 @@ from unittest.mock import patch
     "OpenAI smart router dependencies are not installed",
 )
 class OpenAISmartRouterTest(unittest.TestCase):
+    def test_worker_readiness_failure_is_removed_and_recovery_is_detected(self):
+        from sparsevllm.entrypoints.openai import smart_router
+
+        router = smart_router.SmartRouter(
+            worker_urls=["http://worker-a"],
+            request_timeout_s=1.0,
+            overload_load_factor=1.5,
+            load_abs_threshold=1,
+            profiles={},
+            route_log_dir=None,
+        )
+        ready = False
+        urls = []
+
+        def get_json(url, _timeout):
+            urls.append(url)
+            if not ready:
+                raise RuntimeError("worker not ready")
+            return {"served_model_name": "model", "max_model_len": 262144}
+
+        with patch.object(smart_router, "_get_json", side_effect=get_json):
+            asyncio.run(router.refresh_worker_info())
+            self.assertFalse(router.workers[0].healthy)
+            ready = True
+            asyncio.run(router.refresh_worker_info())
+
+        self.assertTrue(router.workers[0].healthy)
+        self.assertEqual(router.workers[0].info["served_model_name"], "model")
+        self.assertEqual(urls, ["http://worker-a/v1/worker/info"] * 2)
+
+    def test_router_health_returns_503_without_ready_workers(self):
+        from sparsevllm.entrypoints.openai import smart_router
+
+        app = smart_router.create_app(["http://worker-a"])
+        app.state.router.workers[0].healthy = False
+        app.state.router.refresh_worker_info = AsyncMock(return_value=None)
+        endpoint = next(route.endpoint for route in app.routes if getattr(route, "path", None) == "/health")
+
+        response = asyncio.run(endpoint())
+
+        self.assertEqual(response.status_code, 503)
+
+    def test_router_livez_stays_available_without_ready_workers(self):
+        from sparsevllm.entrypoints.openai import smart_router
+
+        app = smart_router.create_app(["http://worker-a"])
+        endpoint = next(route.endpoint for route in app.routes if getattr(route, "path", None) == "/livez")
+
+        response = asyncio.run(endpoint())
+
+        self.assertEqual(response.status_code, 200)
+
     def test_model_cards_use_smallest_worker_context(self):
         from sparsevllm.entrypoints.openai.smart_router import _router_model_cards
         from sparsevllm.entrypoints.openai.smart_router import WorkerState

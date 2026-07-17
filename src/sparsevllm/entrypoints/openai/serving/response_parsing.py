@@ -1,5 +1,4 @@
 import json
-import re
 import uuid
 from dataclasses import dataclass
 from typing import Any
@@ -66,8 +65,6 @@ class TransformersResponseParser:
         self,
         tokenizer: Any,
         response_template: dict[str, Any],
-        *,
-        validate_qwen_delimiters: bool = False,
     ):
         if not callable(getattr(tokenizer, "parse_response", None)):
             raise TypeError("Transformers response parsing requires tokenizer.parse_response().")
@@ -75,7 +72,6 @@ class TransformersResponseParser:
             raise TypeError("Transformers response streaming requires tokenizer.get_response_parser().")
         self._tokenizer = tokenizer
         self._response_template = response_template
-        self._validate_qwen_delimiters = validate_qwen_delimiters
 
     @classmethod
     def from_tokenizer(cls, tokenizer: Any) -> "TransformersResponseParser | None":
@@ -97,7 +93,7 @@ class TransformersResponseParser:
             response_template["fields"]["tool_calls"] = _QWEN_XML_TOOL_FIELD
         elif "<tool_call>" in chat_template:
             response_template["fields"]["tool_calls"] = _QWEN_JSON_TOOL_FIELD
-        return cls(tokenizer, response_template, validate_qwen_delimiters=True)
+        return cls(tokenizer, response_template)
 
     def parse(
         self,
@@ -105,11 +101,8 @@ class TransformersResponseParser:
         *,
         prefix: str,
         parse_tools: bool,
-        finish_reason: str | None,
     ) -> ParsedModelResponse:
         try:
-            if self._validate_qwen_delimiters and finish_reason != "length":
-                _validate_qwen_response_delimiters(prefix, text)
             parsed = self._tokenizer.parse_response(
                 text,
                 self._response_template,
@@ -129,9 +122,7 @@ class TransformersResponseParser:
             raise ResponseParseError(str(exc)) from exc
         return TransformersResponseStreamParser(
             parser,
-            prefix=prefix,
             parse_tools=parse_tools,
-            validate_qwen_delimiters=self._validate_qwen_delimiters,
         )
 
 
@@ -140,32 +131,24 @@ class TransformersResponseStreamParser:
         self,
         parser: Any,
         *,
-        prefix: str,
         parse_tools: bool,
-        validate_qwen_delimiters: bool,
     ):
         self._parser = parser
-        self._prefix = prefix
         self._parse_tools = parse_tools
-        self._validate_qwen_delimiters = validate_qwen_delimiters
         self._initial_events = list(parser.initial_events)
-        self._raw_text = ""
         self._tool_index = 0
         self.tools_called = False
 
     def feed(self, text_delta: str) -> list[dict[str, Any]]:
         events, self._initial_events = self._initial_events, []
         try:
-            self._raw_text += text_delta
             events.extend(self._parser.feed(text_delta))
             return self._events_to_deltas(events)
         except (KeyError, TypeError, ValueError) as exc:
             raise ResponseParseError(str(exc)) from exc
 
-    def finish(self, finish_reason: str | None) -> list[dict[str, Any]]:
+    def finish(self) -> list[dict[str, Any]]:
         try:
-            if self._validate_qwen_delimiters and finish_reason != "length":
-                _validate_qwen_response_delimiters(self._prefix, self._raw_text)
             _message, events = self._parser.finalize()
             return self._events_to_deltas(events)
         except (KeyError, TypeError, ValueError) as exc:
@@ -256,18 +239,3 @@ def _normalize_tool_call(tool_call: Any) -> dict[str, Any]:
         "type": "function",
         "function": {"name": name, "arguments": arguments},
     }
-
-
-def _validate_qwen_response_delimiters(prefix: str, text: str) -> None:
-    assistant_prefix = prefix.rsplit("<|im_start|>assistant\n", 1)[-1]
-    response = assistant_prefix + text
-    pairs = (
-        (response.count("<think>"), response.count("</think>"), "<think>"),
-        (response.count("<tool_call>"), response.count("</tool_call>"), "<tool_call>"),
-        (len(re.findall(r"<function=[^>\n]+>", response)), response.count("</function>"), "<function>"),
-    )
-    for opened, closed, name in pairs:
-        if opened != closed:
-            raise ResponseParseError(
-                f"Qwen response did not close all {name} blocks: opened {opened}, closed {closed}."
-            )

@@ -100,11 +100,25 @@ def create_app(
     async def _startup():
         await router.refresh_worker_info()
 
-    @app.get("/health")
-    async def health():
+    async def _readiness_response():
         await router.refresh_worker_info()
         healthy = [worker.url for worker in router.workers if worker.healthy]
-        return {"status": "ok" if healthy else "unavailable", "healthy_workers": healthy}
+        return JSONResponse(
+            {"status": "ok" if healthy else "unavailable", "healthy_workers": healthy},
+            status_code=200 if healthy else 503,
+        )
+
+    @app.get("/health")
+    async def health():
+        return await _readiness_response()
+
+    @app.get("/readyz")
+    async def readyz():
+        return await _readiness_response()
+
+    @app.get("/livez")
+    async def livez():
+        return JSONResponse({"status": "ok"})
 
     @app.get("/v1/models")
     async def models():
@@ -197,7 +211,14 @@ class SmartRouter:
 
     async def refresh_worker_info(self):
         results = await asyncio.gather(
-            *[asyncio.to_thread(_get_json, f"{worker.url}/v1/worker/info", self.request_timeout_s) for worker in self.workers],
+            *[
+                asyncio.to_thread(
+                    _get_json,
+                    f"{worker.url}/v1/worker/info",
+                    self.request_timeout_s,
+                )
+                for worker in self.workers
+            ],
             return_exceptions=True,
         )
         for worker, result in zip(self.workers, results):

@@ -1,0 +1,20 @@
+[Unit]
+Description=Sparse-vLLM OpenAI smart router
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=300
+StartLimitBurst=3
+
+[Service]
+Type=simple
+UMask=0077
+Environment=PYTHONUNBUFFERED=1
+EnvironmentFile=%h/.config/sparsevllm/router.env
+ExecStart=/bin/bash -c 'cd "$SPARSEVLLM_REPO" && exec env PYTHONPATH="$SPARSEVLLM_REPO/src" "$SPARSEVLLM_PYTHON" -m sparsevllm.entrypoints.openai.smart_router --worker-urls "$SPARSEVLLM_WORKER_URLS" --host "$SPARSEVLLM_ROUTER_HOST" --port "$SPARSEVLLM_ROUTER_PORT" --route-log-dir "$SPARSEVLLM_ROUTE_LOG_DIR"'
+Restart=on-failure
+RestartSec=5
+KillMode=control-group
+TimeoutStopSec=30
+
+[Install]
+WantedBy=default.target

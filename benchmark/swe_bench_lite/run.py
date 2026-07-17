@@ -45,8 +45,9 @@ SECRET_PATTERNS = (
     re.compile(r"(?i)Bearer\s+[A-Za-z0-9._~+/-]{12,}=*"),
 )
 SENSITIVE_KEY_PATTERN = re.compile(
-    r"(?i)(?:^|_)(?:api_?key|access_?token|auth_?token|refresh_?token|token|"
-    r"secret|client_?secret|password|credential|credentials|authorization)(?:$|_)"
+    r"(?i)(?:^|_)(?:api_?key|api_?token|access_?token|auth_?token|bearer_?token|"
+    r"refresh_?token|id_?token|secret|client_?secret|password|credential|credentials|"
+    r"authorization)(?:$|_)|^token$"
 )
 INLINE_SECRET_PATTERN = re.compile(
     r"(?i)(?:--?(?:api[-_]?key|access[-_]?token|auth[-_]?token|token|password|secret)"

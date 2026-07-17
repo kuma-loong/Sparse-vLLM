@@ -72,12 +72,13 @@ The full documentation index is maintained in [docs/README.md](docs/README.md).
 
 ## Quick Start
 
-Install the package from the repository root:
+Sparse-vLLM requires Python 3.10 or newer. Install the package from the
+repository root using the runtime versions pinned in `pyproject.toml`:
 
 ```bash
 conda create -n svllm python=3.10 -y
 conda activate svllm
-pip install torch==2.8.0 transformers[torch]==4.53.3 accelerate deepspeed==0.15.4 torchvision datasets==4.1.0 bitsandbytes
+pip install torch==2.8.0 transformers[torch]==5.13.1 triton==3.4.0 torchvision==0.23.0 accelerate deepspeed==0.15.4 datasets==4.1.0 bitsandbytes
 pip install fire matplotlib seaborn wandb loguru ansible
 MAX_JOBS=8 pip install flash-attn --no-build-isolation
 pip install -e .

@@ -295,6 +295,202 @@ class OpenAIAPIServerTest(unittest.IsolatedAsyncioTestCase):
         self.assertIn("fast tokenizer backend", item["message"])
         self.assertFalse(engine.added)
 
+    async def test_dispatcher_fatal_failure_marks_unready_and_notifies_supervisor(self):
+        from sparsevllm.entrypoints.openai.api_server import AsyncEngineDispatcher
+
+        tokenizer = _byte_level_tokenizer()
+
+        class Engine:
+            def __init__(self):
+                self.tokenizer = tokenizer
+                self.aborted = []
+
+            def add_request(self, _prompt, _sampling_params):
+                return 17
+
+            def step(self):
+                raise RuntimeError("fatal engine step")
+
+            def abort_request(self, seq_id):
+                self.aborted.append(seq_id)
+
+            def exit(self):
+                pass
+
+        notified = threading.Event()
+        dispatcher = AsyncEngineDispatcher(Engine())
+        dispatcher.set_fatal_callback(lambda _message: notified.set())
+        try:
+            sampling = type("Sampling", (), {"max_tokens": 1})()
+            handle = await dispatcher.submit("prompt", sampling, 0)
+            item = await asyncio.wait_for(handle.output_queue.get(), timeout=1)
+            self.assertTrue(await asyncio.to_thread(notified.wait, 1))
+        finally:
+            dispatcher.close()
+
+        self.assertEqual(item["type"], "error")
+        self.assertIn("fatal engine step", item["message"])
+        self.assertFalse(dispatcher.is_ready)
+        self.assertIn("fatal engine step", dispatcher.failure_message)
+
+    async def test_dispatcher_fatal_failure_releases_concurrent_control(self):
+        from sparsevllm.entrypoints.openai.api_server import AsyncEngineDispatcher
+
+        tokenizer = _byte_level_tokenizer()
+        step_started = threading.Event()
+        release_step = threading.Event()
+
+        class Engine:
+            def __init__(self):
+                self.tokenizer = tokenizer
+
+            def add_request(self, _prompt, _sampling_params):
+                return 17
+
+            def step(self):
+                step_started.set()
+                release_step.wait(1)
+                raise RuntimeError("fatal engine step")
+
+            def worker_load(self):
+                return {"active_requests": 1}
+
+            def abort_request(self, _seq_id):
+                pass
+
+            def exit(self):
+                pass
+
+        dispatcher = AsyncEngineDispatcher(Engine())
+        try:
+            sampling = type("Sampling", (), {"max_tokens": 1})()
+            handle = await dispatcher.submit("prompt", sampling, 0)
+            self.assertTrue(await asyncio.to_thread(step_started.wait, 1))
+            control_task = asyncio.create_task(dispatcher.control("worker_load"))
+            await asyncio.sleep(0)
+            self.assertEqual(dispatcher._controls.qsize(), 1)
+            release_step.set()
+
+            item = await asyncio.wait_for(handle.output_queue.get(), timeout=1)
+            with self.assertRaisesRegex(RuntimeError, "fatal engine step"):
+                await asyncio.wait_for(control_task, timeout=1)
+        finally:
+            release_step.set()
+            dispatcher.close()
+
+        self.assertEqual(item["type"], "error")
+        self.assertEqual(dispatcher._controls.qsize(), 0)
+
+    async def test_dispatcher_abort_failure_notifies_supervisor_and_rejects_new_work(self):
+        from sparsevllm.entrypoints.openai.api_server import AsyncEngineDispatcher
+
+        tokenizer = _byte_level_tokenizer()
+        step_started = threading.Event()
+        release_step = threading.Event()
+
+        class Engine:
+            def __init__(self):
+                self.tokenizer = tokenizer
+                self.last_step_token_outputs = []
+                self.last_step_logprob_outputs = []
+
+            def add_request(self, _prompt, _sampling_params):
+                return 17
+
+            def step(self):
+                step_started.set()
+                release_step.wait(1)
+                return [], 0
+
+            def abort_request(self, _seq_id):
+                raise RuntimeError("abort failed")
+
+            def exit(self):
+                pass
+
+        notified = threading.Event()
+        dispatcher = AsyncEngineDispatcher(Engine())
+        dispatcher.set_fatal_callback(lambda _message: notified.set())
+        try:
+            sampling = type("Sampling", (), {"max_tokens": 1})()
+            handle = await dispatcher.submit("prompt", sampling, 0)
+            self.assertTrue(await asyncio.to_thread(step_started.wait, 1))
+            dispatcher.cancel(handle)
+            release_step.set()
+            self.assertTrue(await asyncio.to_thread(notified.wait, 1))
+
+            item = await asyncio.wait_for(handle.output_queue.get(), timeout=1)
+            rejected = await dispatcher.submit("later", sampling, 1)
+            rejected_item = await asyncio.wait_for(rejected.output_queue.get(), timeout=1)
+            with self.assertRaisesRegex(RuntimeError, "abort failed"):
+                await asyncio.wait_for(dispatcher.control("worker_load"), timeout=1)
+        finally:
+            release_step.set()
+            dispatcher.close()
+
+        self.assertEqual(item["type"], "error")
+        self.assertIn("abort failed", item["message"])
+        self.assertEqual(rejected_item["type"], "error")
+        self.assertIn("abort failed", rejected_item["message"])
+        self.assertFalse(dispatcher.is_ready)
+
+    def test_health_is_readiness_aware_but_livez_stays_available(self):
+        from sparsevllm.entrypoints.openai import api_server
+
+        class Engine:
+            tokenizer = object()
+            config = type("Config", (), {"vllm_sparse_method": ""})()
+
+            def exit(self):
+                pass
+
+        app = api_server.create_app("/tmp/model", served_model_name="model", engine=Engine())
+        health_endpoint = _route_endpoint(app, "/health")
+        ready_endpoint = _route_endpoint(app, "/readyz")
+        live_endpoint = _route_endpoint(app, "/livez")
+        try:
+            self.assertEqual(health_endpoint(_TestRequest(app)).status_code, 200)
+            self.assertEqual(ready_endpoint(_TestRequest(app)).status_code, 200)
+            app.state.dispatcher._failed_message = "OutOfMemoryError: CUDA out of memory"
+            self.assertEqual(health_endpoint(_TestRequest(app)).status_code, 503)
+            self.assertEqual(ready_endpoint(_TestRequest(app)).status_code, 503)
+            self.assertEqual(live_endpoint().status_code, 200)
+        finally:
+            app.state.dispatcher.close()
+
+    def test_cli_server_exits_nonzero_after_fatal_dispatcher_failure(self):
+        from sparsevllm.entrypoints.openai import api_server
+
+        class Dispatcher:
+            failure_message = None
+            callback = None
+
+            def set_fatal_callback(self, callback):
+                self.callback = callback
+
+        dispatcher = Dispatcher()
+        app = type(
+            "App",
+            (),
+            {"state": type("State", (), {"dispatcher": dispatcher})()},
+        )()
+        servers = []
+
+        class Server:
+            def __init__(self, _config):
+                self.should_exit = False
+                servers.append(self)
+
+            def run(self):
+                dispatcher.failure_message = "OutOfMemoryError: CUDA out of memory"
+                dispatcher.callback(dispatcher.failure_message)
+
+        with patch("uvicorn.Config", return_value=object()), patch("uvicorn.Server", Server):
+            exit_code = api_server._run_server(app, host="127.0.0.1", port=18000)
+
+        self.assertEqual(exit_code, 1)
+        self.assertTrue(servers[0].should_exit)
+
     def test_incremental_detokenizer_rejects_final_token_mismatch(self):
         from sparsevllm.entrypoints.openai.detokenizer import IncrementalDetokenizer
 
@@ -1200,11 +1396,15 @@ class OpenAIAPIServerTest(unittest.IsolatedAsyncioTestCase):
             with patch.dict(os.environ, {"SPARSEVLLM_WORKER_TAGS": "dialog, omnikv"}):
                 info_response = info_endpoint(_TestRequest(app))
             load_response = await load_endpoint(_TestRequest(app))
+            app.state.dispatcher._failed_message = "OutOfMemoryError: CUDA out of memory"
+            unavailable_info_response = info_endpoint(_TestRequest(app))
         finally:
             app.state.dispatcher.close()
 
         self.assertEqual(json.loads(info_response.body), {"served_model_name": "model", "tags": ["dialog", "omnikv"]})
         self.assertEqual(json.loads(load_response.body), {"active_requests": 3, "thread": "sparsevllm-openai-dispatcher"})
+        self.assertEqual(unavailable_info_response.status_code, 503)
+        self.assertEqual(json.loads(unavailable_info_response.body)["reason"], "OutOfMemoryError")
 
     async def test_prefix_cache_text_selector_tokenizes_server_side(self):
         from sparsevllm.entrypoints.openai import api_server
@@ -2385,7 +2585,7 @@ class OpenAIAPIServerTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(choice["message"]["content"], "")
         self.assertEqual(choice["finish_reason"], "length")
 
-    async def test_chat_completion_parse_failures_are_explicit(self):
+    async def test_chat_completion_transformers_controls_parse_outcomes(self):
         from fastapi import HTTPException
 
         from sparsevllm.entrypoints.openai.api_server import RequestHandle, _chat_completion_response
@@ -2416,8 +2616,10 @@ class OpenAIAPIServerTest(unittest.IsolatedAsyncioTestCase):
                 response_parser=_transformers_response_parser(),
             )
 
-        with self.assertRaisesRegex(HTTPException, "did not close"):
-            await parse("<think>partial", reasoning_parser_name="qwen3")
+        response = await parse("<think>partial", reasoning_parser_name="qwen3")
+        self.assertEqual(response["choices"][0]["message"]["reasoning_content"], "partial")
+        self.assertEqual(response["choices"][0]["finish_reason"], "stop")
+
         with self.assertRaisesRegex(HTTPException, "could not parse region as JSON"):
             await parse('<tool_call>{"name":</tool_call>', parse_tools=True)
 
@@ -2639,7 +2841,7 @@ class OpenAIAPIServerTest(unittest.IsolatedAsyncioTestCase):
                 '<tool_call>{"name":"second","arguments":{"y":2}}</tool_call>'
             )
         )
-        deltas.extend(parser.finish("stop"))
+        deltas.extend(parser.finish())
 
         starts = [
             delta["tool_calls"][0]
@@ -3351,7 +3553,7 @@ class OpenAIAPIServerTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(completed["incomplete_details"], {"reason": "max_output_tokens"})
         self.assertEqual(completed["output"][0]["text"], "partial")
 
-    async def test_response_stream_unclosed_reasoning_stop_fails_fast(self):
+    async def test_response_stream_transformers_finalizes_unclosed_reasoning(self):
         from sparsevllm.entrypoints.openai.api_server import RequestHandle, ResponseRequest, _response_stream
 
         queue = asyncio.Queue()
@@ -3367,11 +3569,9 @@ class OpenAIAPIServerTest(unittest.IsolatedAsyncioTestCase):
             }
         )
 
-        cancelled = threading.Event()
-
         class Dispatcher:
             def cancel(self, _handle):
-                cancelled.set()
+                raise AssertionError("completed response stream should not be cancelled")
 
         events = _response_sse_events(
             [
@@ -3391,9 +3591,10 @@ class OpenAIAPIServerTest(unittest.IsolatedAsyncioTestCase):
             ]
         )
 
-        failed = [payload for event, payload in events if event == "response.failed"][0]
-        self.assertIn("did not close", failed["error"]["message"])
-        self.assertTrue(cancelled.is_set())
+        self.assertNotIn("response.failed", [event for event, _payload in events])
+        completed = [payload["response"] for event, payload in events if event == "response.completed"][0]
+        self.assertEqual(completed["status"], "completed")
+        self.assertEqual(completed["output"][0]["text"], "partial")
 
     def test_response_route_returns_non_streaming_response(self):
         from fastapi.testclient import TestClient
@@ -3458,7 +3659,6 @@ class OpenAIAPIServerTest(unittest.IsolatedAsyncioTestCase):
             "<think>reason</think>answer",
             prefix="",
             parse_tools=False,
-            finish_reason="stop",
         )
         output = _response_output_items(parsed)
 
@@ -3473,7 +3673,6 @@ class OpenAIAPIServerTest(unittest.IsolatedAsyncioTestCase):
             "reason</think>\n\nanswer<|im_end|>",
             prefix="<|im_start|>assistant\n<think>\n",
             parse_tools=False,
-            finish_reason="stop",
         )
         output = _response_output_items(parsed)
 
@@ -3481,29 +3680,17 @@ class OpenAIAPIServerTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(output[0]["text"], "reason")
         self.assertEqual(output[1]["content"][0]["text"], "answer")
 
-    def test_qwen3_reasoning_parser_handles_incomplete_length(self):
+    def test_qwen3_reasoning_parser_handles_unclosed_region(self):
         from sparsevllm.entrypoints.openai.api_server import _response_output_items
 
         parsed = _transformers_response_parser().parse(
             "<think>partial",
             prefix="",
             parse_tools=False,
-            finish_reason="length",
         )
         output = _response_output_items(parsed)
 
         self.assertEqual(output, [{"id": output[0]["id"], "type": "reasoning", "text": "partial", "summary": []}])
-
-    def test_qwen3_reasoning_parser_rejects_unclosed_stop(self):
-        from sparsevllm.entrypoints.openai.serving.response_parsing import ResponseParseError
-
-        with self.assertRaises(ResponseParseError):
-            _transformers_response_parser().parse(
-                "<think>partial",
-                prefix="",
-                parse_tools=False,
-                finish_reason="stop",
-            )
 
     def test_reasoning_parser_disabled_returns_raw_text(self):
         from sparsevllm.entrypoints.openai.api_server import _response_output_items
@@ -3523,13 +3710,29 @@ class OpenAIAPIServerTest(unittest.IsolatedAsyncioTestCase):
             '<tool_call>{"name":"get_weather","arguments":{"city":"Paris"}}</tool_call>',
             prefix="",
             parse_tools=True,
-            finish_reason="stop",
         )
         output = _response_output_items(parsed)
 
         self.assertEqual(output[0]["type"], "function_call")
         self.assertEqual(output[0]["name"], "get_weather")
         self.assertEqual(output[0]["arguments"], '{"city":"Paris"}')
+
+    def test_transformers_decides_xml_tool_delimiter_handling(self):
+        parsed = _transformers_response_parser(xml_tools=True).parse(
+            "reason</think>\n\n"
+            "<tool_call><function=bash>"
+            "<parameter=command>pwd</parameter>"
+            "</function></tool_call></function>",
+            prefix="<|im_start|>assistant\n<think>\n",
+            parse_tools=True,
+        )
+
+        self.assertEqual(parsed.reasoning_content, "reason")
+        self.assertEqual(parsed.content, "</function>")
+        self.assertEqual(parsed.tool_calls[0]["function"], {
+            "name": "bash",
+            "arguments": '{"command":"pwd"}',
+        })
 
     def test_malformed_tool_call_json_fails_fast(self):
         from sparsevllm.entrypoints.openai.serving.response_parsing import ResponseParseError
@@ -3539,7 +3742,6 @@ class OpenAIAPIServerTest(unittest.IsolatedAsyncioTestCase):
                 '<tool_call>{"name":</tool_call>',
                 prefix="",
                 parse_tools=True,
-                finish_reason="stop",
             )
 
     def test_transformers_response_stream_parser_handles_split_regions(self):
@@ -3551,7 +3753,7 @@ class OpenAIAPIServerTest(unittest.IsolatedAsyncioTestCase):
             'call>{"name":"get_weather","arguments":{"city":"Paris"}}</tool_call>',
         ]:
             deltas.extend(parser.feed(chunk))
-        deltas.extend(parser.finish("stop"))
+        deltas.extend(parser.finish())
 
         reasoning = "".join(delta.get("reasoning_content", "") for delta in deltas)
         calls = [delta["tool_calls"][0] for delta in deltas if "tool_calls" in delta]

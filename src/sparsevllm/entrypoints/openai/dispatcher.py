@@ -5,6 +5,7 @@ import threading
 from dataclasses import dataclass
 from dataclasses import field
 from typing import Any
+from typing import Callable
 
 from sparsevllm.entrypoints.openai.detokenizer import IncrementalDetokenizer
 from sparsevllm.entrypoints.openai.sampling import _find_stop_index
@@ -70,8 +71,41 @@ class AsyncEngineDispatcher:
         self._controls: queue.Queue[_ControlRequest] = queue.Queue()
         self._closing = threading.Event()
         self._failed_message: str | None = None
+        self._fatal_callback: Callable[[str], None] | None = None
+        self._state_lock = threading.Lock()
         self._thread = threading.Thread(target=self._run, name="sparsevllm-openai-dispatcher", daemon=True)
         self._thread.start()
+
+    @property
+    def failure_message(self) -> str | None:
+        with self._state_lock:
+            return self._failed_message
+
+    @property
+    def is_ready(self) -> bool:
+        with self._state_lock:
+            return self._terminal_message_locked() is None
+
+    def set_fatal_callback(self, callback: Callable[[str], None]) -> None:
+        with self._state_lock:
+            self._fatal_callback = callback
+            failure_message = self._failed_message
+        if failure_message is not None:
+            callback(failure_message)
+
+    def _mark_failed(self, message: str) -> Callable[[str], None] | None:
+        with self._state_lock:
+            self._failed_message = message
+            return self._fatal_callback
+
+    def _terminal_message_locked(self) -> str | None:
+        if self._failed_message is not None:
+            return self._failed_message
+        if self._closing.is_set():
+            return "Sparse-vLLM server is shutting down."
+        if not self._thread.is_alive():
+            return "Sparse-vLLM dispatcher thread is not running."
+        return None
 
     async def submit(
         self,
@@ -80,46 +114,44 @@ class AsyncEngineDispatcher:
         index: int,
         stop: list[str] | None = None,
     ) -> RequestHandle:
-        if self._failed_message is not None:
-            output_queue: asyncio.Queue = asyncio.Queue()
-            output_queue.put_nowait({"type": "error", "message": self._failed_message})
-            return RequestHandle(output_queue=output_queue, cancelled=threading.Event())
-        if self._closing.is_set():
-            output_queue = asyncio.Queue()
-            output_queue.put_nowait({"type": "error", "message": "Sparse-vLLM server is shutting down."})
-            return RequestHandle(output_queue=output_queue, cancelled=threading.Event())
         output_queue: asyncio.Queue = asyncio.Queue()
         cancelled = threading.Event()
         handle = RequestHandle(output_queue=output_queue, cancelled=cancelled)
-        self._pending.put(
-            _QueuedRequest(
-                prompt=prompt,
-                sampling_params=sampling_params,
-                index=index,
-                stop=list(stop or []),
-                loop=asyncio.get_running_loop(),
-                output_queue=output_queue,
-                cancelled=cancelled,
-                handle=handle,
-            )
+        queued = _QueuedRequest(
+            prompt=prompt,
+            sampling_params=sampling_params,
+            index=index,
+            stop=list(stop or []),
+            loop=asyncio.get_running_loop(),
+            output_queue=output_queue,
+            cancelled=cancelled,
+            handle=handle,
         )
+        with self._state_lock:
+            terminal_message = self._terminal_message_locked()
+            if terminal_message is None:
+                self._pending.put(queued)
+        if terminal_message is not None:
+            output_queue.put_nowait(
+                {"type": "error", "message": terminal_message}
+            )
         return handle
 
     async def control(self, operation: str, **kwargs: Any) -> Any:
-        if self._failed_message is not None:
-            raise RuntimeError(self._failed_message)
-        if self._closing.is_set():
-            raise RuntimeError("Sparse-vLLM server is shutting down.")
         output_queue: asyncio.Queue = asyncio.Queue()
-        self._controls.put(
-            _ControlRequest(
-                operation=operation,
-                kwargs=dict(kwargs),
-                loop=asyncio.get_running_loop(),
-                output_queue=output_queue,
-            )
+        queued = _ControlRequest(
+            operation=operation,
+            kwargs=dict(kwargs),
+            loop=asyncio.get_running_loop(),
+            output_queue=output_queue,
         )
-        self._pending.put(_WAKEUP)
+        with self._state_lock:
+            terminal_message = self._terminal_message_locked()
+            if terminal_message is None:
+                self._controls.put(queued)
+                self._pending.put(_WAKEUP)
+        if terminal_message is not None:
+            raise RuntimeError(terminal_message)
         result = await output_queue.get()
         if result["type"] == "error":
             raise RuntimeError(result["message"])
@@ -131,8 +163,10 @@ class AsyncEngineDispatcher:
             self._aborts.put(handle.seq_id)
 
     def close(self):
-        self._closing.set()
-        self._pending.put(None)
+        with self._state_lock:
+            if not self._closing.is_set():
+                self._closing.set()
+                self._pending.put(None)
         timeout_s = float(os.getenv("SPARSEVLLM_OPENAI_SHUTDOWN_TIMEOUT_S", "5"))
         self._thread.join(timeout=max(0.0, timeout_s))
         if self._thread.is_alive():
@@ -151,48 +185,54 @@ class AsyncEngineDispatcher:
     def _run(self):
         active: dict[int, _ActiveRequest] = {}
         stopping = False
-        while not stopping:
-            self._drain_controls()
-            self._drain_aborts(active)
-            if not active:
-                item = self._pending.get()
-                if item is None:
-                    break
-                if item is _WAKEUP:
-                    continue
-                self._admit(item, active)
+        fatal_callback: Callable[[str], None] | None = None
+        try:
+            while not stopping:
+                self._drain_controls()
+                self._drain_aborts(active)
+                if not active:
+                    item = self._pending.get()
+                    if item is None:
+                        break
+                    if item is _WAKEUP:
+                        continue
+                    self._admit(item, active)
 
-            while True:
-                try:
-                    item = self._pending.get_nowait()
-                except queue.Empty:
-                    break
-                if item is None:
-                    stopping = True
-                    continue
-                if item is _WAKEUP:
-                    continue
-                self._admit(item, active)
+                while True:
+                    try:
+                        item = self._pending.get_nowait()
+                    except queue.Empty:
+                        break
+                    if item is None:
+                        stopping = True
+                        continue
+                    if item is _WAKEUP:
+                        continue
+                    self._admit(item, active)
 
-            self._drain_controls()
-            self._drain_aborts(active)
-            if not active:
-                continue
+                self._drain_controls()
+                self._drain_aborts(active)
+                if not active:
+                    continue
 
-            try:
                 finished_outputs, _num_tokens = self.engine.step()
                 self._publish_token_deltas(active)
                 self._publish_finished(active, finished_outputs)
-            except Exception as exc:
-                self._failed_message = f"{type(exc).__name__}: {exc}"
-                for request in list(active.values()):
-                    self._put(request, {"type": "error", "message": self._failed_message})
-                self._abort_all(active)
-                self._drain_pending_after_failure()
-                break
-
-        self._abort_all(active)
-        self._drain_pending_after_failure("Sparse-vLLM server is shutting down.")
+        except Exception as exc:
+            failed_message = f"{type(exc).__name__}: {exc}"
+            fatal_callback = self._mark_failed(failed_message)
+            logger.exception("OpenAI dispatcher stopped after a fatal error: {}", failed_message)
+        finally:
+            terminal_message = self.failure_message or "Sparse-vLLM server is shutting down."
+            try:
+                self._fail_active_requests(active, terminal_message)
+                self._drain_queued_requests(terminal_message)
+            finally:
+                if fatal_callback is not None:
+                    try:
+                        fatal_callback(terminal_message)
+                    except Exception:
+                        logger.exception("OpenAI dispatcher fatal callback failed")
 
     def _drain_controls(self):
         while True:
@@ -289,8 +329,8 @@ class AsyncEngineDispatcher:
                 self._publish_pending_token_event(request, text, raw_text_delta)
             if stop_index is not None:
                 final = request.detokenizer.finish(request.completion_token_ids)
-                active.pop(seq_id, None)
                 self.engine.abort_request(seq_id)
+                active.pop(seq_id, None)
                 self._put(
                     request,
                     {
@@ -337,25 +377,41 @@ class AsyncEngineDispatcher:
             except queue.Empty:
                 return
             if seq_id in active:
-                active.pop(seq_id)
                 self.engine.abort_request(seq_id)
+                active.pop(seq_id)
 
-    def _abort_all(self, active: dict[int, _ActiveRequest]):
-        for seq_id in list(active):
-            active.pop(seq_id)
-            self.engine.abort_request(seq_id)
+    def _fail_active_requests(self, active: dict[int, _ActiveRequest], message: str):
+        for seq_id, request in list(active.items()):
+            active.pop(seq_id, None)
+            try:
+                self._put(request, {"type": "error", "message": message})
+            except Exception:
+                logger.exception("Failed to notify OpenAI request {} during dispatcher shutdown", seq_id)
+            try:
+                self.engine.abort_request(seq_id)
+            except Exception:
+                logger.exception("Failed to abort OpenAI request {} during dispatcher shutdown", seq_id)
 
-    def _drain_pending_after_failure(self, message: str | None = None):
-        error = message or self._failed_message
-        if error is None:
-            return
+    def _drain_queued_requests(self, message: str):
         while True:
             try:
                 item = self._pending.get_nowait()
             except queue.Empty:
-                return
+                break
             if item is not None and item is not _WAKEUP:
-                self._put(item, {"type": "error", "message": error})
+                try:
+                    self._put(item, {"type": "error", "message": message})
+                except Exception:
+                    logger.exception("Failed to notify queued OpenAI request during dispatcher shutdown")
+        while True:
+            try:
+                item = self._controls.get_nowait()
+            except queue.Empty:
+                return
+            try:
+                self._put_control(item, {"type": "error", "message": message})
+            except Exception:
+                logger.exception("Failed to notify queued OpenAI control request during dispatcher shutdown")
 
     def _publish_finished(
         self,
