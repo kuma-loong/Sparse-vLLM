@@ -8,6 +8,8 @@
   </p>
 </div>
 
+<p align="center">English | <a href="README_zh.md">简体中文</a></p>
+
 A sparse-first inference engine for long-context LLM serving, which also includes DeltaKV compressor training and evaluation tooling.
 
 <div align="center">
