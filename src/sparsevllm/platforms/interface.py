@@ -61,6 +61,10 @@ class Platform:
     def get_allocator_stats(self, device: torch.device | None = None) -> AllocatorStats:
         return AllocatorStats()
 
+    def reset_peak_memory_stats(self, device: torch.device | None = None) -> None:
+        del device
+        return None
+
     def empty_cache(self) -> None:
         return None
 

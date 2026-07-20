@@ -48,7 +48,7 @@ class PrefixCacheCoordinator:
         self.recurrent_state_manager = recurrent_state_manager
         self.enabled = bool(config.enable_prefix_caching)
         self.block_size = int(config.prefix_cache_block_size or 0)
-        self.max_recurrent_bytes = int(config.prefix_cache_max_recurrent_bytes)
+        self.max_recurrent_bytes = int(config.prefix_recurrent_capacity_bytes)
         self.prefix_cache = None
         if self.enabled:
             self.prefix_cache = RadixPrefixIndex(
@@ -60,6 +60,9 @@ class PrefixCacheCoordinator:
         self.seq_id_to_materialized_blocks: dict[int, list[PrefixCacheBlock]] = {}
         self.runtime_states: dict[int, _MixedPrefixRuntimeState] = {}
         self.pending_blocks: dict[int, list[_PendingMixedPrefixBlock]] = {}
+        self.pending_duplicate_refs: dict[int, list[bytes]] = {}
+        self.pending_block_ids: set[bytes] = set()
+        self.pending_recurrent_bytes = 0
         self.capacity_limited_seq_ids: set[int] = set()
         self.skipped_capacity_blocks = 0
 
@@ -131,6 +134,9 @@ class PrefixCacheCoordinator:
         stats = self.prefix_cache.stats()
         stats["mixed_prefix_cache_accounting_bytes"] = int(accounting_bytes)
         stats["mixed_prefix_cache_recurrent_bytes"] = int(recurrent_bytes)
+        stats["mixed_prefix_cache_pending_recurrent_bytes"] = int(
+            self.pending_recurrent_bytes
+        )
         stats["mixed_prefix_cache_max_recurrent_bytes"] = int(self.max_recurrent_bytes)
         stats["mixed_prefix_cache_skipped_capacity_blocks"] = int(self.skipped_capacity_blocks)
         stats["mixed_prefix_cache_evictable_slots"] = int(self.evictable_slots())
@@ -278,29 +284,77 @@ class PrefixCacheCoordinator:
         def add_block(block_tokens: list[int]) -> None:
             block_start = int(state.next_logical_block_idx) * self.block_size
             block_end = block_start + self.block_size
-            kv_payload = self.cache_manager.build_prefix_kv_payload(seq, block_start, block_end)
-            recurrent_payload = self.recurrent_state_manager.build_prefix_recurrent_payload(seq, block_end)
-            recurrent_bytes = int(
-                self.recurrent_state_manager.prefix_recurrent_payload_nbytes(recurrent_payload)
-            )
-            accounting_bytes = int(self.cache_manager.prefix_kv_payload_nbytes(kv_payload))
-            accounting_bytes += recurrent_bytes
             stable_block_id = self.prefix_cache.stable_block_id(block_tokens, state.parent_block_id)
-            pending.append(
-                _PendingMixedPrefixBlock(
-                    stable_block_id=stable_block_id,
-                    parent_block_id=state.parent_block_id,
-                    logical_block_idx=state.next_logical_block_idx,
-                    token_ids=block_tokens,
-                    payload=MixedPrefixBlockPayload(
-                        kv_payload=kv_payload,
-                        recurrent_payload=recurrent_payload,
-                        token_count=self.block_size,
-                        accounting_bytes=accounting_bytes,
-                        recurrent_bytes=recurrent_bytes,
-                    ),
+            existing = self.prefix_cache.get_block(stable_block_id)
+            if existing is not None:
+                self._hold_materialized_ref(seq, existing)
+                state.parent_block_id = stable_block_id
+                state.next_logical_block_idx += 1
+                return
+            if stable_block_id in self.pending_block_ids:
+                duplicate_refs = self.pending_duplicate_refs.setdefault(
+                    int(seq.seq_id),
+                    [],
                 )
+                if stable_block_id not in duplicate_refs:
+                    duplicate_refs.append(stable_block_id)
+                state.parent_block_id = stable_block_id
+                state.next_logical_block_idx += 1
+                return
+
+            recurrent_bytes = int(
+                self.recurrent_state_manager.prefix_recurrent_snapshot_nbytes()
             )
+            if not self._reserve_pending_block(stable_block_id, recurrent_bytes):
+                self.capacity_limited_seq_ids.add(int(seq.seq_id))
+                self.skipped_capacity_blocks += 1
+                return
+            recurrent_payload = None
+            try:
+                kv_payload = self.cache_manager.build_prefix_kv_payload(
+                    seq,
+                    block_start,
+                    block_end,
+                )
+                recurrent_payload = self.recurrent_state_manager.build_prefix_recurrent_payload(
+                    seq,
+                    block_end,
+                )
+                actual_recurrent_bytes = int(
+                    self.recurrent_state_manager.prefix_recurrent_payload_nbytes(
+                        recurrent_payload
+                    )
+                )
+                if actual_recurrent_bytes != recurrent_bytes:
+                    raise RuntimeError(
+                        "Mixed prefix recurrent snapshot bytes differ from the model declaration: "
+                        f"declared={recurrent_bytes} actual={actual_recurrent_bytes}."
+                    )
+                accounting_bytes = int(
+                    self.cache_manager.prefix_kv_payload_nbytes(kv_payload)
+                ) + recurrent_bytes
+                pending.append(
+                    _PendingMixedPrefixBlock(
+                        stable_block_id=stable_block_id,
+                        parent_block_id=state.parent_block_id,
+                        logical_block_idx=state.next_logical_block_idx,
+                        token_ids=block_tokens,
+                        payload=MixedPrefixBlockPayload(
+                            kv_payload=kv_payload,
+                            recurrent_payload=recurrent_payload,
+                            token_count=self.block_size,
+                            accounting_bytes=accounting_bytes,
+                            recurrent_bytes=recurrent_bytes,
+                        ),
+                    )
+                )
+            except BaseException:
+                if recurrent_payload is not None:
+                    self.recurrent_state_manager.free_prefix_recurrent_payload(
+                        recurrent_payload
+                    )
+                self._release_pending_reservation(stable_block_id, recurrent_bytes)
+                raise
             state.parent_block_id = stable_block_id
             state.next_logical_block_idx += 1
 
@@ -328,35 +382,16 @@ class PrefixCacheCoordinator:
         with profiler.record("mixed_prefix_cache_commit"):
             for seq in seqs:
                 pending_blocks = self.pending_blocks.pop(int(seq.seq_id), [])
-                if not pending_blocks:
-                    continue
                 materialized = self.seq_id_to_materialized_blocks.setdefault(int(seq.seq_id), [])
-                protected: list[PrefixCacheBlock] = []
-                protected_ids = {
-                    block_id
-                    for pending in pending_blocks
-                    for block_id in (pending.parent_block_id, pending.stable_block_id)
-                    if block_id is not None and self.prefix_cache.has_block(block_id)
-                }
-                for block_id in protected_ids:
-                    block = self.prefix_cache.get_block(block_id)
-                    if block is not None:
-                        block.ref_count += 1
-                        protected.append(block)
-                try:
-                    for pending in pending_blocks:
-                        if not self.prefix_cache.has_block(pending.stable_block_id):
-                            has_capacity = self._evict_for_insert(
-                                1,
-                                incoming_recurrent_bytes=int(pending.payload.recurrent_bytes),
+                for pending_idx, pending in enumerate(pending_blocks):
+                    inserted = None
+                    inserted_new = False
+                    recurrent_released = False
+                    try:
+                        if self.prefix_cache.has_block(pending.stable_block_id):
+                            raise RuntimeError(
+                                "Mixed prefix block became duplicate after unique pending reservation."
                             )
-                            if not has_capacity:
-                                self.capacity_limited_seq_ids.add(int(seq.seq_id))
-                                self.skipped_capacity_blocks += 1
-                                self.recurrent_state_manager.free_prefix_recurrent_payload(
-                                    pending.payload.recurrent_payload
-                                )
-                                continue
                         block = PrefixCacheBlock(
                             stable_block_id=pending.stable_block_id,
                             parent_block_id=pending.parent_block_id,
@@ -367,15 +402,81 @@ class PrefixCacheCoordinator:
                         )
                         inserted = self.prefix_cache.insert_block(block)
                         if inserted is not block:
-                            continue
+                            raise RuntimeError(
+                                "Mixed prefix insertion returned an unexpected duplicate block."
+                            )
+                        inserted_new = True
                         inserted.ref_count = 1
                         materialized.append(inserted)
-                        self.cache_manager.mark_materialized_prefix_kv_payload(seq, pending.payload.kv_payload)
-                finally:
-                    for block in protected:
-                        block.ref_count -= 1
-                        if block.ref_count < 0:
-                            raise RuntimeError("Mixed prefix cache block ref_count became negative.")
+                        try:
+                            self.cache_manager.mark_materialized_prefix_kv_payload(
+                                seq,
+                                pending.payload.kv_payload,
+                            )
+                        except BaseException:
+                            self.cache_manager.rollback_materialized_prefix_kv_payload(
+                                seq,
+                                pending.payload.kv_payload,
+                            )
+                            materialized.remove(inserted)
+                            inserted.ref_count = 0
+                            self.prefix_cache.rollback_inserted_leaf(inserted)
+                            self.recurrent_state_manager.free_prefix_recurrent_payload(
+                                pending.payload.recurrent_payload
+                            )
+                            recurrent_released = True
+                            inserted_new = False
+                            raise
+                    except BaseException:
+                        if not inserted_new and not recurrent_released:
+                            self.recurrent_state_manager.free_prefix_recurrent_payload(
+                                pending.payload.recurrent_payload
+                            )
+                        for unprocessed in pending_blocks[pending_idx + 1 :]:
+                            self.recurrent_state_manager.free_prefix_recurrent_payload(
+                                unprocessed.payload.recurrent_payload
+                            )
+                            self._release_pending_reservation(
+                                unprocessed.stable_block_id,
+                                int(unprocessed.payload.recurrent_bytes),
+                            )
+                        self.pending_duplicate_refs.pop(int(seq.seq_id), None)
+                        if not materialized:
+                            self.seq_id_to_materialized_blocks.pop(
+                                int(seq.seq_id),
+                                None,
+                            )
+                        raise
+                    finally:
+                        self._release_pending_reservation(
+                            pending.stable_block_id,
+                            int(pending.payload.recurrent_bytes),
+                        )
+                for stable_block_id in self.pending_duplicate_refs.pop(
+                    int(seq.seq_id),
+                    [],
+                ):
+                    block = self.prefix_cache.get_block(stable_block_id)
+                    if block is None:
+                        raise RuntimeError(
+                            "Mixed prefix duplicate reservation was not committed by its owner."
+                        )
+                    self._hold_materialized_ref(seq, block)
+
+    def _hold_materialized_ref(
+        self,
+        seq: Sequence,
+        block: PrefixCacheBlock,
+    ) -> None:
+        seq_id = int(seq.seq_id)
+        held = [
+            *self.seq_id_to_prefix_blocks.get(seq_id, []),
+            *self.seq_id_to_materialized_blocks.get(seq_id, []),
+        ]
+        if any(existing.stable_block_id == block.stable_block_id for existing in held):
+            return
+        block.ref_count += 1
+        self.seq_id_to_materialized_blocks.setdefault(seq_id, []).append(block)
 
     def _live_recurrent_bytes(self) -> int:
         total = 0
@@ -385,6 +486,35 @@ class PrefixCacheCoordinator:
                 raise RuntimeError("Mixed prefix cache block has an invalid payload.")
             total += int(payload.recurrent_bytes)
         return int(total)
+
+    def _reserve_pending_block(
+        self,
+        stable_block_id: bytes,
+        recurrent_bytes: int,
+    ) -> bool:
+        recurrent_bytes = int(recurrent_bytes)
+        if stable_block_id in self.pending_block_ids:
+            return False
+        if not self._evict_for_insert(
+            1,
+            incoming_recurrent_bytes=recurrent_bytes,
+        ):
+            return False
+        self.pending_block_ids.add(stable_block_id)
+        self.pending_recurrent_bytes += recurrent_bytes
+        return True
+
+    def _release_pending_reservation(
+        self,
+        stable_block_id: bytes,
+        recurrent_bytes: int,
+    ) -> None:
+        if stable_block_id not in self.pending_block_ids:
+            raise RuntimeError("Mixed prefix pending reservation is missing during release.")
+        self.pending_block_ids.remove(stable_block_id)
+        self.pending_recurrent_bytes -= int(recurrent_bytes)
+        if self.pending_recurrent_bytes < 0:
+            raise RuntimeError("Mixed prefix pending recurrent byte count became negative.")
 
     def _evict_for_insert(self, needed_blocks: int, *, incoming_recurrent_bytes: int) -> bool:
         incoming_recurrent_bytes = int(incoming_recurrent_bytes)
@@ -401,13 +531,23 @@ class PrefixCacheCoordinator:
         prefix_cache = self._require_prefix_cache()
         needed_blocks = int(needed_blocks)
         if prefix_cache.max_blocks is not None:
-            over_capacity = len(prefix_cache.blocks) + needed_blocks - int(prefix_cache.max_blocks)
+            over_capacity = (
+                len(prefix_cache.blocks)
+                + len(getattr(self, "pending_block_ids", ()))
+                + needed_blocks
+                - int(prefix_cache.max_blocks)
+            )
             if over_capacity > 0:
                 evicted = prefix_cache.evict_until_freeable(over_capacity)
                 self._free_blocks(evicted)
                 if len(evicted) != over_capacity:
                     return False
-        while self._live_recurrent_bytes() + incoming_recurrent_bytes > self.max_recurrent_bytes:
+        while (
+            self._live_recurrent_bytes()
+            + int(getattr(self, "pending_recurrent_bytes", 0))
+            + incoming_recurrent_bytes
+            > self.max_recurrent_bytes
+        ):
             byte_evicted = prefix_cache.evict_until_freeable(1)
             if not byte_evicted:
                 return False
@@ -431,10 +571,13 @@ class PrefixCacheCoordinator:
             )
 
     def _free_blocks(self, blocks: list[PrefixCacheBlock]) -> None:
-        for block in blocks:
-            payload = block.payload
-            if not isinstance(payload, MixedPrefixBlockPayload):
-                raise RuntimeError("Mixed prefix cache block has an invalid payload.")
+        payloads = [block.payload for block in blocks]
+        if any(
+            not isinstance(payload, MixedPrefixBlockPayload)
+            for payload in payloads
+        ):
+            raise RuntimeError("Mixed prefix cache block has an invalid payload.")
+        for payload in payloads:
             self.cache_manager.free_prefix_kv_payload(payload.kv_payload)
             self.recurrent_state_manager.free_prefix_recurrent_payload(payload.recurrent_payload)
 
@@ -449,7 +592,15 @@ class PrefixCacheCoordinator:
             if block.ref_count < 0:
                 raise RuntimeError("Mixed prefix cache block ref_count became negative.")
         self.runtime_states.pop(seq_id, None)
-        self.pending_blocks.pop(seq_id, None)
+        for pending in self.pending_blocks.pop(seq_id, []):
+            self.recurrent_state_manager.free_prefix_recurrent_payload(
+                pending.payload.recurrent_payload
+            )
+            self._release_pending_reservation(
+                pending.stable_block_id,
+                int(pending.payload.recurrent_bytes),
+            )
+        self.pending_duplicate_refs.pop(seq_id, None)
         self.capacity_limited_seq_ids.discard(seq_id)
 
     def reset_after_warmup(self) -> None:
@@ -457,8 +608,15 @@ class PrefixCacheCoordinator:
             return
         if self.seq_id_to_prefix_blocks or self.seq_id_to_materialized_blocks:
             raise RuntimeError("Cannot reset mixed prefix cache while sequences still reference blocks.")
-        if self.pending_blocks:
-            raise RuntimeError("Cannot reset mixed prefix cache with pending materializations.")
+        for pending_blocks in self.pending_blocks.values():
+            for pending in pending_blocks:
+                self.recurrent_state_manager.free_prefix_recurrent_payload(
+                    pending.payload.recurrent_payload
+                )
+                self._release_pending_reservation(
+                    pending.stable_block_id,
+                    int(pending.payload.recurrent_bytes),
+                )
         blocks = list(self.prefix_cache.blocks.values())
         referenced = [block for block in blocks if int(block.ref_count) != 0]
         if referenced:
@@ -476,5 +634,8 @@ class PrefixCacheCoordinator:
         self.seq_id_to_materialized_blocks.clear()
         self.runtime_states.clear()
         self.pending_blocks.clear()
+        self.pending_duplicate_refs.clear()
+        self.pending_block_ids.clear()
+        self.pending_recurrent_bytes = 0
         self.capacity_limited_seq_ids.clear()
         self.skipped_capacity_blocks = 0

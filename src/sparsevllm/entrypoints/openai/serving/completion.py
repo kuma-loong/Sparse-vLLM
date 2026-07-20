@@ -18,6 +18,8 @@ from sparsevllm.entrypoints.openai.serving.base import _completion_logprobs
 from sparsevllm.entrypoints.openai.serving.base import _model_dump_json
 from sparsevllm.entrypoints.openai.serving.base import _sse
 from sparsevllm.entrypoints.openai.serving.base import _tokens_per_second
+from sparsevllm.entrypoints.openai.serving.base import DisconnectChecker
+from sparsevllm.entrypoints.openai.serving.base import _wait_for_any_or_disconnect
 from sparsevllm.entrypoints.openai.serving.base import _wait_final
 from sparsevllm.entrypoints.openai.serving.base import _write_request_log
 from sparsevllm.utils.log import logger
@@ -29,6 +31,8 @@ async def serve_completion(
     tokenizer: Any,
     served_model_name: str,
     request_log_path: Path | None,
+    *,
+    is_disconnected: DisconnectChecker | None = None,
 ):
     _validate_request(request, served_model_name)
     request_id = f"cmpl-{uuid.uuid4().hex}"
@@ -66,12 +70,28 @@ async def serve_completion(
 
     if request.stream:
         return StreamingResponse(
-            _completion_stream(dispatcher, request_id, created, request.model, handles, started, tokenizer),
+            _completion_stream(
+                dispatcher,
+                request_id,
+                created,
+                request.model,
+                handles,
+                started,
+                tokenizer,
+                is_disconnected=is_disconnected,
+            ),
             media_type="text/event-stream",
         )
 
     try:
-        response = await _completion_response(request_id, created, request.model, handles, tokenizer)
+        response = await _completion_response(
+            request_id,
+            created,
+            request.model,
+            handles,
+            tokenizer,
+            is_disconnected=is_disconnected,
+        )
     except asyncio.CancelledError:
         for handle in handles:
             dispatcher.cancel(handle)
@@ -131,12 +151,14 @@ async def _completion_response(
     model: str,
     handles: list[RequestHandle],
     tokenizer: Any | None = None,
+    *,
+    is_disconnected: DisconnectChecker | None = None,
 ) -> dict[str, Any]:
     choices = []
     prompt_tokens = 0
     completion_tokens = 0
     for handle in handles:
-        final = await _wait_final(handle.output_queue)
+        final = await _wait_final(handle.output_queue, is_disconnected)
         choices.append(
             {
                 "text": final["text"],
@@ -178,6 +200,8 @@ async def _completion_stream(
     handles: list[RequestHandle],
     started: float | None = None,
     tokenizer: Any | None = None,
+    *,
+    is_disconnected: DisconnectChecker | None = None,
 ):
     pending = {index: handle for index, handle in enumerate(handles)}
     prompt_tokens = 0
@@ -188,9 +212,15 @@ async def _completion_stream(
                 asyncio.create_task(handle.output_queue.get()): index
                 for index, handle in pending.items()
             }
-            done, pending_tasks = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
-            for task in pending_tasks:
-                task.cancel()
+            try:
+                done, _ = await _wait_for_any_or_disconnect(
+                    set(tasks),
+                    is_disconnected,
+                )
+            finally:
+                for task in tasks:
+                    if not task.done():
+                        task.cancel()
             for task in done:
                 item = task.result()
                 if item["type"] == "error":

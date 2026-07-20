@@ -17,19 +17,72 @@ class RecurrentPrefixPayload:
 
 
 @dataclass(frozen=True)
+class RecurrentTensorSpec:
+    """Exact TP-local geometry for one persistent recurrent tensor."""
+
+    name: str
+    shape: tuple[int, ...]
+    dtype: torch.dtype
+
+    def __post_init__(self) -> None:
+        name = str(self.name)
+        shape = tuple(int(dim) for dim in self.shape)
+        if not name or not shape or any(dim <= 0 for dim in shape):
+            raise ValueError(
+                f"Invalid recurrent tensor spec name={name!r} shape={shape!r}."
+            )
+        if not isinstance(self.dtype, torch.dtype):
+            raise TypeError(
+                f"Recurrent tensor dtype must be torch.dtype, got {type(self.dtype).__name__}."
+            )
+        object.__setattr__(self, "name", name)
+        object.__setattr__(self, "shape", shape)
+
+    @property
+    def nbytes(self) -> int:
+        elements = 1
+        for dim in self.shape:
+            elements *= int(dim)
+        return int(elements * torch.empty((), dtype=self.dtype).element_size())
+
+
+@dataclass(frozen=True)
 class RecurrentStateSpec:
     """Model-provided schema for one recurrent layer's persistent tensors."""
 
     name: str
-    state_names: tuple[str, ...]
+    tensor_specs: tuple[RecurrentTensorSpec, ...]
 
     def __post_init__(self) -> None:
-        names = tuple(str(name) for name in self.state_names)
+        tensor_specs = tuple(self.tensor_specs)
+        names = tuple(spec.name for spec in tensor_specs)
         if not self.name or not names or any(not name for name in names) or len(set(names)) != len(names):
             raise ValueError(
                 f"Invalid recurrent state spec name={self.name!r} state_names={names!r}."
             )
-        object.__setattr__(self, "state_names", names)
+        if any(not isinstance(spec, RecurrentTensorSpec) for spec in tensor_specs):
+            raise TypeError("RecurrentStateSpec.tensor_specs must contain RecurrentTensorSpec values.")
+        object.__setattr__(self, "tensor_specs", tensor_specs)
+
+    @property
+    def state_names(self) -> tuple[str, ...]:
+        return tuple(spec.name for spec in self.tensor_specs)
+
+    @property
+    def bytes_per_layer(self) -> int:
+        return int(sum(spec.nbytes for spec in self.tensor_specs))
+
+    def bytes_for_layers(self, num_layers: int) -> int:
+        return int(self.bytes_per_layer * int(num_layers))
+
+
+@dataclass(frozen=True)
+class RecurrentCapacity:
+    row_capacity: int
+    total_rows: int
+    bytes_per_row: int
+    pool_bytes: int
+    supported_active_sequences: int
 
 
 class RecurrentStateManager:
@@ -41,25 +94,110 @@ class RecurrentStateManager:
         rank: int,
         world_size: int,
         *,
+        device: torch.device,
+        platform=None,
         state_spec: RecurrentStateSpec,
     ):
         self.config = config
         self.rank = int(rank)
         self.world_size = int(world_size)
+        self.device = torch.device(device)
         self.runtime_layout = config.runtime_layout
         self.state_spec = state_spec
-        self.row_capacity = max(
-            int(config.max_num_seqs_in_batch) * REDUNDANCY_BATCH_SIZE_FACTOR,
-            int(config.max_decoding_seqs),
+        recurrent_layers = tuple(
+            int(layer_idx)
+            for layer_idx in self.runtime_layout.linear_attention_layer_indices
         )
+        capacity = self.resolve_capacity(
+            config,
+            state_spec,
+            num_recurrent_layers=len(recurrent_layers),
+        )
+        self.row_capacity = capacity.row_capacity
+        self.bytes_per_row = capacity.bytes_per_row
+        self.pool_bytes = capacity.pool_bytes
         if self.row_capacity <= 0:
             raise ValueError(f"Recurrent state row capacity must be positive, got {self.row_capacity}.")
         self.scratch_row = self.row_capacity
         self.seq_id_to_row: dict[int, int] = {}
         self.row_to_seq_id: list[int | None] = [None] * self.row_capacity
         self.free_rows: deque[int] = deque(range(self.row_capacity))
-        self.layer_buffers: dict[int, dict[str, torch.Tensor]] = {}
+        allocator_peak_before = 0
+        if platform is not None:
+            allocator_peak_before = int(
+                platform.get_allocator_stats(self.device).peak_allocated_bytes
+            )
+        self.layer_buffers: dict[int, dict[str, torch.Tensor]] = {
+            layer_idx: {
+                tensor_spec.name: torch.zeros(
+                    (capacity.total_rows, *tensor_spec.shape),
+                    dtype=tensor_spec.dtype,
+                    device=self.device,
+                )
+                for tensor_spec in state_spec.tensor_specs
+            }
+            for layer_idx in recurrent_layers
+        }
+        allocator_peak_after = allocator_peak_before
+        if platform is not None:
+            allocator_peak_after = int(
+                platform.get_allocator_stats(self.device).peak_allocated_bytes
+            )
         self.decode_state_indices: dict[int, torch.Tensor] = {}
+        config.recurrent_state_pool_bytes = int(self.pool_bytes)
+        config.recurrent_state_bytes_per_row = int(self.bytes_per_row)
+        config.recurrent_state_row_capacity = int(self.row_capacity)
+        config.prefix_recurrent_bytes_per_block = int(self.bytes_per_row)
+        config.recurrent_state_allocator_peak_before_bytes = int(
+            allocator_peak_before
+        )
+        config.recurrent_state_allocator_peak_after_bytes = int(
+            allocator_peak_after
+        )
+
+    @staticmethod
+    def resolve_capacity(
+        config: Config,
+        state_spec: RecurrentStateSpec,
+        *,
+        num_recurrent_layers: int,
+    ) -> RecurrentCapacity:
+        num_recurrent_layers = int(num_recurrent_layers)
+        if num_recurrent_layers <= 0:
+            raise ValueError(
+                f"num_recurrent_layers must be positive, got {num_recurrent_layers}."
+            )
+        bytes_per_row = state_spec.bytes_for_layers(num_recurrent_layers)
+        requested_active = max(
+            int(config.max_num_seqs_in_batch),
+            int(config.max_decoding_seqs),
+        )
+        requested_rows = max(
+            int(config.max_num_seqs_in_batch) * REDUNDANCY_BATCH_SIZE_FACTOR,
+            int(config.max_decoding_seqs),
+        )
+        supported_active = requested_rows
+        row_capacity = requested_rows
+        if not bool(config.enable_prefix_caching):
+            budget_bytes = int(config.recurrent_state_max_bytes)
+            supported_active = budget_bytes // bytes_per_row - 1
+            if requested_active > supported_active:
+                raise RuntimeError(
+                    f"{state_spec.name} recurrent state exceeds the prefix-off live-state budget: "
+                    f"requested_active_sequences={requested_active} "
+                    f"supported_active_sequences={supported_active} "
+                    f"bytes_per_row={bytes_per_row} budget_bytes={budget_bytes} "
+                    "(one additional scratch row is required)."
+                )
+            row_capacity = min(requested_rows, supported_active)
+        total_rows = row_capacity + 1
+        return RecurrentCapacity(
+            row_capacity=int(row_capacity),
+            total_rows=int(total_rows),
+            bytes_per_row=int(bytes_per_row),
+            pool_bytes=int(total_rows * bytes_per_row),
+            supported_active_sequences=int(supported_active),
+        )
 
     def _allocate_row(self, seq_id: int) -> int:
         seq_id = int(seq_id)
@@ -82,13 +220,17 @@ class RecurrentStateManager:
     def _ensure_buffer(self, layer_idx: int, name: str, value: torch.Tensor) -> torch.Tensor:
         layer_idx = int(layer_idx)
         name = str(name)
-        buffers = self.layer_buffers.setdefault(layer_idx, {})
+        buffers = self.layer_buffers.get(layer_idx)
+        if buffers is None:
+            raise RuntimeError(
+                f"Recurrent state was requested for undeclared layer_idx={layer_idx}."
+            )
         buffer = buffers.get(name)
         expected_shape = (self.row_capacity + 1, *value.shape)
         if buffer is None:
-            buffer = torch.zeros(expected_shape, dtype=value.dtype, device=value.device)
-            buffers[name] = buffer
-            return buffer
+            raise RuntimeError(
+                f"Recurrent state was requested for undeclared tensor name={name!r}."
+            )
         if tuple(buffer.shape) != tuple(expected_shape):
             raise RuntimeError(
                 "Recurrent state shape changed after row pool allocation: "
@@ -288,6 +430,9 @@ class RecurrentStateManager:
 
     def free_prefix_recurrent_payload(self, payload: RecurrentPrefixPayload | None) -> None:
         del payload
+
+    def prefix_recurrent_snapshot_nbytes(self) -> int:
+        return int(self.bytes_per_row)
 
     def prefix_recurrent_payload_nbytes(self, payload: RecurrentPrefixPayload | None) -> int:
         if payload is None:

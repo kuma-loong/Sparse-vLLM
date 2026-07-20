@@ -34,8 +34,13 @@ CLAW_EVAL_DIR="${CLAW_EVAL_DIR:-${REPO_ROOT}/../claw-eval}"
 CLAW_EVAL_REF="${CLAW_EVAL_REF:-main}"
 CLAW_EVAL_CONFIG_TEMPLATE="${CLAW_EVAL_CONFIG_TEMPLATE:-${REPO_ROOT}/benchmark/claw_eval/sparsevllm_config.yaml}"
 CLAW_EVAL_RESULT_VALIDATOR="${CLAW_EVAL_RESULT_VALIDATOR:-${REPO_ROOT}/benchmark/claw_eval/validate_results.py}"
+CLAW_EVAL_TASK_SELECTOR="${CLAW_EVAL_TASK_SELECTOR:-${REPO_ROOT}/benchmark/claw_eval/select_tasks.py}"
 CLAW_EVAL_CONFIG="${RUN_DIR}/sparsevllm_config.yaml"
 CLAW_EVAL_ARGS="${CLAW_EVAL_ARGS:-batch --config ${CLAW_EVAL_CONFIG} --sandbox --trials 3 --parallel 1}"
+CLAW_EVAL_TEXT_ONLY="${CLAW_EVAL_TEXT_ONLY:-0}"
+CLAW_EVAL_RESUME_TRACE_DIR="${CLAW_EVAL_RESUME_TRACE_DIR:-}"
+CLAW_EVAL_SELECTION_SUMMARY=""
+CLAW_EVAL_SKIPPED_RESULTS=""
 CLAW_EVAL_UPDATE_REPO="${CLAW_EVAL_UPDATE_REPO:-1}"
 CLAW_EVAL_SANDBOX_IMAGE="${CLAW_EVAL_SANDBOX_IMAGE:-claw-eval-agent:latest}"
 CLAW_EVAL_BUILD_SANDBOX_IMAGE="${CLAW_EVAL_BUILD_SANDBOX_IMAGE:-0}"
@@ -52,6 +57,7 @@ SETUP_ONLY="${SETUP_ONLY:-0}"
 SPARSEVLLM_CONDA_ENV="${SPARSEVLLM_CONDA_ENV:-${CONDA_ENVS_ROOT}/sparse-vllm-tf530}"
 CLAW_EVAL_CONDA_ENV="${CLAW_EVAL_CONDA_ENV:-${CONDA_ENVS_ROOT}/claw-eval-py311}"
 SPARSEVLLM_MASTER_PORT="${SPARSEVLLM_MASTER_PORT:-2333}"
+SPARSEVLLM_DATA_PARALLEL_SIZE="${SPARSEVLLM_DATA_PARALLEL_SIZE:-1}"
 if [[ -z "${ENGINE_KWARGS:-}" ]]; then
   ENGINE_KWARGS="{\"tensor_parallel_size\":1,\"gpu_memory_utilization\":0.88,\"max_model_len\":${SPARSEVLLM_CONTEXT_WINDOW},\"engine_prefill_chunk_size\":4096,\"sparse_method\":\"vanilla\"}"
 fi
@@ -89,9 +95,14 @@ export CLAW_EVAL_EFFECTIVE_SANDBOX_IMAGE
 export CLAW_EVAL_SANDBOX_IMAGE_ID
 export CLAW_EVAL_SANDBOX_IMAGE_SIZE_BYTES
 export CLAW_EVAL_RESULT_VALIDATOR
+export CLAW_EVAL_TEXT_ONLY
+export CLAW_EVAL_RESUME_TRACE_DIR
+export CLAW_EVAL_SELECTION_SUMMARY
+export CLAW_EVAL_SKIPPED_RESULTS
 export SPARSEVLLM_CONDA_ENV
 export CLAW_EVAL_CONDA_ENV
 export SPARSEVLLM_MASTER_PORT
+export SPARSEVLLM_DATA_PARALLEL_SIZE
 export SETUP_ONLY
 export DOWNLOAD_HTTP_PROXY
 export ENGINE_KWARGS_FILE
@@ -250,9 +261,13 @@ PY
 }
 
 write_engine_kwargs_file() {
-  ENGINE_KWARGS_RAW="${ENGINE_KWARGS}" "${CLAW_EVAL_CONDA_ENV}/bin/python" - "${ENGINE_KWARGS_FILE}" <<'PY'
+  ENGINE_KWARGS_RAW="${ENGINE_KWARGS}" \
+    CLAW_EVAL_ARGS_RAW="${CLAW_EVAL_ARGS}" \
+    SPARSEVLLM_DATA_PARALLEL_SIZE="${SPARSEVLLM_DATA_PARALLEL_SIZE}" \
+    "${CLAW_EVAL_CONDA_ENV}/bin/python" - "${ENGINE_KWARGS_FILE}" <<'PY'
 import json
 import os
+import shlex
 import sys
 from pathlib import Path
 
@@ -267,11 +282,38 @@ else:
         data = json.load(f)
 if not isinstance(data, dict):
     raise ValueError("ENGINE_KWARGS must resolve to a JSON object")
+args = shlex.split(os.environ["CLAW_EVAL_ARGS_RAW"])
+parallel_values = []
+for index, arg in enumerate(args):
+    if arg == "--parallel":
+        if index + 1 >= len(args):
+            raise ValueError("--parallel requires a value")
+        parallel_values.append(args[index + 1])
+    elif arg.startswith("--parallel="):
+        parallel_values.append(arg.split("=", 1)[1])
+if len(parallel_values) != 1:
+    raise ValueError(
+        "CLAW_EVAL_ARGS must set --parallel exactly once so server capacity is reproducible"
+    )
+parallel = int(parallel_values[0])
+dp_size = int(os.environ["SPARSEVLLM_DATA_PARALLEL_SIZE"])
+if parallel <= 0 or dp_size <= 0:
+    raise ValueError(f"parallel and data-parallel size must be positive: {parallel=}, {dp_size=}")
+if parallel % dp_size:
+    raise ValueError(
+        "benchmark parallelism must be divisible by data-parallel size: "
+        f"{parallel} % {dp_size} != 0"
+    )
+data["max_decoding_seqs"] = parallel // dp_size
 dst = Path(sys.argv[1])
 dst.parent.mkdir(parents=True, exist_ok=True)
 with dst.open("w", encoding="utf-8") as f:
     json.dump(data, f, ensure_ascii=False, indent=2, sort_keys=True)
     f.write("\n")
+print(
+    f"server_max_decoding_seqs={data['max_decoding_seqs']} "
+    f"benchmark_parallel={parallel} data_parallel_size={dp_size}"
+)
 PY
 }
 
@@ -285,6 +327,83 @@ from string import Template
 
 print(Template(os.environ["CLAW_EVAL_ARGS_TEMPLATE"]).safe_substitute(os.environ))
 PY
+}
+
+prepare_resume_args() {
+  if [[ -z "${CLAW_EVAL_RESUME_TRACE_DIR}" ]]; then
+    return
+  fi
+  require_file "${CLAW_EVAL_RESUME_TRACE_DIR}" "Claw-Eval resume trace directory"
+  CLAW_EVAL_ARGS_RAW="${CLAW_EVAL_ARGS}" \
+    CLAW_EVAL_RESUME_TRACE_DIR="${CLAW_EVAL_RESUME_TRACE_DIR}" \
+    TRACE_DIR="${TRACE_DIR}" \
+    "${CLAW_EVAL_CONDA_ENV}/bin/python" - <<'PY'
+import os
+import shlex
+from pathlib import Path
+
+args = shlex.split(os.environ["CLAW_EVAL_ARGS_RAW"])
+if "--continue" in args or any(arg.startswith("--continue=") for arg in args):
+    raise SystemExit("CLAW_EVAL_ARGS already contains --continue")
+resume = Path(os.environ["CLAW_EVAL_RESUME_TRACE_DIR"]).resolve()
+trace_dir = Path(os.environ["TRACE_DIR"]).resolve()
+if not resume.is_relative_to(trace_dir):
+    raise SystemExit(
+        f"resume trace must be inside this run's TRACE_DIR: {resume} is not under {trace_dir}"
+    )
+PY
+  printf -v resume_trace_quoted '%q' "${CLAW_EVAL_RESUME_TRACE_DIR}"
+  CLAW_EVAL_ARGS+=" --continue ${resume_trace_quoted}"
+}
+
+prepare_task_selection() {
+  if [[ "${CLAW_EVAL_TEXT_ONLY}" != "1" ]]; then
+    return
+  fi
+  require_file "${CLAW_EVAL_TASK_SELECTOR}" "Claw-Eval task selector"
+  local source_tasks_dir="${CLAW_EVAL_DIR}/tasks"
+  local selection_root="${RUN_DIR}/text_only_selection"
+  local selected_tasks_dir="${selection_root}/tasks"
+  CLAW_EVAL_SELECTION_SUMMARY="${RUN_DIR}/task_selection.json"
+  CLAW_EVAL_SKIPPED_RESULTS="${RUN_DIR}/skipped_by_policy.jsonl"
+  export CLAW_EVAL_SELECTION_SUMMARY
+  export CLAW_EVAL_SKIPPED_RESULTS
+
+  local tag
+  tag="$({
+    CLAW_EVAL_ARGS_RAW="${CLAW_EVAL_ARGS}" "${CLAW_EVAL_CONDA_ENV}/bin/python" - <<'PY'
+import os
+import shlex
+
+args = shlex.split(os.environ["CLAW_EVAL_ARGS_RAW"])
+if "--tasks-dir" in args or any(arg.startswith("--tasks-dir=") for arg in args):
+    raise SystemExit("CLAW_EVAL_TEXT_ONLY=1 owns --tasks-dir; remove it from CLAW_EVAL_ARGS")
+values = []
+for index, arg in enumerate(args):
+    if arg == "--tag":
+        if index + 1 >= len(args):
+            raise SystemExit("--tag requires a value")
+        values.append(args[index + 1])
+    elif arg.startswith("--tag="):
+        values.append(arg.split("=", 1)[1])
+if len(values) > 1:
+    raise SystemExit("CLAW_EVAL_ARGS must not set --tag more than once")
+print(values[0] if values else "")
+PY
+  })"
+
+  local -a selector_args=(
+    --source-tasks-dir "${source_tasks_dir}"
+    --output-root "${selection_root}"
+    --summary "${CLAW_EVAL_SELECTION_SUMMARY}"
+    --skipped-results "${CLAW_EVAL_SKIPPED_RESULTS}"
+  )
+  if [[ -n "${tag}" ]]; then
+    selector_args+=(--tag "${tag}")
+  fi
+  "${CLAW_EVAL_CONDA_ENV}/bin/python" "${CLAW_EVAL_TASK_SELECTOR}" "${selector_args[@]}"
+  printf -v selected_tasks_quoted '%q' "${selected_tasks_dir}"
+  CLAW_EVAL_ARGS+=" --tasks-dir ${selected_tasks_quoted}"
 }
 
 resolve_effective_sandbox_image() {
@@ -460,7 +579,12 @@ manifest = {
     "judge_base_url": os.environ["CLAW_EVAL_JUDGE_BASE_URL"],
     "judge_model": os.environ["CLAW_EVAL_JUDGE_MODEL"],
     "sparsevllm_master_port": os.environ["SPARSEVLLM_MASTER_PORT"],
+    "sparsevllm_data_parallel_size": int(os.environ["SPARSEVLLM_DATA_PARALLEL_SIZE"]),
     "claw_eval_args": os.environ["CLAW_EVAL_ARGS"],
+    "claw_eval_text_only": os.environ["CLAW_EVAL_TEXT_ONLY"] == "1",
+    "claw_eval_resume_trace_dir": os.environ["CLAW_EVAL_RESUME_TRACE_DIR"] or None,
+    "task_selection_summary": os.environ["CLAW_EVAL_SELECTION_SUMMARY"] or None,
+    "skipped_results": os.environ["CLAW_EVAL_SKIPPED_RESULTS"] or None,
     "sandbox_enabled": bool(os.environ["CLAW_EVAL_EFFECTIVE_SANDBOX_IMAGE"]),
     "sandbox_image": os.environ["CLAW_EVAL_EFFECTIVE_SANDBOX_IMAGE"] or None,
     "sandbox_image_id": os.environ["CLAW_EVAL_SANDBOX_IMAGE_ID"] or None,
@@ -492,6 +616,7 @@ main() {
   require_bool "START_SPARSEVLLM_SERVER" "${START_SPARSEVLLM_SERVER}"
   require_bool "CLAW_EVAL_UPDATE_REPO" "${CLAW_EVAL_UPDATE_REPO}"
   require_bool "CLAW_EVAL_BUILD_SANDBOX_IMAGE" "${CLAW_EVAL_BUILD_SANDBOX_IMAGE}"
+  require_bool "CLAW_EVAL_TEXT_ONLY" "${CLAW_EVAL_TEXT_ONLY}"
   require_file "${CLAW_EVAL_RESULT_VALIDATOR}" "Claw-Eval result validator"
 
   source "${HOME}/miniconda3/etc/profile.d/conda.sh"
@@ -499,9 +624,11 @@ main() {
   prepare_claw_eval_repo
   prepare_claw_eval_env
   render_config
-  write_engine_kwargs_file
   CLAW_EVAL_ARGS="$(resolve_claw_eval_args)"
+  prepare_resume_args
+  prepare_task_selection
   export CLAW_EVAL_ARGS
+  write_engine_kwargs_file
   prepare_sandbox_image
   write_run_manifest
 
@@ -563,11 +690,17 @@ main() {
   set -e
 
   set +e
-  "${CLAW_EVAL_CONDA_ENV}/bin/python" "${CLAW_EVAL_RESULT_VALIDATOR}" validate \
+  validator_args=(
+    validate
     --trace-dir "${TRACE_DIR}" \
     --snapshot "${CLAW_EVAL_PRE_RUN_SNAPSHOT}" \
     --per-sample "${CLAW_EVAL_PER_SAMPLE_RESULTS}" \
-    --final-summary "${CLAW_EVAL_FINAL_SUMMARY}" \
+    --final-summary "${CLAW_EVAL_FINAL_SUMMARY}"
+  )
+  if [[ -n "${CLAW_EVAL_SKIPPED_RESULTS}" ]]; then
+    validator_args+=(--skipped-results "${CLAW_EVAL_SKIPPED_RESULTS}")
+  fi
+  "${CLAW_EVAL_CONDA_ENV}/bin/python" "${CLAW_EVAL_RESULT_VALIDATOR}" "${validator_args[@]}" \
     2>&1 | tee "${LOG_DIR}/claw_eval_result_validation.log"
   validation_exit="${PIPESTATUS[0]}"
   set -e

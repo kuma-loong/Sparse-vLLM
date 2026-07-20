@@ -14,6 +14,7 @@ from benchmark.swe_bench_lite.run import (
     _reject_secrets,
     _require_local_images,
     assert_runtime_provenance_matches,
+    build_parser,
     build_official_run_id,
     merge_batch_predictions,
     normalize_results,
@@ -106,6 +107,50 @@ class SweBenchLiteRunnerTest(unittest.TestCase):
         self.assertIn("step_limit: 80", config)
         self.assertNotIn("api_key", config)
         self.assertNotIn("thinking", config)
+
+    def test_zero_wall_time_disables_agent_timeout(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            args = build_parser().parse_args(
+                [
+                    "--stage",
+                    "summarize",
+                    "--run-dir",
+                    tmp,
+                    "--wall-time-limit-seconds",
+                    "0",
+                ]
+            )
+
+            runner = SweBenchLiteRunner(args)
+
+        self.assertEqual(runner.args.wall_time_limit_seconds, 0)
+        config = render_mini_config(
+            step_limit=80,
+            cost_limit=0.0,
+            wall_time_limit_seconds=0,
+            cost_tracking="ignore_errors",
+            max_tokens=4096,
+            temperature=0.0,
+            top_p=1.0,
+            api_base="http://127.0.0.1:18000/v1",
+        )
+        self.assertIn("wall_time_limit_seconds: 0", config)
+
+    def test_negative_wall_time_is_rejected(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            args = build_parser().parse_args(
+                [
+                    "--stage",
+                    "summarize",
+                    "--run-dir",
+                    tmp,
+                    "--wall-time-limit-seconds",
+                    "-1",
+                ]
+            )
+
+            with self.assertRaisesRegex(RunnerError, "non-negative"):
+                SweBenchLiteRunner(args)
 
     def test_model_environment_makes_benchmark_adapter_importable(self):
         runner = object.__new__(SweBenchLiteRunner)

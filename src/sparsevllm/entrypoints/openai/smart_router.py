@@ -1,6 +1,9 @@
 import argparse
 import asyncio
+import http.client
 import json
+import socket
+import threading
 import time
 import uuid
 from dataclasses import dataclass
@@ -8,6 +11,7 @@ from pathlib import Path
 from typing import Any
 from urllib.error import HTTPError
 from urllib.error import URLError
+from urllib.parse import urlsplit
 from urllib.request import Request as UrlRequest
 from urllib.request import urlopen
 
@@ -19,6 +23,8 @@ from fastapi.responses import JSONResponse
 from fastapi.responses import Response
 from fastapi.responses import StreamingResponse
 
+from sparsevllm.entrypoints.openai.serving.base import DisconnectChecker
+from sparsevllm.entrypoints.openai.serving.base import _wait_for_any_or_disconnect
 from sparsevllm.utils.log import logger
 
 
@@ -131,15 +137,27 @@ def create_app(
 
     @app.post("/v1/completions")
     async def completions(request: Request):
-        return await router.route_openai_request("/v1/completions", await request.json())
+        return await router.route_openai_request(
+            "/v1/completions",
+            await request.json(),
+            is_disconnected=request.is_disconnected,
+        )
 
     @app.post("/v1/chat/completions")
     async def chat_completions(request: Request):
-        return await router.route_openai_request("/v1/chat/completions", await request.json())
+        return await router.route_openai_request(
+            "/v1/chat/completions",
+            await request.json(),
+            is_disconnected=request.is_disconnected,
+        )
 
     @app.post("/v1/responses")
     async def responses(request: Request):
-        return await router.route_openai_request("/v1/responses", await request.json())
+        return await router.route_openai_request(
+            "/v1/responses",
+            await request.json(),
+            is_disconnected=request.is_disconnected,
+        )
 
     @app.post("/v1/prefix_cache/inspect")
     async def prefix_cache_inspect(request: Request):
@@ -230,12 +248,29 @@ class SmartRouter:
             worker.healthy = True
             worker.last_error = None
 
-    async def route_openai_request(self, endpoint: str, payload: dict[str, Any]) -> Response:
+    async def route_openai_request(
+        self,
+        endpoint: str,
+        payload: dict[str, Any],
+        *,
+        is_disconnected: DisconnectChecker | None = None,
+    ) -> Response:
         worker, forward_payload, route = await self.select_worker(endpoint, payload)
         stream = bool(forward_payload.get("stream", False))
         if stream:
-            return await self.forward_stream(worker, endpoint, forward_payload, route)
-        response = await self.forward_json(worker, endpoint, forward_payload)
+            return await self.forward_stream(
+                worker,
+                endpoint,
+                forward_payload,
+                route,
+                is_disconnected=is_disconnected,
+            )
+        response = await self.forward_json(
+            worker,
+            endpoint,
+            forward_payload,
+            is_disconnected=is_disconnected,
+        )
         return _with_route_headers(response, route)
 
     async def select_worker(
@@ -341,17 +376,32 @@ class SmartRouter:
             )
         return WorkerProbe(worker=worker, load=dict(load), match=dict(match))
 
-    async def forward_json(self, worker: WorkerState, endpoint: str, payload: dict[str, Any]) -> Response:
+    async def forward_json(
+        self,
+        worker: WorkerState,
+        endpoint: str,
+        payload: dict[str, Any],
+        *,
+        is_disconnected: DisconnectChecker | None = None,
+    ) -> Response:
+        request = _CloseableByteRequest(
+            f"{worker.url}{endpoint}",
+            "POST",
+            payload,
+            self.request_timeout_s,
+        )
         worker.local_inflight += 1
+        request_task = asyncio.create_task(asyncio.to_thread(request.execute))
         try:
-            status, headers, body = await asyncio.to_thread(
-                _request_bytes,
-                f"{worker.url}{endpoint}",
-                "POST",
-                payload,
-                self.request_timeout_s,
+            done, _ = await _wait_for_any_or_disconnect(
+                {request_task},
+                is_disconnected,
             )
+            status, headers, body = next(iter(done)).result()
         finally:
+            if not request_task.done():
+                request.close()
+                request_task.cancel()
             worker.local_inflight -= 1
         return Response(content=body, status_code=status, headers=_content_headers(headers))
 
@@ -361,6 +411,8 @@ class SmartRouter:
         endpoint: str,
         payload: dict[str, Any],
         route: dict[str, Any],
+        *,
+        is_disconnected: DisconnectChecker | None = None,
     ) -> Response:
         worker.local_inflight += 1
         stream_handoff = False
@@ -383,7 +435,21 @@ class SmartRouter:
 
             async def _stream():
                 try:
-                    async for chunk in _stream_response_chunks(opened_response):
+                    chunks = _stream_response_chunks(opened_response)
+                    while True:
+                        next_chunk = asyncio.create_task(chunks.__anext__())
+                        try:
+                            done, _ = await _wait_for_any_or_disconnect(
+                                {next_chunk},
+                                is_disconnected,
+                            )
+                            try:
+                                chunk = next(iter(done)).result()
+                            except StopAsyncIteration:
+                                break
+                        finally:
+                            if not next_chunk.done():
+                                next_chunk.cancel()
                         yield chunk
                 finally:
                     try:
@@ -592,6 +658,78 @@ def _post_json(url: str, payload: dict[str, Any], timeout_s: float) -> dict[str,
     if status >= 400:
         raise RuntimeError(body.decode("utf-8", errors="replace"))
     return json.loads(body.decode("utf-8"))
+
+
+class _CloseableByteRequest:
+    def __init__(
+        self,
+        url: str,
+        method: str,
+        payload: dict[str, Any] | None,
+        timeout_s: float,
+    ) -> None:
+        parsed = urlsplit(url)
+        if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+            raise ValueError(f"Unsupported upstream URL: {url!r}")
+        connection_cls = (
+            http.client.HTTPSConnection
+            if parsed.scheme == "https"
+            else http.client.HTTPConnection
+        )
+        self.connection = connection_cls(
+            parsed.hostname,
+            parsed.port,
+            timeout=float(timeout_s),
+        )
+        self.method = method
+        self.path = parsed.path or "/"
+        if parsed.query:
+            self.path += f"?{parsed.query}"
+        self.body = None if payload is None else json.dumps(payload).encode("utf-8")
+        self.cancelled = threading.Event()
+        self.response: http.client.HTTPResponse | None = None
+
+    def close(self) -> None:
+        self.cancelled.set()
+        upstream_socket = self.connection.sock
+        if upstream_socket is not None:
+            try:
+                upstream_socket.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+        if self.response is not None:
+            self.response.close()
+        self.connection.close()
+
+    def execute(self) -> tuple[int, dict[str, str], bytes]:
+        if self.cancelled.is_set():
+            raise RuntimeError("Upstream request was cancelled before it started.")
+        try:
+            self.connection.request(
+                self.method,
+                self.path,
+                body=self.body,
+                headers={"Content-Type": "application/json"},
+            )
+            if self.cancelled.is_set():
+                raise RuntimeError("Upstream request was cancelled before its response.")
+            response = self.connection.getresponse()
+            self.response = response
+            if self.cancelled.is_set():
+                raise RuntimeError("Upstream request was cancelled before reading its response.")
+            try:
+                return (
+                    int(response.status),
+                    dict(response.headers.items()),
+                    response.read(),
+                )
+            finally:
+                response.close()
+                self.response = None
+        except OSError as exc:
+            raise RuntimeError(str(exc)) from exc
+        finally:
+            self.connection.close()
 
 
 def _request_bytes(

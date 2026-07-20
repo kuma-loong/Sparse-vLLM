@@ -8,13 +8,22 @@ import torch
 
 import sparsevllm.platforms as platforms
 from sparsevllm.config import Config, RuntimeLayout
-from sparsevllm.engine.cache_manager.base import LayerBatchStates
-from sparsevllm.engine.cache_manager.quest import QuestCacheManager
+from sparsevllm.engine.cache_manager.base import (
+    CacheManager,
+    LayerBatchStates,
+    resolve_joint_prefix_capacity,
+)
+from sparsevllm.engine.cache_manager.quest import QuestCacheManager, QuestPrefixBlockPayload
 from sparsevllm.engine.cache_manager.snapkv import SnapKVCacheManager
 from sparsevllm.engine.cache_manager.standard import StandardCacheManager
+from sparsevllm.engine.model_runner import ModelRunner
 from sparsevllm.engine.prefix_cache import PrefixCacheBlock, RadixPrefixIndex
 from sparsevllm.engine.prefix_cache_coordinator import MixedPrefixBlockPayload, PrefixCacheCoordinator
-from sparsevllm.engine.recurrent_state_manager import RecurrentStateManager, RecurrentStateSpec
+from sparsevllm.engine.recurrent_state_manager import (
+    RecurrentStateManager,
+    RecurrentStateSpec,
+    RecurrentTensorSpec,
+)
 from sparsevllm.engine.runtime_state import RuntimeState
 from sparsevllm.engine.sequence import Sequence
 from sparsevllm.engine.sparse_controller import LayerBatchSparseState, SparseController
@@ -68,6 +77,445 @@ def _qwen35_outer_config(*, num_layers: int = 64, full_layers: tuple[int, ...] |
 def _make_config(tmp_path, **kwargs):
     with patch("sparsevllm.config.AutoConfig.from_pretrained", return_value=_qwen35_outer_config()):
         return Config(model=str(tmp_path), **kwargs)
+
+
+@pytest.mark.parametrize(
+    ("world_size", "conv_shape", "recurrent_shape", "snapshot_bytes"),
+    [
+        (1, (10_240, 3), (48, 128, 128), 78_446_592),
+        (2, (5_120, 3), (24, 128, 128), 39_223_296),
+    ],
+)
+def test_qwen36_recurrent_spec_has_exact_tp_local_bytes(
+    world_size,
+    conv_shape,
+    recurrent_shape,
+    snapshot_bytes,
+):
+    config = SimpleNamespace(
+        linear_num_key_heads=16,
+        linear_num_value_heads=48,
+        linear_key_head_dim=128,
+        linear_value_head_dim=128,
+        linear_conv_kernel_dim=4,
+        torch_dtype=torch.bfloat16,
+    )
+
+    spec = Qwen35ForCausalLM.recurrent_state_spec(config, world_size)
+
+    assert spec.tensor_specs == (
+        RecurrentTensorSpec("conv_state", conv_shape, torch.bfloat16),
+        RecurrentTensorSpec("recurrent_state", recurrent_shape, torch.bfloat16),
+    )
+    assert spec.bytes_per_layer == snapshot_bytes // 48
+    assert spec.bytes_for_layers(48) == snapshot_bytes
+
+
+def test_qwen36_prefix_off_rejects_requested_concurrency_above_one_gib_capacity():
+    state_spec = Qwen35ForCausalLM.recurrent_state_spec(
+        SimpleNamespace(
+            linear_num_key_heads=16,
+            linear_num_value_heads=48,
+            linear_key_head_dim=128,
+            linear_value_head_dim=128,
+            linear_conv_kernel_dim=4,
+            torch_dtype=torch.bfloat16,
+        ),
+        world_size=1,
+    )
+    config = SimpleNamespace(
+        enable_prefix_caching=False,
+        recurrent_state_max_bytes=1 << 30,
+        max_num_seqs_in_batch=16,
+        max_decoding_seqs=16,
+    )
+
+    with pytest.raises(
+        RuntimeError,
+        match=(
+            "requested_active_sequences=16.*supported_active_sequences=12.*"
+            "bytes_per_row=78446592.*budget_bytes=1073741824"
+        ),
+    ):
+        RecurrentStateManager.resolve_capacity(config, state_spec, num_recurrent_layers=48)
+
+
+def test_qwen36_recurrent_capacity_counts_rows_and_scratch_exactly():
+    state_spec = Qwen35ForCausalLM.recurrent_state_spec(
+        SimpleNamespace(
+            linear_num_key_heads=16,
+            linear_num_value_heads=48,
+            linear_key_head_dim=128,
+            linear_value_head_dim=128,
+            linear_conv_kernel_dim=4,
+            torch_dtype=torch.bfloat16,
+        ),
+        world_size=1,
+    )
+    prefix_off = SimpleNamespace(
+        enable_prefix_caching=False,
+        recurrent_state_max_bytes=1 << 30,
+        max_num_seqs_in_batch=4,
+        max_decoding_seqs=4,
+    )
+    prefix_on = SimpleNamespace(
+        enable_prefix_caching=True,
+        recurrent_state_max_bytes=1 << 30,
+        max_num_seqs_in_batch=16,
+        max_decoding_seqs=16,
+    )
+
+    off_capacity = RecurrentStateManager.resolve_capacity(
+        prefix_off,
+        state_spec,
+        num_recurrent_layers=48,
+    )
+    on_capacity = RecurrentStateManager.resolve_capacity(
+        prefix_on,
+        state_spec,
+        num_recurrent_layers=48,
+    )
+
+    assert off_capacity.row_capacity == 12
+    assert off_capacity.total_rows == 13
+    assert off_capacity.pool_bytes == 1_019_805_696
+    assert on_capacity.row_capacity == 48
+    assert on_capacity.total_rows == 49
+    assert on_capacity.pool_bytes == 3_843_883_008
+
+
+def _deprecation_messages(mock_log_once):
+    return [
+        call.args[0]
+        for call in mock_log_once.call_args_list
+        if call.args and "prefix_cache_max_recurrent_bytes is deprecated" in call.args[0]
+    ]
+
+
+def test_recurrent_budget_accepts_deprecated_prefix_cache_alias(tmp_path):
+    with patch("sparsevllm.config.log_once") as mock_log_once:
+        config = _make_config(tmp_path, prefix_cache_max_recurrent_bytes=2 << 30)
+
+    assert config.recurrent_state_max_bytes == 2 << 30
+    assert config.prefix_cache_max_recurrent_bytes == 2 << 30
+    assert len(_deprecation_messages(mock_log_once)) == 1
+
+
+def test_recurrent_budget_accepts_new_name_without_deprecation(tmp_path):
+    with patch("sparsevllm.config.log_once") as mock_log_once:
+        config = _make_config(tmp_path, recurrent_state_max_bytes=3 << 30)
+
+    assert config.recurrent_state_max_bytes == 3 << 30
+    assert config.prefix_cache_max_recurrent_bytes is None
+    assert not _deprecation_messages(mock_log_once)
+
+
+def test_recurrent_budget_accepts_equal_new_and_deprecated_names(tmp_path):
+    with patch("sparsevllm.config.log_once") as mock_log_once:
+        config = _make_config(
+            tmp_path,
+            recurrent_state_max_bytes=2 << 30,
+            prefix_cache_max_recurrent_bytes=2 << 30,
+        )
+
+    assert config.recurrent_state_max_bytes == 2 << 30
+    assert len(_deprecation_messages(mock_log_once)) == 1
+
+
+def test_recurrent_budget_rejects_conflicting_new_and_deprecated_names(tmp_path):
+    with pytest.raises(ValueError, match="conflicting recurrent state budgets"):
+        _make_config(
+            tmp_path,
+            recurrent_state_max_bytes=2 << 30,
+            prefix_cache_max_recurrent_bytes=3 << 30,
+        )
+
+
+def test_deprecated_recurrent_budget_does_not_cap_prefix_on_capacity(tmp_path):
+    config = _make_config(
+        tmp_path,
+        enable_prefix_caching=True,
+        prefix_cache_max_recurrent_bytes=1,
+    )
+    state_spec = Qwen35ForCausalLM.recurrent_state_spec(config.hf_config, world_size=1)
+
+    capacity = RecurrentStateManager.resolve_capacity(
+        config,
+        state_spec,
+        num_recurrent_layers=48,
+    )
+
+    assert config.recurrent_state_max_bytes == 1
+    assert capacity.row_capacity == 96
+    assert capacity.pool_bytes > config.recurrent_state_max_bytes
+
+
+@pytest.mark.parametrize("manager_cls", [StandardCacheManager, QuestCacheManager])
+@pytest.mark.parametrize("max_num_seqs_in_batch", [2, 8])
+def test_mixed_cache_manager_rows_do_not_exceed_recurrent_pool(
+    manager_cls,
+    max_num_seqs_in_batch,
+):
+    config = SimpleNamespace(
+        hf_config=SimpleNamespace(
+            num_hidden_layers=64,
+            num_key_value_heads=4,
+            num_attention_heads=24,
+            hidden_size=5120,
+            head_dim=256,
+        ),
+        runtime_layout=RuntimeLayout.from_config(
+            _qwen35_outer_config().text_config,
+            require_mixed=True,
+        ),
+        max_model_len=121_000,
+        max_num_seqs_in_batch=max_num_seqs_in_batch,
+        max_decoding_seqs=12,
+        recurrent_state_row_capacity=12,
+    )
+    manager = object.__new__(manager_cls)
+
+    with patch.object(platforms, "_current_platform", CpuPlatform()):
+        CacheManager.__init__(manager, config, rank=0, world_size=1)
+
+    assert manager.max_buffer_rows == 12
+
+
+def test_dense_cache_manager_keeps_redundant_row_capacity():
+    config = SimpleNamespace(
+        hf_config=SimpleNamespace(
+            num_hidden_layers=2,
+            num_key_value_heads=1,
+            num_attention_heads=1,
+            hidden_size=32,
+            head_dim=32,
+        ),
+        runtime_layout=RuntimeLayout.dense(2),
+        max_model_len=128,
+        max_num_seqs_in_batch=8,
+        max_decoding_seqs=12,
+    )
+    manager = object.__new__(StandardCacheManager)
+
+    with patch.object(platforms, "_current_platform", CpuPlatform()):
+        CacheManager.__init__(manager, config, rank=0, world_size=1)
+
+    assert manager.max_buffer_rows == 24
+
+
+def test_qwen36_prefix_on_matches_kv_and_recurrent_block_capacity():
+    kv_bytes_per_block = 268_435_456
+    recurrent_bytes_per_block = 78_446_592
+    available_bytes = 5 * (kv_bytes_per_block + recurrent_bytes_per_block) + 123
+
+    capacity = resolve_joint_prefix_capacity(
+        available_bytes=available_bytes,
+        kv_bytes_per_block=kv_bytes_per_block,
+        recurrent_bytes_per_block=recurrent_bytes_per_block,
+        requested_max_blocks=None,
+    )
+
+    assert capacity.block_capacity == 5
+    assert capacity.kv_allocatable_bytes == 5 * kv_bytes_per_block
+    assert capacity.recurrent_capacity_bytes == 5 * recurrent_bytes_per_block
+    assert capacity.unallocated_bytes == 123
+    assert (
+        available_bytes - capacity.kv_allocatable_bytes
+        == capacity.recurrent_capacity_bytes + capacity.unallocated_bytes
+    )
+
+
+def test_joint_prefix_capacity_applies_explicit_block_cap_to_both_payloads():
+    capacity = resolve_joint_prefix_capacity(
+        available_bytes=10_000,
+        kv_bytes_per_block=600,
+        recurrent_bytes_per_block=400,
+        requested_max_blocks=3,
+    )
+
+    assert capacity.block_capacity == 3
+    assert capacity.kv_allocatable_bytes == 1_800
+    assert capacity.recurrent_capacity_bytes == 1_200
+    assert capacity.unallocated_bytes == 7_000
+
+
+def _budget_test_manager(
+    *,
+    free_bytes,
+    peak_bytes,
+    current_bytes,
+    prefix_on=False,
+    recurrent_pool_bytes=1_000,
+    recurrent_peak_before_bytes=None,
+    recurrent_peak_after_bytes=None,
+):
+    manager = object.__new__(StandardCacheManager)
+    manager.config = SimpleNamespace(
+        hf_config=SimpleNamespace(
+            hidden_size=10,
+            intermediate_size=10,
+            torch_dtype=torch.float16,
+        ),
+        gpu_memory_utilization=0.9,
+        max_num_batched_tokens=1,
+        chunk_prefill_size=1,
+        prefill_schedule_policy="long_bs1full_short_batch",
+        enable_prefix_caching=prefix_on,
+        prefix_cache_block_size=4,
+        prefix_cache_max_blocks=None,
+        recurrent_state_pool_bytes=recurrent_pool_bytes,
+        recurrent_state_allocator_peak_before_bytes=(
+            peak_bytes
+            if recurrent_peak_before_bytes is None
+            else recurrent_peak_before_bytes
+        ),
+        recurrent_state_allocator_peak_after_bytes=(
+            peak_bytes
+            if recurrent_peak_after_bytes is None
+            else recurrent_peak_after_bytes
+        ),
+        prefix_recurrent_bytes_per_block=400 if prefix_on else 0,
+    )
+    manager.world_size = 1
+    manager.device = torch.device("cpu")
+    manager.num_kv_heads = 1
+    manager.head_dim = 10
+    manager.num_kv_layers = 2
+    manager.platform = SimpleNamespace(
+        get_available_memory=lambda _device_id: (free_bytes, 10_000_000),
+        get_allocator_stats=lambda _device: SimpleNamespace(
+            peak_allocated_bytes=peak_bytes,
+            current_allocated_bytes=current_bytes,
+        ),
+    )
+    return manager
+
+
+def test_kv_available_bytes_decrease_by_exact_eager_recurrent_pool_bytes():
+    baseline = _budget_test_manager(
+        free_bytes=8_000_000,
+        peak_bytes=1_000_000,
+        current_bytes=1_000_000,
+        recurrent_pool_bytes=0,
+    )
+    with_pool = _budget_test_manager(
+        free_bytes=7_999_000,
+        peak_bytes=1_001_000,
+        current_bytes=1_001_000,
+        recurrent_peak_before_bytes=1_000_000,
+        recurrent_peak_after_bytes=1_001_000,
+    )
+
+    baseline_available, _ = baseline._get_available_slots_info()
+    pooled_available, _ = with_pool._get_available_slots_info()
+
+    assert baseline_available - pooled_available == 1_000
+
+
+def test_kv_available_bytes_deduct_pool_when_allocator_peak_does_not_rise():
+    baseline = _budget_test_manager(
+        free_bytes=8_000_000,
+        peak_bytes=2_000_000,
+        current_bytes=1_000_000,
+        recurrent_pool_bytes=0,
+    )
+    with_pool = _budget_test_manager(
+        free_bytes=7_999_000,
+        peak_bytes=2_000_000,
+        current_bytes=1_001_000,
+        recurrent_peak_before_bytes=2_000_000,
+        recurrent_peak_after_bytes=2_000_000,
+    )
+
+    baseline_available, _ = baseline._get_available_slots_info()
+    pooled_available, _ = with_pool._get_available_slots_info()
+
+    assert baseline_available - pooled_available == 1_000
+
+
+def test_model_runner_resets_inherited_allocator_peak_before_model_construction():
+    events = []
+
+    class LifecyclePlatform(CpuPlatform):
+        inherited_peak = 62_000_000_000
+        current = 0
+
+        def validate_inference(self):
+            return None
+
+        def init_backend(self):
+            return None
+
+        def get_distributed_backend(self):
+            return "gloo"
+
+        def reset_peak_memory_stats(self, device):
+            events.append(("reset_peak", device))
+            self.inherited_peak = self.current
+
+    platform = LifecyclePlatform()
+    observed_peak_at_construction = []
+
+    def stop_at_model_construction(_config):
+        observed_peak_at_construction.append(platform.inherited_peak)
+        raise RuntimeError("stop after model construction boundary")
+
+    config = SimpleNamespace(
+        enable_profiler=False,
+        enforce_eager=True,
+        tensor_parallel_size=1,
+        hf_config=SimpleNamespace(model_type="qwen2", torch_dtype=torch.float32),
+    )
+    with (
+        patch.object(platforms, "_current_platform", platform),
+        patch("sparsevllm.engine.model_runner.dist.is_initialized", return_value=True),
+        patch("sparsevllm.engine.model_runner.Qwen2ForCausalLM", side_effect=stop_at_model_construction),
+        pytest.raises(RuntimeError, match="stop after model construction boundary"),
+    ):
+        ModelRunner(config, rank=0, event=[])
+
+    assert events == [("reset_peak", torch.device("cpu"))]
+    assert observed_peak_at_construction == [0]
+
+
+def test_cache_budget_resolves_joint_prefix_capacity_before_kv_allocation():
+    manager = _budget_test_manager(
+        free_bytes=8_000_000,
+        peak_bytes=1_000_000,
+        current_bytes=1_000_000,
+        prefix_on=True,
+    )
+
+    kv_allocatable_bytes, slot_bytes_per_layer = manager._get_available_slots_info()
+
+    assert slot_bytes_per_layer == 40
+    assert manager.config.prefix_kv_bytes_per_block == 320
+    assert manager.config.prefix_kv_block_capacity == 9_720
+    assert manager.config.prefix_cache_max_blocks == 9_720
+    assert manager.config.prefix_recurrent_capacity_bytes == 3_888_000
+    assert kv_allocatable_bytes == 3_110_400
+
+
+def test_quest_joint_prefix_kv_bytes_include_page_metadata():
+    manager = object.__new__(QuestCacheManager)
+    manager.config = SimpleNamespace(prefix_cache_block_size=4096)
+    manager.page_size = 16
+    manager.num_kv_layers = 16
+    manager.num_kv_heads = 4
+    manager.head_dim = 256
+    manager.hf_config = SimpleNamespace(torch_dtype=torch.bfloat16)
+    payload = QuestPrefixBlockPayload(
+        block_slot=None,
+        token_slots=torch.arange(4096, dtype=torch.int32),
+        block_start=0,
+        block_end=4096,
+        block_slots=torch.arange(256, dtype=torch.int32),
+    )
+
+    reserved_bytes = manager._kv_allocation_bytes_per_prefix_block(4096)
+
+    assert reserved_bytes == 285_212_672
+    assert manager.prefix_kv_payload_nbytes(payload) == reserved_bytes
 
 
 def test_runtime_layout_maps_qwen35_full_layers_to_compact_kv_indices():
@@ -563,6 +1011,53 @@ def test_runtime_warmup_reset_clears_coordinator_before_kv_allocator():
     assert calls == ["coordinator", "kv", "recurrent"]
 
 
+def test_mixed_prefix_warmup_reset_clears_dummy_blocks_and_accounting():
+    freed = []
+    config = SimpleNamespace(
+        enable_prefix_caching=True,
+        prefix_cache_block_size=4,
+        prefix_recurrent_capacity_bytes=8,
+        prefix_cache_max_blocks=2,
+        model="test",
+        hf_config=SimpleNamespace(model_type="test", torch_dtype=torch.float16),
+        tensor_parallel_size=1,
+        vllm_sparse_method="",
+        prefix_cache_salt="",
+    )
+    coordinator = PrefixCacheCoordinator(
+        config,
+        SimpleNamespace(
+            free_prefix_kv_payload=lambda payload: freed.append(("kv", payload))
+        ),
+        SimpleNamespace(
+            free_prefix_recurrent_payload=lambda payload: freed.append(("recurrent", payload))
+        ),
+    )
+    block_id = coordinator.prefix_cache.stable_block_id([1, 2, 3, 4], None)
+    coordinator.prefix_cache.insert_block(
+        PrefixCacheBlock(
+            stable_block_id=block_id,
+            parent_block_id=None,
+            block_size=4,
+            logical_block_idx=0,
+            payload=MixedPrefixBlockPayload("kv-warmup", "state-warmup", 4, 8, 4),
+            token_ids=(1, 2, 3, 4),
+        )
+    )
+    coordinator.runtime_states[99] = object()
+    coordinator.capacity_limited_seq_ids.add(99)
+    coordinator.skipped_capacity_blocks = 1
+
+    coordinator.reset_after_warmup()
+
+    assert len(coordinator.prefix_cache) == 0
+    assert coordinator.runtime_states == {}
+    assert coordinator.pending_recurrent_bytes == 0
+    assert coordinator.capacity_limited_seq_ids == set()
+    assert coordinator.skipped_capacity_blocks == 0
+    assert freed == [("kv", "kv-warmup"), ("recurrent", "state-warmup")]
+
+
 def test_runtime_state_does_not_proxy_undeclared_cache_manager_api():
     runtime_state = RuntimeState(
         config=None,
@@ -651,9 +1146,228 @@ def test_mixed_prefix_capacity_skips_insert_when_live_chain_is_referenced():
     assert coordinator.prefix_cache.get_block(block_id) is block
 
 
+def test_mixed_prefix_referenced_leaf_protects_its_ancestor_chain():
+    freed = []
+    coordinator = object.__new__(PrefixCacheCoordinator)
+    coordinator.block_size = 4
+    coordinator.max_recurrent_bytes = 8
+    coordinator.cache_manager = SimpleNamespace(
+        free_prefix_kv_payload=lambda payload: freed.append(("kv", payload))
+    )
+    coordinator.recurrent_state_manager = SimpleNamespace(
+        free_prefix_recurrent_payload=lambda payload: freed.append(("recurrent", payload))
+    )
+    coordinator.prefix_cache = RadixPrefixIndex(block_size=4, fingerprint=b"test")
+    root_id = coordinator.prefix_cache.stable_block_id([1, 2, 3, 4], None)
+    leaf_id = coordinator.prefix_cache.stable_block_id([5, 6, 7, 8], root_id)
+    for block_id, parent_id, logical_idx, tokens, ref_count in (
+        (root_id, None, 0, (1, 2, 3, 4), 0),
+        (leaf_id, root_id, 1, (5, 6, 7, 8), 1),
+    ):
+        coordinator.prefix_cache.insert_block(
+            PrefixCacheBlock(
+                stable_block_id=block_id,
+                parent_block_id=parent_id,
+                block_size=4,
+                logical_block_idx=logical_idx,
+                payload=MixedPrefixBlockPayload(
+                    f"kv-{logical_idx}",
+                    f"state-{logical_idx}",
+                    4,
+                    4,
+                    4,
+                ),
+                token_ids=tokens,
+                ref_count=ref_count,
+            )
+        )
+
+    assert not coordinator._evict_for_insert(1, incoming_recurrent_bytes=4)
+    assert set(coordinator.prefix_cache.blocks) == {root_id, leaf_id}
+    assert freed == []
+
+
+def test_mixed_prefix_free_validates_all_payloads_before_releasing_any_resource():
+    freed = []
+    coordinator = object.__new__(PrefixCacheCoordinator)
+    coordinator.cache_manager = SimpleNamespace(
+        free_prefix_kv_payload=lambda payload: freed.append(("kv", payload))
+    )
+    coordinator.recurrent_state_manager = SimpleNamespace(
+        free_prefix_recurrent_payload=lambda payload: freed.append(("recurrent", payload))
+    )
+    valid = SimpleNamespace(payload=MixedPrefixBlockPayload("kv", "state", 4, 4, 4))
+    invalid = SimpleNamespace(payload=object())
+
+    with pytest.raises(RuntimeError, match="invalid payload"):
+        coordinator._free_blocks([valid, invalid])
+
+    assert freed == []
+
+
+def _make_pending_capacity_coordinator(*, max_recurrent_bytes: int):
+    clone_calls = []
+    cache_manager = SimpleNamespace(
+        build_prefix_kv_payload=lambda seq, start, end: (seq.seq_id, start, end),
+        prefix_kv_payload_nbytes=lambda payload: 10,
+        free_prefix_kv_payload=lambda payload: None,
+        mark_materialized_prefix_kv_payload=lambda seq, payload: None,
+    )
+    recurrent_manager = SimpleNamespace(
+        prefix_recurrent_snapshot_nbytes=lambda: 6,
+        build_prefix_recurrent_payload=lambda seq, end: clone_calls.append((seq.seq_id, end))
+        or f"state-{seq.seq_id}-{end}",
+        prefix_recurrent_payload_nbytes=lambda payload: 6,
+        free_prefix_recurrent_payload=lambda payload: None,
+    )
+    coordinator = object.__new__(PrefixCacheCoordinator)
+    coordinator.block_size = 4
+    coordinator.max_recurrent_bytes = max_recurrent_bytes
+    coordinator.cache_manager = cache_manager
+    coordinator.recurrent_state_manager = recurrent_manager
+    coordinator.prefix_cache = RadixPrefixIndex(block_size=4, fingerprint=b"test")
+    coordinator.runtime_states = {}
+    coordinator.pending_blocks = {}
+    coordinator.pending_duplicate_refs = {}
+    coordinator.pending_block_ids = set()
+    coordinator.pending_recurrent_bytes = 0
+    coordinator.capacity_limited_seq_ids = set()
+    coordinator.skipped_capacity_blocks = 0
+    coordinator.seq_id_to_prefix_blocks = {}
+    coordinator.seq_id_to_materialized_blocks = {}
+    return coordinator, clone_calls
+
+
+def test_mixed_prefix_enforces_capacity_before_recurrent_snapshot_clone():
+    coordinator, clone_calls = _make_pending_capacity_coordinator(max_recurrent_bytes=6)
+    block_id = coordinator.prefix_cache.stable_block_id([9, 9, 9, 9], None)
+    coordinator.prefix_cache.insert_block(
+        PrefixCacheBlock(
+            stable_block_id=block_id,
+            parent_block_id=None,
+            block_size=4,
+            logical_block_idx=0,
+            payload=MixedPrefixBlockPayload("kv", "state", 4, 16, 6),
+            token_ids=(9, 9, 9, 9),
+            ref_count=1,
+        )
+    )
+    seq = SimpleNamespace(seq_id=7, prefix_cache_hit_block_count=0, prefix_cache_hit_last_block_id=None)
+
+    coordinator._record_tokens(seq, [1, 2, 3, 4])
+
+    assert clone_calls == []
+    assert coordinator.pending_blocks[7] == []
+    assert coordinator.pending_recurrent_bytes == 0
+    assert coordinator.capacity_limited_seq_ids == {7}
+    assert coordinator.skipped_capacity_blocks == 1
+
+
+def test_mixed_prefix_pending_snapshots_count_and_duplicate_does_not_clone():
+    coordinator, clone_calls = _make_pending_capacity_coordinator(max_recurrent_bytes=12)
+    seq1 = SimpleNamespace(seq_id=1, prefix_cache_hit_block_count=0, prefix_cache_hit_last_block_id=None)
+    seq2 = SimpleNamespace(seq_id=2, prefix_cache_hit_block_count=0, prefix_cache_hit_last_block_id=None)
+    seq3 = SimpleNamespace(seq_id=3, prefix_cache_hit_block_count=0, prefix_cache_hit_last_block_id=None)
+    duplicate = SimpleNamespace(seq_id=4, prefix_cache_hit_block_count=0, prefix_cache_hit_last_block_id=None)
+
+    coordinator._record_tokens(seq1, [1, 2, 3, 4])
+    coordinator._record_tokens(seq2, [5, 6, 7, 8])
+    coordinator._record_tokens(duplicate, [1, 2, 3, 4])
+    coordinator._record_tokens(seq3, [9, 10, 11, 12])
+
+    assert clone_calls == [(1, 4), (2, 4)]
+    assert coordinator.pending_recurrent_bytes == 12
+    assert len(coordinator.pending_block_ids) == 2
+    assert coordinator.pending_blocks[4] == []
+    assert coordinator.capacity_limited_seq_ids == {3}
+
+
+def test_mixed_prefix_duplicate_pending_block_holds_reference_after_commit():
+    coordinator, clone_calls = _make_pending_capacity_coordinator(max_recurrent_bytes=6)
+    owner = SimpleNamespace(seq_id=1, prefix_cache_hit_block_count=0, prefix_cache_hit_last_block_id=None)
+    duplicate = SimpleNamespace(seq_id=2, prefix_cache_hit_block_count=0, prefix_cache_hit_last_block_id=None)
+
+    coordinator._record_tokens(owner, [1, 2, 3, 4])
+    coordinator._record_tokens(duplicate, [1, 2, 3, 4])
+    coordinator.commit_pending_blocks([owner, duplicate])
+
+    block = next(iter(coordinator.prefix_cache.blocks.values()))
+    assert clone_calls == [(1, 4)]
+    assert block.ref_count == 2
+    coordinator.release_seq(owner.seq_id)
+    assert block.ref_count == 1
+    assert not coordinator.prefix_cache.can_evict(block)
+    coordinator.release_seq(duplicate.seq_id)
+    assert block.ref_count == 0
+
+
+def test_mixed_prefix_snapshot_error_rolls_back_pending_accounting():
+    coordinator, _ = _make_pending_capacity_coordinator(max_recurrent_bytes=6)
+    coordinator.recurrent_state_manager.build_prefix_recurrent_payload = (
+        lambda seq, end: (_ for _ in ()).throw(RuntimeError("clone failed"))
+    )
+    seq = SimpleNamespace(seq_id=1, prefix_cache_hit_block_count=0, prefix_cache_hit_last_block_id=None)
+
+    with pytest.raises(RuntimeError, match="clone failed"):
+        coordinator._record_tokens(seq, [1, 2, 3, 4])
+
+    assert coordinator.pending_recurrent_bytes == 0
+    assert coordinator.pending_block_ids == set()
+    assert coordinator.pending_blocks[1] == []
+
+
+def test_mixed_prefix_mark_failure_rolls_back_radix_ref_and_allocator_ownership():
+    coordinator, _ = _make_pending_capacity_coordinator(max_recurrent_bytes=12)
+    allocator = SimpleNamespace(
+        free_slots=0,
+        cached_ranges=set(),
+        freed_kv_payloads=[],
+    )
+
+    def fail_mark(seq, payload):
+        allocator.cached_ranges.add((seq.seq_id, payload))
+        raise RuntimeError("mark failed")
+
+    def rollback_mark(seq, payload):
+        allocator.cached_ranges.discard((seq.seq_id, payload))
+
+    coordinator.cache_manager.mark_materialized_prefix_kv_payload = fail_mark
+    coordinator.cache_manager.rollback_materialized_prefix_kv_payload = rollback_mark
+    coordinator.cache_manager.free_prefix_kv_payload = (
+        lambda payload: allocator.freed_kv_payloads.append(payload)
+    )
+    freed_recurrent = []
+    coordinator.recurrent_state_manager.free_prefix_recurrent_payload = (
+        lambda payload: freed_recurrent.append(payload)
+    )
+    seq = SimpleNamespace(
+        seq_id=1,
+        prefix_cache_hit_block_count=0,
+        prefix_cache_hit_last_block_id=None,
+    )
+    coordinator._record_tokens(seq, [1, 2, 3, 4, 5, 6, 7, 8])
+
+    with pytest.raises(RuntimeError, match="mark failed"):
+        coordinator.commit_pending_blocks([seq])
+
+    assert len(coordinator.prefix_cache) == 0
+    assert coordinator.seq_id_to_materialized_blocks.get(seq.seq_id, []) == []
+    assert coordinator.pending_recurrent_bytes == 0
+    assert coordinator.pending_block_ids == set()
+    assert allocator.cached_ranges == set()
+    assert allocator.free_slots == 0
+    assert allocator.freed_kv_payloads == []
+    assert freed_recurrent == ["state-1-4", "state-1-8"]
+    assert coordinator.prefix_cache.stats()["prefix_cache_committed_blocks"] == 0
+
+
 def test_recurrent_state_manager_reuses_preallocated_rows_for_decode():
     config = SimpleNamespace(
-        runtime_layout=None,
+        runtime_layout=SimpleNamespace(
+            linear_attention_layer_indices=(1,),
+            is_linear_attention=lambda layer_idx: int(layer_idx) == 1,
+        ),
+        enable_prefix_caching=True,
         max_num_seqs_in_batch=2,
         max_decoding_seqs=4,
         prefix_cache_block_size=4,
@@ -662,12 +1376,19 @@ def test_recurrent_state_manager_reuses_preallocated_rows_for_decode():
         config,
         rank=0,
         world_size=1,
+        device=torch.device("cpu"),
         state_spec=RecurrentStateSpec(
             name="test recurrent",
-            state_names=("conv_state", "recurrent_state"),
+            tensor_specs=(
+                RecurrentTensorSpec("conv_state", (2, 3), torch.float16),
+                RecurrentTensorSpec("recurrent_state", (2, 2, 2), torch.float16),
+            ),
         ),
     )
     assert manager.row_capacity == 6
+    assert manager.pool_bytes == 196
+    assert manager.layer_buffers[1]["conv_state"].shape == (7, 2, 3)
+    assert manager.layer_buffers[1]["recurrent_state"].shape == (7, 2, 2, 2)
     seq = SimpleNamespace(seq_id=7)
     manager.prepare_step([seq], is_prefill=True)
     conv = torch.arange(6, dtype=torch.float16).reshape(2, 3)
@@ -712,7 +1433,11 @@ def test_recurrent_state_manager_reuses_preallocated_rows_for_decode():
 
 def test_recurrent_state_manager_uses_model_declared_state_schema():
     config = SimpleNamespace(
-        runtime_layout=None,
+        runtime_layout=SimpleNamespace(
+            linear_attention_layer_indices=(0,),
+            is_linear_attention=lambda layer_idx: int(layer_idx) == 0,
+        ),
+        enable_prefix_caching=True,
         max_num_seqs_in_batch=1,
         max_decoding_seqs=1,
         prefix_cache_block_size=4,
@@ -721,7 +1446,11 @@ def test_recurrent_state_manager_uses_model_declared_state_schema():
         config,
         rank=0,
         world_size=1,
-        state_spec=RecurrentStateSpec(name="single-state model", state_names=("ssm_state",)),
+        device=torch.device("cpu"),
+        state_spec=RecurrentStateSpec(
+            name="single-state model",
+            tensor_specs=(RecurrentTensorSpec("ssm_state", (4,), torch.float16),),
+        ),
     )
     seq = SimpleNamespace(seq_id=3)
     state = torch.arange(4, dtype=torch.float16)

@@ -18,6 +18,8 @@ from sparsevllm.entrypoints.openai.responses import events as response_events
 from sparsevllm.entrypoints.openai.sampling import _sampling_params_from_response_request
 from sparsevllm.entrypoints.openai.serving.base import _model_dump_json
 from sparsevllm.entrypoints.openai.serving.base import _tokens_per_second
+from sparsevllm.entrypoints.openai.serving.base import DisconnectChecker
+from sparsevllm.entrypoints.openai.serving.base import _queue_get_or_disconnect
 from sparsevllm.entrypoints.openai.serving.base import _wait_final
 from sparsevllm.entrypoints.openai.serving.base import _write_request_log
 from sparsevllm.entrypoints.openai.serving.response_parsing import ParsedModelResponse
@@ -34,6 +36,8 @@ async def serve_response(
     request_log_path: Path | None,
     reasoning_parser_name: str | None,
     response_parser: TransformersResponseParser | None = None,
+    *,
+    is_disconnected: DisconnectChecker | None = None,
 ):
     _validate_response_request(
         request,
@@ -84,6 +88,7 @@ async def serve_response(
                 prompt=prompt,
                 reasoning_parser_name=reasoning_parser_name,
                 response_parser=response_parser,
+                is_disconnected=is_disconnected,
             ),
             media_type="text/event-stream",
         )
@@ -98,6 +103,7 @@ async def serve_response(
             reasoning_parser_name=reasoning_parser_name,
             parse_tools=bool(request.tools),
             response_parser=response_parser,
+            is_disconnected=is_disconnected,
         )
     except asyncio.CancelledError:
         dispatcher.cancel(handle)
@@ -187,8 +193,9 @@ async def _response_response(
     reasoning_parser_name: str | None,
     parse_tools: bool = False,
     response_parser: TransformersResponseParser | None = None,
+    is_disconnected: DisconnectChecker | None = None,
 ) -> dict[str, Any]:
-    final = await _wait_final(handle.output_queue)
+    final = await _wait_final(handle.output_queue, is_disconnected)
     should_parse = reasoning_parser_name is not None or parse_tools
     if should_parse:
         if response_parser is None:
@@ -229,6 +236,7 @@ async def _response_stream(
     prompt: str = "",
     reasoning_parser_name: str | None,
     response_parser: TransformersResponseParser | None = None,
+    is_disconnected: DisconnectChecker | None = None,
 ):
     state = _ResponseStreamState(request_id, created_at, model)
     should_parse = reasoning_parser_name is not None or bool(request.tools)
@@ -246,7 +254,7 @@ async def _response_stream(
     try:
         yield response_events.response_created(state.response("in_progress"))
         while True:
-            item = await handle.output_queue.get()
+            item = await _queue_get_or_disconnect(handle.output_queue, is_disconnected)
             if item["type"] == "error":
                 dispatcher.cancel(handle)
                 yield _response_stream_failed(state, item["message"])

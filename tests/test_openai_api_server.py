@@ -134,6 +134,9 @@ class _TestRequest:
     def __init__(self, app):
         self.app = app
 
+    async def is_disconnected(self):
+        return False
+
 
 def _route_endpoint(app, path):
     for route in app.routes:
@@ -773,6 +776,31 @@ class OpenAIAPIServerTest(unittest.IsolatedAsyncioTestCase):
         )
 
         self.assertEqual(prompt, "rendered")
+        self.assertEqual(
+            tokenizer.chat,
+            [{"role": "assistant", "content": "answer", "reasoning_content": "reason"}],
+        )
+
+    def test_chat_prompt_accepts_reasoning_alias_for_templates(self):
+        from sparsevllm.entrypoints.openai.api_server import ChatMessage, _chat_prompt
+
+        class Tokenizer:
+            chat_template = "template"
+
+            def __init__(self):
+                self.chat = None
+
+            def apply_chat_template(self, chat, **_kwargs):
+                self.chat = chat
+                return "rendered"
+
+        tokenizer = Tokenizer()
+        message = ChatMessage.model_validate(
+            {"role": "assistant", "content": "answer", "reasoning": "reason"}
+        )
+
+        self.assertEqual(_chat_prompt(tokenizer, [message]), "rendered")
+        self.assertEqual(message.reasoning_content, "reason")
         self.assertEqual(
             tokenizer.chat,
             [{"role": "assistant", "content": "answer", "reasoning_content": "reason"}],
@@ -2978,6 +3006,35 @@ class OpenAIAPIServerTest(unittest.IsolatedAsyncioTestCase):
         pending.cancel()
         with self.assertRaises(asyncio.CancelledError):
             await pending
+
+        self.assertTrue(cancelled.is_set())
+
+    async def test_chat_stream_disconnect_releases_dispatcher_request(self):
+        from sparsevllm.entrypoints.openai.api_server import RequestHandle, _chat_completion_stream
+
+        queue = asyncio.Queue()
+        handle = RequestHandle(output_queue=queue, cancelled=threading.Event())
+        cancelled = threading.Event()
+
+        class Dispatcher:
+            def cancel(self, observed_handle):
+                if observed_handle is handle:
+                    cancelled.set()
+
+        async def is_disconnected():
+            return True
+
+        stream = _chat_completion_stream(
+            Dispatcher(),
+            "chatcmpl-test",
+            123,
+            "model",
+            [handle],
+            is_disconnected=is_disconnected,
+        )
+        await stream.__anext__()
+        with self.assertRaises(asyncio.CancelledError):
+            await stream.__anext__()
 
         self.assertTrue(cancelled.is_set())
 

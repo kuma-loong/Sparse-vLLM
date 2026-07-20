@@ -1,6 +1,7 @@
 from typing import Any
 from typing import Literal
 
+from pydantic import AliasChoices
 from pydantic import BaseModel
 from pydantic import ConfigDict
 from pydantic import Field
@@ -19,7 +20,10 @@ class ChatMessage(BaseModel):
 
     role: Literal["developer", "system", "user", "assistant", "tool"]
     content: str | list[ChatContentPart] | None = None
-    reasoning_content: str | None = None
+    reasoning_content: str | None = Field(
+        default=None,
+        validation_alias=AliasChoices("reasoning_content", "reasoning"),
+    )
     tool_call_id: str | None = None
     tool_calls: list[dict[str, Any]] | None = None
 

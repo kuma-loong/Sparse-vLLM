@@ -21,6 +21,8 @@ from sparsevllm.entrypoints.openai.serving.base import _chat_logprobs
 from sparsevllm.entrypoints.openai.serving.base import _model_dump_json
 from sparsevllm.entrypoints.openai.serving.base import _sse
 from sparsevllm.entrypoints.openai.serving.base import _tokens_per_second
+from sparsevllm.entrypoints.openai.serving.base import DisconnectChecker
+from sparsevllm.entrypoints.openai.serving.base import _queue_get_or_disconnect
 from sparsevllm.entrypoints.openai.serving.base import _wait_final
 from sparsevllm.entrypoints.openai.serving.base import _write_request_log
 from sparsevllm.entrypoints.openai.serving.response_parsing import ParsedModelResponse
@@ -37,6 +39,8 @@ async def serve_chat_completion(
     request_log_path: Path | None,
     reasoning_parser_name: str | None = None,
     response_parser: TransformersResponseParser | None = None,
+    *,
+    is_disconnected: DisconnectChecker | None = None,
 ):
     _validate_chat_request(
         request,
@@ -94,6 +98,7 @@ async def serve_chat_completion(
                 reasoning_parser_name=reasoning_parser_name,
                 parse_tools=bool(chat_tools),
                 response_parser=response_parser,
+                is_disconnected=is_disconnected,
             ),
             media_type="text/event-stream",
         )
@@ -109,6 +114,7 @@ async def serve_chat_completion(
             reasoning_parser_name=reasoning_parser_name,
             parse_tools=bool(chat_tools),
             response_parser=response_parser,
+            is_disconnected=is_disconnected,
         )
     except asyncio.CancelledError:
         dispatcher.cancel(handle)
@@ -219,10 +225,11 @@ async def _chat_completion_response(
     reasoning_parser_name: str | None = None,
     parse_tools: bool = False,
     response_parser: TransformersResponseParser | None = None,
+    is_disconnected: DisconnectChecker | None = None,
 ) -> dict[str, Any]:
     if len(handles) != 1:
         raise HTTPException(status_code=500, detail="chat completions expects exactly one request handle.")
-    final = await _wait_final(handles[0].output_queue)
+    final = await _wait_final(handles[0].output_queue, is_disconnected)
     should_parse = reasoning_parser_name is not None or parse_tools
     if should_parse:
         if response_parser is None:
@@ -306,6 +313,7 @@ async def _chat_completion_stream(
     reasoning_parser_name: str | None = None,
     parse_tools: bool = False,
     response_parser: TransformersResponseParser | None = None,
+    is_disconnected: DisconnectChecker | None = None,
 ):
     if len(handles) != 1:
         raise HTTPException(status_code=500, detail="chat completions expects exactly one request handle.")
@@ -328,7 +336,7 @@ async def _chat_completion_stream(
         )
         while pending:
             handle = next(iter(pending.values()))
-            item = await handle.output_queue.get()
+            item = await _queue_get_or_disconnect(handle.output_queue, is_disconnected)
             if item["type"] == "error":
                 yield _sse({"object": "error", "message": item["message"]})
                 pending.clear()

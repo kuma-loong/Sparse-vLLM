@@ -412,6 +412,25 @@ class StandardCacheManager(PrefixCacheMixin, CacheManager):
             )
         self.seq_id_to_cached_ranges.setdefault(int(seq.seq_id), []).append((start, end))
 
+    def rollback_materialized_prefix_kv_payload(
+        self,
+        seq: Sequence,
+        payload: object,
+    ) -> None:
+        if not isinstance(payload, StandardPrefixBlockPayload):
+            raise RuntimeError("Standard mixed prefix KV payload is missing token slots.")
+        seq_id = int(seq.seq_id)
+        target = (int(payload.block_start), int(payload.block_end))
+        cached_ranges = self.seq_id_to_cached_ranges.get(seq_id)
+        if not cached_ranges:
+            return
+        for idx in range(len(cached_ranges) - 1, -1, -1):
+            if cached_ranges[idx] == target:
+                cached_ranges.pop(idx)
+                break
+        if not cached_ranges:
+            self.seq_id_to_cached_ranges.pop(seq_id, None)
+
     def _reset_prefix_cache_allocator_after_clear(self) -> None:
         if self.seq_id_to_row:
             raise RuntimeError("Cannot reset prefix cache while Standard sequences are active.")

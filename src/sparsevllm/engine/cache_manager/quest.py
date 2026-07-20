@@ -117,6 +117,28 @@ class QuestCacheManager(PrefixCacheMixin, CacheManager):
             device=self.device,
         )
 
+    def _kv_allocation_bytes_per_prefix_block(
+        self,
+        slot_bytes_per_layer: int,
+    ) -> int:
+        block_size = int(self.config.prefix_cache_block_size or 0)
+        if block_size <= 0 or block_size % self.page_size != 0:
+            raise RuntimeError(
+                "Quest mixed prefix blocks must contain whole pages for memory accounting: "
+                f"block_size={block_size} page_size={self.page_size}."
+            )
+        return self._prefix_kv_allocation_nbytes(block_size, slot_bytes_per_layer)
+
+    def _prefix_kv_allocation_nbytes(
+        self,
+        token_count: int,
+        slot_bytes_per_layer: int,
+    ) -> int:
+        page_count = int(token_count) // self.page_size
+        token_kv_bytes = int(token_count) * self.num_kv_layers * int(slot_bytes_per_layer)
+        page_metadata_bytes = page_count * self.num_kv_layers * int(slot_bytes_per_layer)
+        return int(token_kv_bytes + page_metadata_bytes)
+
     def get_layer_batch_states(self, layer_idx: int) -> LayerBatchStates:
         return self.layer_batch_state
 
@@ -540,15 +562,16 @@ class QuestCacheManager(PrefixCacheMixin, CacheManager):
     def prefix_kv_payload_nbytes(self, payload: object) -> int:
         if not isinstance(payload, QuestPrefixBlockPayload):
             raise RuntimeError("Quest mixed prefix KV payload is missing page payload.")
-        dtype_size = self._cache_slot_dtype_size()
-        return int(
-            payload.token_slots.numel()
-            * self.num_kv_layers
-            * 2
-            * self.num_kv_heads
-            * self.head_dim
-            * dtype_size
+        token_count = int(payload.token_slots.numel())
+        if token_count <= 0 or token_count % self.page_size != 0:
+            raise RuntimeError(
+                "Quest mixed prefix KV payload must contain whole pages for memory accounting: "
+                f"token_count={token_count} page_size={self.page_size}."
+            )
+        slot_bytes_per_layer = (
+            2 * self.num_kv_heads * self.head_dim * self._cache_slot_dtype_size()
         )
+        return self._prefix_kv_allocation_nbytes(token_count, slot_bytes_per_layer)
 
     def mark_materialized_prefix_kv_payload(self, seq: Sequence, payload: object) -> None:
         if not isinstance(payload, QuestPrefixBlockPayload):
@@ -558,6 +581,23 @@ class QuestCacheManager(PrefixCacheMixin, CacheManager):
         self.seq_id_to_cached_pages.setdefault(int(seq.seq_id), set()).update(
             range(start_page, start_page + page_count)
         )
+
+    def rollback_materialized_prefix_kv_payload(
+        self,
+        seq: Sequence,
+        payload: object,
+    ) -> None:
+        if not isinstance(payload, QuestPrefixBlockPayload):
+            raise RuntimeError("Quest mixed prefix KV payload is missing page payload.")
+        seq_id = int(seq.seq_id)
+        start_page = int(payload.block_start) // int(self.page_size)
+        page_count = int(payload.token_slots.numel()) // int(self.page_size)
+        cached_pages = self.seq_id_to_cached_pages.get(seq_id)
+        if not cached_pages:
+            return
+        cached_pages.difference_update(range(start_page, start_page + page_count))
+        if not cached_pages:
+            self.seq_id_to_cached_pages.pop(seq_id, None)
 
     def _reset_prefix_cache_allocator_after_clear(self) -> None:
         if self.seq_id_to_row:

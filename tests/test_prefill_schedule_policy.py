@@ -383,6 +383,41 @@ class PrefillPolicyRegistryTest(unittest.TestCase):
 
 
 class StandardCacheManagerAdmissionTest(unittest.TestCase):
+    def test_prefill_token_estimate_keeps_ten_x_activation_headroom(self):
+        total_memory = 80 * 1024**3
+        manager = object.__new__(StandardCacheManager)
+        manager.config = SimpleNamespace(
+            hf_config=SimpleNamespace(
+                hidden_size=2560,
+                intermediate_size=9728,
+                torch_dtype=torch.bfloat16,
+            ),
+            gpu_memory_utilization=0.9,
+            max_num_batched_tokens=65536,
+            chunk_prefill_size=4096,
+            prefill_schedule_policy="all_chunked",
+        )
+        manager.world_size = 1
+        manager.device = torch.device("cuda:0")
+        manager.num_kv_heads = 8
+        manager.head_dim = 128
+        manager.platform = SimpleNamespace(
+            get_available_memory=lambda _device_id: (total_memory, total_memory),
+            get_allocator_stats=lambda _device: SimpleNamespace(
+                peak_allocated_bytes=0,
+                current_allocated_bytes=0,
+            ),
+        )
+
+        expected_max_tokens = int(
+            total_memory * (1 - manager.config.gpu_memory_utilization)
+            / (manager.config.hf_config.intermediate_size * 2 * 10)
+        )
+        with patch.dict(os.environ, {"SPARSEVLLM_ALLOW_LARGE_PREFILL_CHUNK": "0"}):
+            manager._get_available_slots_info()
+
+        self.assertEqual(manager.config.max_num_batched_tokens, expected_max_tokens)
+
     def test_prompt_admission_tracks_row_budget(self):
         manager = object.__new__(StandardCacheManager)
         manager._num_free_slots = 100

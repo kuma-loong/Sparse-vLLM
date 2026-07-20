@@ -2,6 +2,7 @@ import asyncio
 import importlib.util
 import unittest
 from unittest.mock import AsyncMock
+from unittest.mock import Mock
 from unittest.mock import patch
 
 
@@ -253,16 +254,21 @@ class OpenAISmartRouterTest(unittest.TestCase):
             async def json(self):
                 return {"model": "model", "input": "hello"}
 
+            async def is_disconnected(self):
+                return False
+
         app = smart_router.create_app(["http://worker-a"])
         endpoint = next(route.endpoint for route in app.routes if getattr(route, "path", None) == "/v1/responses")
         app.state.router.route_openai_request = AsyncMock(return_value="ok")
 
-        response = asyncio.run(endpoint(JsonRequest()))
+        request = JsonRequest()
+        response = asyncio.run(endpoint(request))
 
         self.assertEqual(response, "ok")
         app.state.router.route_openai_request.assert_awaited_once_with(
             "/v1/responses",
             {"model": "model", "input": "hello"},
+            is_disconnected=request.is_disconnected,
         )
 
     def test_responses_route_hints_are_stripped_before_forwarding(self):
@@ -284,8 +290,15 @@ class OpenAISmartRouterTest(unittest.TestCase):
 
         router.refresh_worker_info = refresh_worker_info
 
-        async def forward_json(_worker, _endpoint, payload):
+        async def forward_json(
+            _worker,
+            _endpoint,
+            payload,
+            *,
+            is_disconnected=None,
+        ):
             self.assertEqual(payload, {"model": "model", "input": "hello"})
+            self.assertIsNone(is_disconnected)
             return Response(content=b"{}", media_type="application/json")
 
         router.forward_json = forward_json
@@ -453,6 +466,213 @@ class OpenAISmartRouterTest(unittest.TestCase):
         self.assertEqual(response.headers["x-sparsevllm-worker"], "http://worker-a")
         self.assertEqual(response.headers["x-sparsevllm-route-reason"], "target_worker")
         self.assertEqual(router.workers[0].local_inflight, 0)
+
+    def test_streaming_client_disconnect_closes_upstream(self):
+        from sparsevllm.entrypoints.openai import smart_router
+
+        router = smart_router.SmartRouter(
+            worker_urls=["http://worker-a"],
+            request_timeout_s=1.0,
+            overload_load_factor=1.5,
+            load_abs_threshold=1,
+            profiles={},
+            route_log_dir=None,
+        )
+        router.workers[0].info = {
+            "served_model_name": "model",
+            "sparse_method": "omnikv",
+        }
+
+        async def refresh_worker_info():
+            return None
+
+        class Upstream:
+            def __init__(self):
+                self.closed = False
+
+            def read(self, _size):
+                raise AssertionError("disconnect must be checked before blocking on upstream")
+
+            def close(self):
+                self.closed = True
+
+        async def is_disconnected():
+            return True
+
+        upstream_response = Upstream()
+        router.refresh_worker_info = refresh_worker_info
+
+        async def run_request():
+            with patch.object(
+                smart_router,
+                "_open_stream_response",
+                return_value=smart_router.UpstreamStream(
+                    response=upstream_response,
+                    headers={"Content-Type": "text/event-stream"},
+                ),
+            ):
+                response = await router.route_openai_request(
+                    "/v1/responses",
+                    {
+                        "model": "model",
+                        "input": "hello",
+                        "stream": True,
+                        "svllm_target_worker": "0",
+                    },
+                    is_disconnected=is_disconnected,
+                )
+                await response.body_iterator.__anext__()
+
+        with self.assertRaises(asyncio.CancelledError):
+            asyncio.run(run_request())
+
+        self.assertTrue(upstream_response.closed)
+        self.assertEqual(router.workers[0].local_inflight, 0)
+
+    def test_non_streaming_client_disconnect_closes_upstream(self):
+        import threading
+
+        from sparsevllm.entrypoints.openai import smart_router
+
+        router = smart_router.SmartRouter(
+            worker_urls=["http://worker-a"],
+            request_timeout_s=1.0,
+            overload_load_factor=1.5,
+            load_abs_threshold=1,
+            profiles={},
+            route_log_dir=None,
+        )
+        operation_started = threading.Event()
+        operation_closed = threading.Event()
+
+        class BlockingRequest:
+            def execute(self):
+                operation_started.set()
+                if not operation_closed.wait(timeout=1.0):
+                    raise AssertionError("upstream request was not closed")
+                raise RuntimeError("upstream request closed")
+
+            def close(self):
+                operation_closed.set()
+
+        async def is_disconnected():
+            return operation_started.is_set()
+
+        with patch.object(
+            smart_router,
+            "_CloseableByteRequest",
+            return_value=BlockingRequest(),
+        ):
+            with self.assertRaises(asyncio.CancelledError):
+                asyncio.run(
+                    router.forward_json(
+                        router.workers[0],
+                        "/v1/responses",
+                        {"model": "model", "input": "hello"},
+                        is_disconnected=is_disconnected,
+                    )
+                )
+
+        self.assertTrue(operation_closed.is_set())
+        self.assertEqual(router.workers[0].local_inflight, 0)
+
+    def test_non_streaming_forward_returns_upstream_response(self):
+        from sparsevllm.entrypoints.openai import smart_router
+
+        router = smart_router.SmartRouter(
+            worker_urls=["http://worker-a"],
+            request_timeout_s=1.0,
+            overload_load_factor=1.5,
+            load_abs_threshold=1,
+            profiles={},
+            route_log_dir=None,
+        )
+        operation = Mock()
+        operation.execute.return_value = (
+            201,
+            {"Content-Type": "application/json", "X-Upstream": "ignored"},
+            b'{"ok":true}',
+        )
+
+        with patch.object(
+            smart_router,
+            "_CloseableByteRequest",
+            return_value=operation,
+        ):
+            response = asyncio.run(
+                router.forward_json(
+                    router.workers[0],
+                    "/v1/responses",
+                    {"model": "model", "input": "hello"},
+                )
+            )
+
+        self.assertEqual(response.status_code, 201)
+        self.assertEqual(response.body, b'{"ok":true}')
+        self.assertEqual(response.headers["content-type"], "application/json")
+        operation.close.assert_not_called()
+        self.assertEqual(router.workers[0].local_inflight, 0)
+
+    def test_closeable_request_interrupts_wait_for_response_headers(self):
+        import socket
+        import threading
+
+        from sparsevllm.entrypoints.openai import smart_router
+
+        server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        server_socket.bind(("127.0.0.1", 0))
+        server_socket.listen(1)
+        request_received = threading.Event()
+        release_server = threading.Event()
+        client_errors = []
+
+        def serve_delayed_headers():
+            connection, _ = server_socket.accept()
+            with connection:
+                connection.recv(8192)
+                request_received.set()
+                release_server.wait(timeout=2.0)
+                try:
+                    connection.sendall(
+                        b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\n{}"
+                    )
+                except OSError:
+                    pass
+
+        server_thread = threading.Thread(target=serve_delayed_headers)
+        server_thread.start()
+        port = server_socket.getsockname()[1]
+        operation = smart_router._CloseableByteRequest(
+            f"http://127.0.0.1:{port}/v1/responses",
+            "POST",
+            {"model": "model", "input": "hello"},
+            2.0,
+        )
+
+        def run_request():
+            try:
+                operation.execute()
+            except BaseException as exc:
+                client_errors.append(exc)
+
+        client_thread = threading.Thread(target=run_request)
+        client_thread.start()
+        try:
+            self.assertTrue(request_received.wait(timeout=1.0))
+            operation.close()
+            client_thread.join(timeout=0.5)
+            self.assertFalse(
+                client_thread.is_alive(),
+                "closing the request did not interrupt response-header wait",
+            )
+        finally:
+            release_server.set()
+            server_thread.join(timeout=1.0)
+            client_thread.join(timeout=1.0)
+            server_socket.close()
+
+        self.assertEqual(len(client_errors), 1)
+        self.assertIsInstance(client_errors[0], RuntimeError)
 
     def test_streaming_open_exception_releases_local_inflight(self):
         from sparsevllm.entrypoints.openai import smart_router

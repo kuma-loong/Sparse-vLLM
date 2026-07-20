@@ -607,7 +607,8 @@ class Config:
     enable_prefix_caching: bool = False
     prefix_cache_block_size: int | None = None
     prefix_cache_max_blocks: int | None = None
-    prefix_cache_max_recurrent_bytes: int = 1 << 30
+    recurrent_state_max_bytes: int | None = None
+    prefix_cache_max_recurrent_bytes: int | None = None
     prefix_cache_salt: str = ""
 
     # General Sparse Config
@@ -800,12 +801,35 @@ class Config:
             "prefix_cache_max_blocks",
             self.prefix_cache_max_blocks,
         )
+        recurrent_state_max_bytes = _coerce_optional_positive_int(
+            "recurrent_state_max_bytes",
+            self.recurrent_state_max_bytes,
+        )
         self.prefix_cache_max_recurrent_bytes = _coerce_optional_positive_int(
             "prefix_cache_max_recurrent_bytes",
             self.prefix_cache_max_recurrent_bytes,
         )
-        if self.prefix_cache_max_recurrent_bytes is None:
-            raise ValueError("prefix_cache_max_recurrent_bytes must be a positive integer.")
+        if self.prefix_cache_max_recurrent_bytes is not None:
+            log_once(
+                "prefix_cache_max_recurrent_bytes is deprecated; use "
+                "recurrent_state_max_bytes instead. The budget applies only when "
+                "prefix caching is disabled.",
+                level="WARNING",
+            )
+            if (
+                recurrent_state_max_bytes is not None
+                and recurrent_state_max_bytes != self.prefix_cache_max_recurrent_bytes
+            ):
+                raise ValueError(
+                    "conflicting recurrent state budgets: "
+                    f"recurrent_state_max_bytes={recurrent_state_max_bytes} and "
+                    "prefix_cache_max_recurrent_bytes="
+                    f"{self.prefix_cache_max_recurrent_bytes}."
+                )
+            recurrent_state_max_bytes = self.prefix_cache_max_recurrent_bytes
+        self.recurrent_state_max_bytes = (
+            1 << 30 if recurrent_state_max_bytes is None else recurrent_state_max_bytes
+        )
         if self.enable_prefix_caching and self.vllm_sparse_method not in PREFIX_CACHE_SUPPORTED_METHODS:
             raise ValueError("prefix caching only supports vanilla, omnikv, quest.")
         self.prefix_cache_salt = str(self.prefix_cache_salt or "")

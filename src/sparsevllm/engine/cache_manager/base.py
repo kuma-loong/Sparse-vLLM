@@ -30,6 +30,51 @@ class LayerBatchStates:
     req_indices: torch.Tensor | None = None
 
 
+@dataclass(frozen=True)
+class JointPrefixCapacity:
+    block_capacity: int
+    kv_allocatable_bytes: int
+    recurrent_capacity_bytes: int
+    unallocated_bytes: int
+
+
+def resolve_joint_prefix_capacity(
+    *,
+    available_bytes: int,
+    kv_bytes_per_block: int,
+    recurrent_bytes_per_block: int,
+    requested_max_blocks: int | None,
+) -> JointPrefixCapacity:
+    available_bytes = int(available_bytes)
+    kv_bytes_per_block = int(kv_bytes_per_block)
+    recurrent_bytes_per_block = int(recurrent_bytes_per_block)
+    if available_bytes < 0:
+        raise ValueError(f"available_bytes must be >= 0, got {available_bytes}.")
+    if kv_bytes_per_block <= 0 or recurrent_bytes_per_block <= 0:
+        raise ValueError(
+            "Joint prefix block bytes must be positive: "
+            f"kv={kv_bytes_per_block} recurrent={recurrent_bytes_per_block}."
+        )
+    block_capacity = available_bytes // (kv_bytes_per_block + recurrent_bytes_per_block)
+    if requested_max_blocks is not None:
+        requested_max_blocks = int(requested_max_blocks)
+        if requested_max_blocks <= 0:
+            raise ValueError(
+                f"requested_max_blocks must be positive when set, got {requested_max_blocks}."
+            )
+        block_capacity = min(block_capacity, requested_max_blocks)
+    kv_allocatable_bytes = block_capacity * kv_bytes_per_block
+    recurrent_capacity_bytes = block_capacity * recurrent_bytes_per_block
+    return JointPrefixCapacity(
+        block_capacity=int(block_capacity),
+        kv_allocatable_bytes=int(kv_allocatable_bytes),
+        recurrent_capacity_bytes=int(recurrent_capacity_bytes),
+        unallocated_bytes=int(
+            available_bytes - kv_allocatable_bytes - recurrent_capacity_bytes
+        ),
+    )
+
+
 @dataclass
 class SparseSelection:
     """Logical token selection produced by SparseController for one layer."""
@@ -103,7 +148,35 @@ class CacheManager(ABC):
         )
 
         self.max_model_len = config.max_model_len
-        self.max_buffer_rows = config.max_num_seqs_in_batch * REDUNDANCY_BATCH_SIZE_FACTOR
+        default_buffer_rows = (
+            int(config.max_num_seqs_in_batch) * REDUNDANCY_BATCH_SIZE_FACTOR
+        )
+        recurrent_row_capacity = getattr(
+            config,
+            "recurrent_state_row_capacity",
+            None,
+        )
+        has_recurrent_layers = bool(
+            getattr(self.runtime_layout, "linear_attention_layer_indices", ())
+        )
+        if has_recurrent_layers and recurrent_row_capacity is not None:
+            recurrent_row_capacity = int(recurrent_row_capacity)
+            requested_active = max(
+                int(config.max_num_seqs_in_batch),
+                int(config.max_decoding_seqs),
+            )
+            if recurrent_row_capacity < requested_active:
+                raise RuntimeError(
+                    "Cache-manager row capacity cannot satisfy requested mixed-runtime "
+                    f"concurrency: recurrent_rows={recurrent_row_capacity} "
+                    f"requested_active_sequences={requested_active}."
+                )
+            self.max_buffer_rows = min(
+                max(default_buffer_rows, requested_active),
+                recurrent_row_capacity,
+            )
+        else:
+            self.max_buffer_rows = default_buffer_rows
 
         self.kv_cache = None
         self._decode_static_max_context_len: int | None = None
@@ -183,7 +256,7 @@ class CacheManager(ABC):
 
         # Keep this heuristic conservative: large prefill batches can still peak on
         # MLP activations and allocator fragmentation after KV cache allocation.
-        estimated_max_tokens = int(reserved_mem / (intermediate_size_per_rank * dtype_size * 4))
+        estimated_max_tokens = int(reserved_mem / (intermediate_size_per_rank * dtype_size * 10))
         allow_large_prefill_chunk = os.getenv("SPARSEVLLM_ALLOW_LARGE_PREFILL_CHUNK", "0") == "1"
         prefill_policy = getattr(config, "prefill_schedule_policy", None)
         if estimated_max_tokens <= 0:
@@ -229,8 +302,108 @@ class CacheManager(ABC):
         peak = allocator_stats.peak_allocated_bytes
         current = allocator_stats.current_allocated_bytes
 
-        available_memory = int(total * config.gpu_memory_utilization - used - peak + current)
+        target_persistent_bytes = int(total * config.gpu_memory_utilization)
+        activation_reserve_bytes = int(total - target_persistent_bytes)
+        recurrent_pool_bytes = int(getattr(config, "recurrent_state_pool_bytes", 0) or 0)
+        recurrent_peak_before = int(
+            getattr(config, "recurrent_state_allocator_peak_before_bytes", peak) or 0
+        )
+        recurrent_peak_after = int(
+            getattr(config, "recurrent_state_allocator_peak_after_bytes", peak) or 0
+        )
+        recurrent_peak_growth = min(
+            recurrent_pool_bytes,
+            max(0, recurrent_peak_after - recurrent_peak_before),
+        )
+        recurrent_explicit_deduction = max(
+            0,
+            recurrent_pool_bytes - recurrent_peak_growth,
+        )
+        available_memory = int(
+            target_persistent_bytes
+            - used
+            - peak
+            + current
+            - recurrent_explicit_deduction
+        )
         slot_bytes_per_layer = 2 * self.num_kv_heads * self.head_dim * dtype_size
+
+        recurrent_bytes_per_block = int(
+            getattr(config, "prefix_recurrent_bytes_per_block", 0) or 0
+        )
+        prefix_block_capacity = 0
+        prefix_recurrent_capacity_bytes = 0
+        kv_bytes_per_block = 0
+        if bool(getattr(config, "enable_prefix_caching", False)) and recurrent_bytes_per_block > 0:
+            kv_bytes_per_block = self._kv_allocation_bytes_per_prefix_block(
+                slot_bytes_per_layer
+            )
+            requested_max_blocks = getattr(
+                config,
+                "prefix_cache_requested_max_blocks",
+                getattr(config, "prefix_cache_max_blocks", None),
+            )
+            config.prefix_cache_requested_max_blocks = requested_max_blocks
+            joint_capacity = resolve_joint_prefix_capacity(
+                available_bytes=available_memory,
+                kv_bytes_per_block=kv_bytes_per_block,
+                recurrent_bytes_per_block=recurrent_bytes_per_block,
+                requested_max_blocks=requested_max_blocks,
+            )
+            if joint_capacity.block_capacity <= 0:
+                raise RuntimeError(
+                    "Insufficient GPU memory for one mixed prefix block: "
+                    f"available_bytes={available_memory} "
+                    f"kv_bytes_per_block={kv_bytes_per_block} "
+                    f"recurrent_bytes_per_block={recurrent_bytes_per_block}."
+                )
+            available_memory = joint_capacity.kv_allocatable_bytes
+            prefix_block_capacity = joint_capacity.block_capacity
+            prefix_recurrent_capacity_bytes = joint_capacity.recurrent_capacity_bytes
+            config.prefix_cache_max_blocks = int(prefix_block_capacity)
+            config.prefix_recurrent_capacity_bytes = int(
+                prefix_recurrent_capacity_bytes
+            )
+            config.prefix_kv_bytes_per_block = int(kv_bytes_per_block)
+            config.prefix_kv_block_capacity = int(prefix_block_capacity)
+            config.kv_allocatable_bytes = int(available_memory)
+
+        model_current_bytes = max(0, int(current) - recurrent_pool_bytes)
+        ratio = (
+            0.0
+            if kv_bytes_per_block <= 0
+            else float(recurrent_bytes_per_block) / float(kv_bytes_per_block)
+        )
+        num_kv_layers = int(
+            getattr(self, "num_kv_layers", getattr(self, "num_layers", 1))
+        )
+        kv_slots = (
+            prefix_block_capacity * int(config.prefix_cache_block_size)
+            if prefix_block_capacity > 0
+            else available_memory // (num_kv_layers * slot_bytes_per_layer)
+        )
+        logger.info(
+            "Persistent GPU budget: target={} model_current={} allocator_current={} "
+            "device_used={} historical_peak={} recurrent_pool={} "
+            "recurrent_peak_growth={} recurrent_explicit_deduction={} "
+            "prefix_recurrent_capacity={} "
+            "prefix_recurrent_to_kv_ratio={:.6f} activation_reserve={} "
+            "kv_allocatable={} kv_slots={} prefix_blocks={}.",
+            target_persistent_bytes,
+            model_current_bytes,
+            current,
+            used,
+            peak,
+            recurrent_pool_bytes,
+            recurrent_peak_growth,
+            recurrent_explicit_deduction,
+            prefix_recurrent_capacity_bytes,
+            ratio,
+            activation_reserve_bytes,
+            available_memory,
+            kv_slots,
+            prefix_block_capacity,
+        )
 
         if log_level == "DEBUG":
             logger.debug(
@@ -239,6 +412,17 @@ class CacheManager(ABC):
             )
 
         return available_memory, slot_bytes_per_layer
+
+    def _kv_allocation_bytes_per_prefix_block(
+        self,
+        slot_bytes_per_layer: int,
+    ) -> int:
+        block_size = int(self.config.prefix_cache_block_size or 0)
+        if block_size <= 0:
+            raise RuntimeError(
+                "Mixed prefix capacity requires a positive prefix_cache_block_size."
+            )
+        return int(block_size * self.num_kv_layers * int(slot_bytes_per_layer))
 
     def prepare_step(self, seqs: list[Sequence], is_prefill: bool):
         if is_prefill:

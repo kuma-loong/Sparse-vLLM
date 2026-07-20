@@ -37,6 +37,40 @@ def _write_jsonl(path: Path, rows: Sequence[dict[str, Any]]) -> None:
             handle.write(json.dumps(row, ensure_ascii=False, sort_keys=True) + "\n")
 
 
+def _read_skipped_results(path: Path | None) -> list[dict[str, Any]]:
+    if path is None:
+        return []
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except FileNotFoundError as exc:
+        raise ClawResultError(f"Skipped-results artifact is missing: {path}") from exc
+    rows = []
+    for line_number, line in enumerate(lines, start=1):
+        if not line.strip():
+            continue
+        try:
+            row = json.loads(line)
+        except json.JSONDecodeError as exc:
+            raise ClawResultError(
+                f"Invalid JSON on line {line_number} of skipped-results artifact {path}: {exc}"
+            ) from exc
+        if not isinstance(row, dict):
+            raise ClawResultError(
+                f"Skipped-results line {line_number} must be a JSON object: {path}"
+            )
+        if row.get("status") != "skipped_by_policy":
+            raise ClawResultError(
+                f"Skipped-results line {line_number} has invalid status: {row.get('status')!r}"
+            )
+        task_id = row.get("task_id")
+        if not isinstance(task_id, str) or not task_id:
+            raise ClawResultError(
+                f"Skipped-results line {line_number} has no non-empty task_id: {path}"
+            )
+        rows.append(row)
+    return rows
+
+
 def _sha256(path: Path) -> str:
     digest = hashlib.sha256()
     with path.open("rb") as handle:
@@ -147,6 +181,7 @@ def validate_changed_results(
     snapshot_path: Path,
     per_sample_path: Path,
     final_summary_path: Path,
+    skipped_results_path: Path | None = None,
 ) -> dict[str, Any]:
     summary_path = _changed_summary(trace_dir, snapshot_path)
     results_path = summary_path.with_name("batch_results.json")
@@ -175,9 +210,19 @@ def validate_changed_results(
         )
 
     rows = [_normalize_task(result, trials_per_task) for result in results]
+    skipped_rows = _read_skipped_results(skipped_results_path)
     task_ids = [row["task_id"] for row in rows]
     if len(set(task_ids)) != len(task_ids):
         raise ClawResultError("Claw-Eval results contain duplicate task_id values")
+    skipped_task_ids = [row["task_id"] for row in skipped_rows]
+    if len(set(skipped_task_ids)) != len(skipped_task_ids):
+        raise ClawResultError("Skipped-results artifact contains duplicate task_id values")
+    overlap = sorted(set(task_ids) & set(skipped_task_ids))
+    if overlap:
+        raise ClawResultError(
+            f"Tasks cannot be both evaluated and skipped_by_policy: {overlap}"
+        )
+    all_rows = rows + skipped_rows
 
     top_level_errors = sum(
         1 for result in results if isinstance(result, dict) and result.get("error")
@@ -188,19 +233,25 @@ def validate_changed_results(
             f"{upstream_summary.get('errored')!r} != {top_level_errors}"
         )
 
-    status_counts = dict(sorted(Counter(row["status"] for row in rows).items()))
+    status_counts = dict(sorted(Counter(row["status"] for row in all_rows).items()))
     normalized_summary = {
         "schema_version": 1,
         "tasks": tasks,
+        "skipped_tasks": len(skipped_rows),
+        "total_scope_tasks": tasks + len(skipped_rows),
         "trials_per_task": trials_per_task,
         "resolved_tasks": sum(row["resolved"] is True for row in rows),
         "status_counts": status_counts,
         "failed_task_ids": [row["task_id"] for row in rows if row["status"] != "success"],
+        "skipped_task_ids": skipped_task_ids,
         "batch_results_path": str(results_path.resolve()),
         "batch_summary_path": str(summary_path.resolve()),
+        "skipped_results_path": (
+            str(skipped_results_path.resolve()) if skipped_results_path is not None else None
+        ),
         "upstream_summary": upstream_summary,
     }
-    _write_jsonl(per_sample_path, rows)
+    _write_jsonl(per_sample_path, all_rows)
     _write_json(final_summary_path, normalized_summary)
 
     failed = sum(row["status"] != "success" for row in rows)
@@ -225,6 +276,7 @@ def build_parser() -> argparse.ArgumentParser:
     validate.add_argument("--snapshot", type=Path, required=True)
     validate.add_argument("--per-sample", type=Path, required=True)
     validate.add_argument("--final-summary", type=Path, required=True)
+    validate.add_argument("--skipped-results", type=Path)
     return parser
 
 
@@ -239,6 +291,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 snapshot_path=args.snapshot,
                 per_sample_path=args.per_sample,
                 final_summary_path=args.final_summary,
+                skipped_results_path=args.skipped_results,
             )
             print(
                 "Claw-Eval artifacts validated: "

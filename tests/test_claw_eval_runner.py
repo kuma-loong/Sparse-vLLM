@@ -1,3 +1,4 @@
+import json
 import os
 import subprocess
 import sys
@@ -123,6 +124,113 @@ class ClawEvalRunnerTest(unittest.TestCase):
 
         self.assertEqual(result.returncode, 3)
         self.assertIn("checkout must be clean", result.stderr)
+
+    def test_server_decoding_capacity_matches_parallelism_per_dp_replica(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            env_dir = root / "python-env"
+            (env_dir / "bin").mkdir(parents=True)
+            (env_dir / "bin" / "python").symlink_to(sys.executable)
+            engine_path = root / "engine.json"
+            env = os.environ.copy()
+            env.update(
+                {
+                    "OUTPUT_ROOT": str(root / "outputs"),
+                    "RUN_NAME": "capacity-test",
+                    "CLAW_EVAL_CONDA_ENV": str(env_dir),
+                    "ENGINE_KWARGS_FILE": str(engine_path),
+                    "ENGINE_KWARGS": json.dumps(
+                        {"max_num_seqs_in_batch": 4, "max_decoding_seqs": 99}
+                    ),
+                    "CLAW_EVAL_ARGS": "batch --parallel 24",
+                    "SPARSEVLLM_DATA_PARALLEL_SIZE": "2",
+                }
+            )
+
+            subprocess.run(
+                [
+                    "bash",
+                    "-c",
+                    'source "$1"; write_engine_kwargs_file',
+                    "bash",
+                    str(RUNNER),
+                ],
+                check=True,
+                env=env,
+            )
+
+            engine = json.loads(engine_path.read_text(encoding="utf-8"))
+            self.assertEqual(engine["max_decoding_seqs"], 12)
+            self.assertEqual(engine["max_num_seqs_in_batch"], 4)
+
+    def test_server_capacity_rejects_non_divisible_parallelism(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            env_dir = root / "python-env"
+            (env_dir / "bin").mkdir(parents=True)
+            (env_dir / "bin" / "python").symlink_to(sys.executable)
+            env = os.environ.copy()
+            env.update(
+                {
+                    "OUTPUT_ROOT": str(root / "outputs"),
+                    "RUN_NAME": "capacity-test",
+                    "CLAW_EVAL_CONDA_ENV": str(env_dir),
+                    "ENGINE_KWARGS": "{}",
+                    "CLAW_EVAL_ARGS": "batch --parallel 7",
+                    "SPARSEVLLM_DATA_PARALLEL_SIZE": "2",
+                }
+            )
+
+            result = subprocess.run(
+                [
+                    "bash",
+                    "-c",
+                    'source "$1"; write_engine_kwargs_file',
+                    "bash",
+                    str(RUNNER),
+                ],
+                capture_output=True,
+                text=True,
+                env=env,
+            )
+
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("must be divisible", result.stderr)
+
+    def test_resume_trace_is_added_for_the_same_run(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            env_dir = root / "python-env"
+            (env_dir / "bin").mkdir(parents=True)
+            (env_dir / "bin" / "python").symlink_to(sys.executable)
+            resume_trace = root / "outputs" / "resume-test" / "traces" / "model-run"
+            resume_trace.mkdir(parents=True)
+            env = os.environ.copy()
+            env.update(
+                {
+                    "OUTPUT_ROOT": str(root / "outputs"),
+                    "RUN_NAME": "resume-test",
+                    "CLAW_EVAL_CONDA_ENV": str(env_dir),
+                    "CLAW_EVAL_ARGS": "batch --parallel 8",
+                    "CLAW_EVAL_RESUME_TRACE_DIR": str(resume_trace),
+                }
+            )
+
+            result = subprocess.run(
+                [
+                    "bash",
+                    "-c",
+                    'source "$1"; prepare_resume_args; printf "%s" "$CLAW_EVAL_ARGS"',
+                    "bash",
+                    str(RUNNER),
+                ],
+                check=True,
+                capture_output=True,
+                text=True,
+                env=env,
+            )
+
+            self.assertIn(f"--continue {resume_trace}", result.stdout)
 
 
 if __name__ == "__main__":

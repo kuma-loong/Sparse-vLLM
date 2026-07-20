@@ -626,6 +626,21 @@ class RadixPrefixIndex:
         del self.blocks[stable_block_id]
         return block
 
+    def rollback_inserted_leaf(self, block: PrefixCacheBlock) -> None:
+        current = self.blocks.get(block.stable_block_id)
+        if current is not block:
+            raise RuntimeError(
+                "Cannot roll back a prefix block that is not the current indexed block."
+            )
+        if int(block.ref_count) != 0:
+            raise RuntimeError("Cannot roll back a referenced prefix block.")
+        if self.child_count(block.stable_block_id) != 0:
+            raise RuntimeError("Cannot roll back a prefix block with live children.")
+        if self.committed_blocks <= 0:
+            raise RuntimeError("Cannot roll back prefix commit statistics below zero.")
+        self._remove_block_from_index(block.stable_block_id)
+        self.committed_blocks -= 1
+
     def evict_until_freeable(self, needed_blocks: int) -> list[PrefixCacheBlock]:
         evicted: list[PrefixCacheBlock] = []
         needed_blocks = int(needed_blocks)

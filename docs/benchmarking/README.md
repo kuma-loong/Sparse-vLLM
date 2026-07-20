@@ -268,7 +268,23 @@ Notes:
   local source changes fail before evaluation.
 - The shared OpenAI-compatible server is intentionally text-only for this
   benchmark route. Unsupported OpenAI request fields fail instead of being
-  silently ignored.
+  silently ignored. Set `CLAW_EVAL_TEXT_ONLY=1` to build a recorded task view
+  that excludes `multimodal` tasks and tasks exposing image, PDF, presentation,
+  or spreadsheet files. Exclusions are retained as `skipped_by_policy` rows in
+  `per_sample_results.jsonl`; evaluated and skipped counts remain separate in
+  `final_summary.json`.
+- `CLAW_EVAL_ARGS` must contain exactly one explicit `--parallel`. For a
+  managed server, the runner sets `max_decoding_seqs` to
+  `parallel / SPARSEVLLM_DATA_PARALLEL_SIZE` and rejects non-divisible values.
+  `max_num_seqs_in_batch` remains an independent prefill batching control.
+- To continue an interrupted run in the same `RUN_NAME`, set
+  `CLAW_EVAL_RESUME_TRACE_DIR` to that run's concrete trace subdirectory. The
+  runner records the path and passes Claw-Eval's bounded `--continue` mode;
+  resume paths outside the current run are rejected.
+- Remote launchers can keep a reverse port forward alive with
+  `benchmark/ssh_reverse_tunnel.sh`. It uses SSH keepalives, records each
+  reconnect, and stops after the configured reconnect bound instead of hiding
+  a permanently broken route.
 - Use `SETUP_ONLY=1` to prepare the external repo, environments, Docker
   preflight, config, engine kwargs file, and run manifest without launching
   the model server or benchmark. A model path is not required in setup-only or

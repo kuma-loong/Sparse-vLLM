@@ -1,4 +1,5 @@
 import atexit
+import gc
 import os
 from dataclasses import fields
 from time import perf_counter
@@ -235,7 +236,8 @@ class LLMEngine:
             tuple[int, list[float | None], list[dict[int, float] | None]]
         ] = []
         # 注册退出钩子，确保程序崩溃或结束时能正确释放多进程资源
-        atexit.register(self.exit)
+        self._atexit_callback = self.exit
+        atexit.register(self._atexit_callback)
 
         # 5. 预热模型
         self._warmup()
@@ -389,6 +391,10 @@ class LLMEngine:
 
     def exit(self):
         """优雅地退出所有子进程并清理共享内存"""
+        atexit_callback = getattr(self, "_atexit_callback", None)
+        if atexit_callback is not None:
+            atexit.unregister(atexit_callback)
+            del self._atexit_callback
         if self._exited:
             return
         self._exited = True
@@ -396,8 +402,22 @@ class LLMEngine:
         profiler.print_stats()
         if hasattr(self, "_throughput_logger"):
             self._throughput_logger.stop()
+        runner_exit_completed, runner_platform = self._shutdown_runtime()
+        if runner_exit_completed:
+            # Collect only after _shutdown_runtime() returns. Its worker-thread
+            # closure temporarily owns ModelRunner, so collecting inside that
+            # frame can leave cyclic model/cache objects alive until exit().
+            gc.collect()
+            if runner_platform is not None:
+                runner_platform.empty_cache()
+
+    def _shutdown_runtime(self):
+        """Stop the runner/workers and drop engine-owned runtime references."""
+        runner_exit_completed = True
+        runner_platform = None
         if hasattr(self, "model_runner"):
             model_runner = self.model_runner
+            runner_platform = getattr(model_runner, "platform", None)
             timeout_s = float(os.getenv("SPARSEVLLM_ENGINE_EXIT_TIMEOUT_S", "10"))
             errors: list[BaseException] = []
 
@@ -415,6 +435,7 @@ class LLMEngine:
             exit_thread.start()
             exit_thread.join(timeout=max(0.0, timeout_s))
             if exit_thread.is_alive():
+                runner_exit_completed = False
                 logger.warning(
                     "Timed out waiting {:.1f}s for ModelRunner exit RPC; terminating workers.",
                     timeout_s,
@@ -423,7 +444,10 @@ class LLMEngine:
             elif errors:
                 logger.warning("ModelRunner exit RPC failed during shutdown: {}", repr(errors[0]))
                 self._cleanup_model_runner_shared_memory(model_runner)
+            errors.clear()
             del self.model_runner
+        if hasattr(self, "scheduler"):
+            del self.scheduler
         if hasattr(self, "ps"):
             join_timeout_s = float(os.getenv("SPARSEVLLM_WORKER_JOIN_TIMEOUT_S", "5"))
             for p in self.ps:
@@ -437,6 +461,7 @@ class LLMEngine:
                     )
                     p.kill()
                     p.join(timeout=max(0.0, join_timeout_s))
+        return runner_exit_completed, runner_platform
 
     def add_request(self, prompt: str | list[int], sampling_params: SamplingParams):
         """将一个新的推理请求加入系统"""

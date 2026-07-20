@@ -108,6 +108,58 @@ class ClawEvalResultValidationTest(unittest.TestCase):
                     final_summary_path=root / "summary.json",
                 )
 
+    def test_policy_skips_are_preserved_without_failing_validation(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            trace_dir = root / "traces"
+            snapshot = root / "before.json"
+            per_sample = root / "per_sample_results.jsonl"
+            final_summary = root / "final_summary.json"
+            skipped = root / "skipped.jsonl"
+            skipped.write_text(
+                json.dumps(
+                    {
+                        "task_id": "T200",
+                        "status": "skipped_by_policy",
+                        "resolved": None,
+                        "score": None,
+                        "trials": 0,
+                        "error": None,
+                        "skip_reason": "visual_files=fixture.pdf",
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            write_snapshot(trace_dir, snapshot)
+            batch_dir = trace_dir / "model_run"
+            _write_json(
+                batch_dir / "batch_results.json",
+                [{"task_id": "T100", "error": None, "trials": [_trial(passed=True)]}],
+            )
+            _write_json(
+                batch_dir / "batch_summary.json",
+                {"tasks": 1, "trials_per_task": 1, "errored": 0, "avg_score": 1.0},
+            )
+
+            summary = validate_changed_results(
+                trace_dir=trace_dir,
+                snapshot_path=snapshot,
+                per_sample_path=per_sample,
+                final_summary_path=final_summary,
+                skipped_results_path=skipped,
+            )
+
+            rows = [json.loads(line) for line in per_sample.read_text().splitlines()]
+            self.assertEqual(summary["tasks"], 1)
+            self.assertEqual(summary["skipped_tasks"], 1)
+            self.assertEqual(summary["total_scope_tasks"], 2)
+            self.assertEqual(
+                summary["status_counts"],
+                {"skipped_by_policy": 1, "success": 1},
+            )
+            self.assertEqual({row["task_id"] for row in rows}, {"T100", "T200"})
+
 
 if __name__ == "__main__":
     unittest.main()

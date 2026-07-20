@@ -2,11 +2,20 @@ import asyncio
 import json
 import time
 import uuid
+from collections.abc import Awaitable
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
 from fastapi import HTTPException
 from pydantic import BaseModel
+
+
+DisconnectChecker = Callable[[], Awaitable[bool]]
+
+
+class ClientDisconnected(asyncio.CancelledError):
+    """Raised when the ASGI client disappears while generation is active."""
 
 
 def _model_dump_json(model: BaseModel) -> dict[str, Any]:
@@ -74,9 +83,43 @@ def _chat_logprobs(
     return {"content": content}
 
 
-async def _wait_final(queue_item: asyncio.Queue) -> dict[str, Any]:
+async def _wait_for_any_or_disconnect(
+    tasks: set[asyncio.Task],
+    is_disconnected: DisconnectChecker | None = None,
+) -> tuple[set[asyncio.Task], set[asyncio.Task]]:
+    if is_disconnected is None:
+        return await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
     while True:
-        item = await queue_item.get()
+        if await is_disconnected():
+            raise ClientDisconnected
+        done, pending = await asyncio.wait(
+            tasks,
+            timeout=0.25,
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+        if done:
+            return done, pending
+
+
+async def _queue_get_or_disconnect(
+    queue_item: asyncio.Queue,
+    is_disconnected: DisconnectChecker | None = None,
+) -> Any:
+    task = asyncio.create_task(queue_item.get())
+    try:
+        done, _ = await _wait_for_any_or_disconnect({task}, is_disconnected)
+        return next(iter(done)).result()
+    finally:
+        if not task.done():
+            task.cancel()
+
+
+async def _wait_final(
+    queue_item: asyncio.Queue,
+    is_disconnected: DisconnectChecker | None = None,
+) -> dict[str, Any]:
+    while True:
+        item = await _queue_get_or_disconnect(queue_item, is_disconnected)
         if item["type"] == "error":
             raise HTTPException(status_code=500, detail=item["message"])
         if item["type"] == "final":

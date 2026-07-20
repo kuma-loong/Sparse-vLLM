@@ -90,6 +90,11 @@ class ModelRunner:
                 world_size=self.world_size,
                 rank=rank,
             )
+
+        # CUDA allocator peaks are process-global and survive LLMEngine.exit().
+        # Start a new lifecycle before model construction so KV sizing observes
+        # only this engine's model load and persistent allocations.
+        self.platform.reset_peak_memory_stats(self.device)
         
         default_dtype = torch.get_default_dtype()
         torch.set_default_dtype(hf_config.torch_dtype)
@@ -124,8 +129,6 @@ class ModelRunner:
         # Sync those fields from the compressor checkpoint before creating CacheManager.
         sync_deltakv_config_from_checkpoint(config)
         
-        # 初始化 CacheManager (负责 KV Cache + 物理槽位)
-        self.cache_manager = CacheManager.create(config, rank, self.world_size)
         has_linear_layers = bool(getattr(config.runtime_layout, "linear_attention_layer_indices", ()))
         state_spec_provider = getattr(self.model, "recurrent_state_spec", None)
         if has_linear_layers and not callable(state_spec_provider):
@@ -133,7 +136,11 @@ class ModelRunner:
                 f"Model {type(self.model).__name__} declares linear-attention layers but does not "
                 "provide recurrent_state_spec()."
             )
-        state_spec = state_spec_provider() if has_linear_layers else None
+        state_spec = (
+            state_spec_provider(config.hf_config, self.world_size)
+            if has_linear_layers
+            else None
+        )
         if state_spec is not None and not isinstance(state_spec, RecurrentStateSpec):
             raise TypeError(
                 f"recurrent_state_spec() must return RecurrentStateSpec, got {type(state_spec).__name__}."
@@ -144,8 +151,13 @@ class ModelRunner:
                 config,
                 rank,
                 self.world_size,
+                device=self.device,
+                platform=self.platform,
                 state_spec=state_spec,
             )
+        # Recurrent rows are persistent runtime state. Allocate them before the
+        # cache manager sizes KV so gpu_memory_utilization accounts for both.
+        self.cache_manager = CacheManager.create(config, rank, self.world_size)
         self.prefix_cache_coordinator = (
             PrefixCacheCoordinator(config, self.cache_manager, self.recurrent_state_manager)
             if has_linear_layers and bool(config.enable_prefix_caching)

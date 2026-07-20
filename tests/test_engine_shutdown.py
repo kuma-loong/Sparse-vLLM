@@ -1,9 +1,58 @@
+import gc
 import os
 import threading
 import time
+from types import SimpleNamespace
 from unittest.mock import patch
+import weakref
 
 from sparsevllm.engine.llm_engine import LLMEngine
+
+
+def test_explicit_exit_unregisters_hook_and_releases_runtime_references():
+    cleanup_calls = []
+
+    class Resource:
+        def __init__(self):
+            self.cycle = self
+
+    class Runner:
+        def __init__(self, resource):
+            self.platform = SimpleNamespace(
+                empty_cache=lambda: cleanup_calls.append("empty_cache"),
+            )
+            self.model = resource
+            self.cache_manager = resource
+
+        def call(self, method_name):
+            cleanup_calls.append(method_name)
+
+    resource = Resource()
+    resource_ref = weakref.ref(resource)
+    runner = Runner(resource)
+    runner_ref = weakref.ref(runner)
+    engine = object.__new__(LLMEngine)
+    engine._exited = False
+    engine.model_runner = runner
+    engine.scheduler = SimpleNamespace(memory_oracle=resource)
+    engine.ps = []
+    engine._atexit_callback = engine.exit
+    callback = engine._atexit_callback
+    del resource, runner
+
+    with (
+        patch("sparsevllm.engine.llm_engine.atexit.unregister") as unregister,
+        patch("sparsevllm.engine.llm_engine.gc.collect", wraps=gc.collect) as collect,
+    ):
+        engine.exit()
+
+    unregister.assert_called_once_with(callback)
+    collect.assert_called_once_with()
+    assert cleanup_calls == ["exit", "empty_cache"]
+    assert not hasattr(engine, "scheduler")
+    assert not hasattr(engine, "model_runner")
+    assert runner_ref() is None
+    assert resource_ref() is None
 
 
 def test_engine_exit_timeout_still_terminates_workers():

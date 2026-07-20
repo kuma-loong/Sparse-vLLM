@@ -36,6 +36,9 @@ class CudaPlatform(Platform):
             current_allocated_bytes=int(stats.get("allocated_bytes.all.current", 0)),
         )
 
+    def reset_peak_memory_stats(self, device: torch.device | None = None) -> None:
+        torch.cuda.reset_peak_memory_stats(device)
+
     def empty_cache(self) -> None:
         torch.cuda.empty_cache()
 

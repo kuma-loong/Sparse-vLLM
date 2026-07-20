@@ -778,8 +778,12 @@ class SweBenchLiteRunner:
             raise RunnerError(
                 "--run-id may only contain letters, numbers, dot, underscore, and dash"
             )
-        if args.step_limit <= 0 or args.wall_time_limit_seconds <= 0:
-            raise RunnerError("step and wall-time limits must be positive")
+        if args.step_limit <= 0:
+            raise RunnerError("--step-limit must be positive")
+        if args.wall_time_limit_seconds < 0:
+            raise RunnerError(
+                "--wall-time-limit-seconds must be non-negative; use 0 to disable it"
+            )
         if args.max_tokens <= 0 or args.eval_timeout <= 0 or args.health_timeout <= 0:
             raise RunnerError(
                 "token, evaluation-timeout, and health-timeout limits must be positive"
@@ -1584,7 +1588,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--batch-size", type=int, default=50)
     parser.add_argument("--step-limit", type=int, default=80)
     parser.add_argument("--cost-limit", type=float, default=0.0)
-    parser.add_argument("--wall-time-limit-seconds", type=int, default=1800)
+    parser.add_argument(
+        "--wall-time-limit-seconds",
+        type=int,
+        default=1800,
+        help="Per-agent wall-clock limit in seconds; 0 disables the limit.",
+    )
     parser.add_argument("--eval-timeout", type=int, default=1800)
     parser.add_argument("--cost-tracking", choices=("default", "ignore_errors"), default=None)
     parser.add_argument("--max-tokens", type=int, default=4096)
