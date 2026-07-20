@@ -628,7 +628,7 @@ class DeltaKVLessMemoryCacheManager(DeltaKVCacheTritonManagerV4):
         sink = int(config.num_sink_tokens)
         recent = int(config.num_recent_tokens)
         max_seqs = self._max_decode_scratch_seqs()
-        max_admission_seqs = int(config.max_num_seqs_in_batch)
+        max_admission_seqs = int(config.max_num_seqs_in_gpu)
         max_model_len = int(config.max_model_len)
         top_decode = int(config.decode_keep_tokens)
         self.deltakv_materialized_compute_num_slots = self._materialized_sparse_compute_slots(

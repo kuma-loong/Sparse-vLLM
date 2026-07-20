@@ -12,7 +12,6 @@ import torch
 from sparsevllm.config import Config
 from sparsevllm.distributed import ParallelContext
 from sparsevllm.engine.sequence import Sequence
-from sparsevllm.constant import REDUNDANCY_BATCH_SIZE_FACTOR
 from sparsevllm.method_registry import SUPPORTED_SPARSE_METHODS, normalize_sparse_method
 from sparsevllm.triton_kernel.store_kvcache import store_kvcache
 import sparsevllm.platforms as platforms
@@ -200,9 +199,7 @@ class CacheManager(ABC):
         )
 
         self.max_model_len = config.max_model_len
-        default_buffer_rows = (
-            int(config.max_num_seqs_in_batch) * REDUNDANCY_BATCH_SIZE_FACTOR
-        )
+        resident_buffer_rows = int(config.max_num_seqs_in_gpu)
         recurrent_row_capacity = getattr(
             config,
             "recurrent_state_row_capacity",
@@ -213,22 +210,15 @@ class CacheManager(ABC):
         )
         if has_recurrent_layers and recurrent_row_capacity is not None:
             recurrent_row_capacity = int(recurrent_row_capacity)
-            requested_active = max(
-                int(config.max_num_seqs_in_batch),
-                int(config.max_decoding_seqs),
-            )
-            if recurrent_row_capacity < requested_active:
+            if recurrent_row_capacity != resident_buffer_rows:
                 raise RuntimeError(
-                    "Cache-manager row capacity cannot satisfy requested mixed-runtime "
-                    f"concurrency: recurrent_rows={recurrent_row_capacity} "
-                    f"requested_active_sequences={requested_active}."
+                    "Cache-manager and recurrent live-row capacities disagree: "
+                    f"cache_rows={resident_buffer_rows} "
+                    f"recurrent_rows={recurrent_row_capacity}."
                 )
-            self.max_buffer_rows = min(
-                max(default_buffer_rows, requested_active),
-                recurrent_row_capacity,
-            )
+            self.max_buffer_rows = recurrent_row_capacity
         else:
-            self.max_buffer_rows = default_buffer_rows
+            self.max_buffer_rows = resident_buffer_rows
 
         self.kv_cache = None
         self._decode_static_max_context_len: int | None = None
@@ -316,22 +306,39 @@ class CacheManager(ABC):
                 "Estimated prefill token capacity must be positive: "
                 f"estimated_max_tokens={estimated_max_tokens}."
             )
+        chunk_prefill_size = int(config.chunk_prefill_size)
+        if prefill_policy == "long_bs1full_short_batch":
+            long_prefill_offload_threshold = int(config.long_prefill_offload_threshold)
+            assert long_prefill_offload_threshold == chunk_prefill_size, (
+                "long_bs1full_short_batch requires long_prefill_offload_threshold "
+                "to equal chunk_prefill_size: "
+                f"long_prefill_offload_threshold={long_prefill_offload_threshold}, "
+                f"chunk_prefill_size={chunk_prefill_size}."
+            )
         if (
             prefill_policy == "long_bs1full_short_batch"
-            and int(config.chunk_prefill_size) > estimated_max_tokens
+            and chunk_prefill_size > estimated_max_tokens
         ):
             msg = (
-                f"chunk_prefill_size={int(config.chunk_prefill_size)} > "
+                f"chunk_prefill_size={chunk_prefill_size} > "
                 f"estimated_max_tokens={estimated_max_tokens} "
                 f"(prefill_schedule_policy={prefill_policy!r})"
             )
-            if not allow_large_prefill_chunk:
-                raise AssertionError(msg)
-            logger.warning(
-                "{}; continuing because SPARSEVLLM_ALLOW_LARGE_PREFILL_CHUNK=1. "
-                "This is an explicit experiment override and may OOM.",
-                msg,
-            )
+            if allow_large_prefill_chunk:
+                logger.warning(
+                    "{}; continuing because SPARSEVLLM_ALLOW_LARGE_PREFILL_CHUNK=1. "
+                    "This is an explicit experiment override and may OOM.",
+                    msg,
+                )
+            else:
+                logger.warning(
+                    "{}; capping long_prefill_offload_threshold and "
+                    "chunk_prefill_size to {} to avoid OOM.",
+                    msg,
+                    estimated_max_tokens,
+                )
+                config.long_prefill_offload_threshold = estimated_max_tokens
+                config.chunk_prefill_size = estimated_max_tokens
 
         if estimated_max_tokens < config.max_num_batched_tokens and not allow_large_prefill_chunk:
             logger.warning(
@@ -1149,7 +1156,7 @@ class CacheManager(ABC):
         slots = [int(value) for value in slot_candidates if isinstance(value, (int, float)) and int(value) > 0]
         if slots:
             return max(slots)
-        return int(getattr(self.config, "max_num_seqs_in_batch", 1)) * int(self.max_model_len)
+        return int(getattr(self.config, "max_num_seqs_in_gpu", 1)) * int(self.max_model_len)
 
     def _dense_baseline_bytes(self) -> int:
         dtype_size = self._cache_slot_dtype_size()

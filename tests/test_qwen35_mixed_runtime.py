@@ -26,6 +26,7 @@ from sparsevllm.engine.recurrent_state_manager import (
     RecurrentTensorSpec,
 )
 from sparsevllm.engine.runtime_state import RuntimeState
+from sparsevllm.engine.scheduler import Scheduler
 from sparsevllm.engine.sequence import Sequence
 from sparsevllm.engine.sparse_controller import LayerBatchSparseState, SparseController
 from sparsevllm.models.qwen3_5 import (
@@ -35,6 +36,7 @@ from sparsevllm.models.qwen3_5 import (
     _get_rotary_dim,
 )
 from sparsevllm.platforms.cpu import CpuPlatform
+from sparsevllm.sampling_params import SamplingParams
 from sparsevllm.utils.loader import _target_weight_name_for_model, _validate_all_quantized_weights_loaded
 
 
@@ -85,6 +87,219 @@ def _make_config(tmp_path, **kwargs):
         return Config(model=str(tmp_path), **kwargs)
 
 
+class _ResidentAdmissionCache:
+    def __init__(self):
+        self.num_free_slots = 1_000_000
+        self.freed_seq_ids = []
+        self.prefix_blocks = 0
+
+    def prefill_batched_tokens_margin(self):
+        return 0
+
+    def remaining_prefill_tokens(self, seq):
+        return int(seq.num_prompt_tokens - max(seq.num_prefilled_tokens, seq.prefix_cache_hit_len))
+
+    def reserved_prefill_slots(self, waiting, chunk_prefill_size):
+        return 0
+
+    def should_schedule_full_prefill(self, seq):
+        return False
+
+    def requires_full_prefill_step(self, seq):
+        return False
+
+    def requires_long_prefill_offload(self, seq):
+        return False
+
+    def prefill_step_free_slots(self):
+        return self.num_free_slots
+
+    def prefill_step_free_slots_for(self, seq):
+        return self.num_free_slots
+
+    def prefill_step_reservation_cost(self, seq, scheduled_tokens):
+        return int(scheduled_tokens)
+
+    def decode_step_free_slots(self):
+        return self.num_free_slots
+
+    def decode_step_free_slots_for(self, seq):
+        return self.num_free_slots
+
+    def decode_step_reservation_cost(self, seq):
+        return 1
+
+    def prompt_admission_free_slots(self):
+        return self.num_free_slots
+
+    def prompt_admission_budgets(self, waiting, chunk_prefill_size):
+        return {"slots": self.num_free_slots}
+
+    def prompt_admission_costs(self, seq):
+        return {"slots": int(seq.num_prompt_tokens - seq.prefix_cache_hit_len)}
+
+    def prompt_admission_cost(self, seq):
+        return int(seq.num_prompt_tokens - seq.prefix_cache_hit_len)
+
+    def prompt_logical_reservation_cost(self, seq):
+        return int(seq.num_prompt_tokens - seq.prefix_cache_hit_len)
+
+    def prompt_admission_failure_action(self):
+        return "defer"
+
+    def on_prompt_admitted(self, seq, costs):
+        return None
+
+    def refresh_prefix_cache_hit(self, seq):
+        return None
+
+    def clear_prefix_cache_hit(self, seq):
+        seq.clear_prefix_cache_hit()
+
+    def free_seq(self, seq_id):
+        self.freed_seq_ids.append(int(seq_id))
+
+    def reset_after_warmup(self):
+        return None
+
+    def free_slot_stats(self):
+        return {"free_slots": self.num_free_slots}
+
+    def debug_live_seq_slots(self):
+        return {}
+
+
+def _resident_scheduler_config():
+    return SimpleNamespace(
+        max_num_seqs_in_batch=2,
+        max_num_batched_tokens=4,
+        max_decoding_seqs=2,
+        max_num_seqs_in_gpu=2,
+        chunk_prefill_size=2,
+        prefill_schedule_policy="all_chunked",
+        eos=-1,
+        eos_token_ids=(),
+        num_sink_tokens=1,
+        num_recent_tokens=1,
+        decode_keep_tokens=4,
+        vllm_sparse_method="",
+    )
+
+
+def test_config_resolves_default_resident_sequence_capacity(tmp_path):
+    config = _make_config(
+        tmp_path,
+        max_num_seqs_in_batch=8,
+        max_decoding_seqs=8,
+    )
+
+    assert config.max_num_seqs_in_gpu == 24
+    assert config.recurrent_state_max_bytes is None
+
+
+def test_config_accepts_explicit_resident_sequence_capacity(tmp_path):
+    config = _make_config(
+        tmp_path,
+        max_num_seqs_in_batch=8,
+        max_decoding_seqs=12,
+        max_num_seqs_in_gpu=40,
+    )
+
+    assert config.max_num_seqs_in_gpu == 40
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {
+            "max_num_seqs_in_batch": 8,
+            "max_decoding_seqs": 8,
+            "max_num_seqs_in_gpu": 7,
+        },
+        {
+            "max_num_seqs_in_batch": 8,
+            "max_decoding_seqs": 10,
+            "max_num_seqs_in_gpu": 9,
+        },
+    ],
+)
+def test_config_rejects_resident_capacity_below_step_or_decode_limit(tmp_path, kwargs):
+    with pytest.raises(ValueError, match="max_num_seqs_in_gpu must be >="):
+        _make_config(tmp_path, **kwargs)
+
+
+def test_resident_admission_waits_at_capacity_and_partial_prefill_keeps_progressing():
+    config = _resident_scheduler_config()
+    cache = _ResidentAdmissionCache()
+    runtime_state = RuntimeState(config, cache)
+    scheduler = Scheduler(config, runtime_state)
+    seqs = [Sequence([1, 2, 3, 4], SamplingParams(max_tokens=4)) for _ in range(3)]
+    for seq in seqs:
+        scheduler.add(seq)
+
+    first_batch, is_prefill, _ = scheduler.schedule()
+    assert is_prefill
+    assert {seq.seq_id for seq in first_batch} == {seqs[0].seq_id, seqs[1].seq_id}
+    assert runtime_state.free_slot_stats()["resident_sequences"] == 2
+    scheduler.postprocess(first_batch, [10, 11], is_prefill=True)
+
+    second_batch, is_prefill, _ = scheduler.schedule()
+    assert is_prefill
+    assert {seq.seq_id for seq in second_batch} == {seqs[0].seq_id, seqs[1].seq_id}
+    assert seqs[2] in scheduler.waiting
+    assert runtime_state.free_slot_stats()["resident_sequences"] == 2
+    assert runtime_state.prompt_admission_costs(seqs[0])["resident_seqs"] == 0
+    scheduler.postprocess(second_batch, [12, 13], is_prefill=True)
+
+    decode_batch, is_prefill, _ = scheduler.schedule()
+    assert not is_prefill
+    assert {seq.seq_id for seq in decode_batch} == {seqs[0].seq_id, seqs[1].seq_id}
+    assert seqs[2] in scheduler.waiting
+
+    scheduler.decoding.remove(seqs[0])
+    runtime_state.free_seq(seqs[0].seq_id)
+    admitted_batch, is_prefill, _ = scheduler.schedule()
+    assert is_prefill
+    assert [seq.seq_id for seq in admitted_batch] == [seqs[2].seq_id]
+    assert runtime_state.free_slot_stats()["resident_sequences"] == 2
+
+
+def test_resident_ownership_releases_on_abort_free_and_warmup_reset():
+    config = _resident_scheduler_config()
+    cache = _ResidentAdmissionCache()
+    runtime_state = RuntimeState(config, cache)
+    scheduler = Scheduler(config, runtime_state)
+    seq = Sequence([1, 2], SamplingParams(max_tokens=2))
+    runtime_state.on_prompt_admitted(seq, {"slots": 2, "resident_seqs": 1})
+    seq.num_prefilled_tokens = 1
+    scheduler.waiting.append(seq)
+
+    assert scheduler.abort(seq.seq_id)
+    runtime_state.free_seq(seq.seq_id)
+    assert runtime_state.free_slot_stats()["resident_sequences"] == 0
+    assert cache.freed_seq_ids == [seq.seq_id]
+
+    runtime_state.on_prompt_admitted(seq, {"slots": 2, "resident_seqs": 1})
+    runtime_state.reset_after_warmup()
+    assert runtime_state.free_slot_stats()["resident_sequences"] == 0
+
+
+def test_prefix_history_does_not_consume_resident_slots_but_hit_request_does():
+    config = _resident_scheduler_config()
+    cache = _ResidentAdmissionCache()
+    cache.prefix_blocks = 100
+    runtime_state = RuntimeState(config, cache)
+    seq = Sequence([1, 2, 3, 4], SamplingParams(max_tokens=2))
+    seq.prefix_cache_hit_len = 2
+
+    assert runtime_state.prompt_admission_budgets(deque(), 2)["resident_seqs"] == 2
+    costs = runtime_state.prompt_admission_costs(seq)
+    assert costs["slots"] == 2
+    assert costs["resident_seqs"] == 1
+    runtime_state.on_prompt_admitted(seq, costs)
+    assert runtime_state.prompt_admission_budgets(deque(), 2)["resident_seqs"] == 1
+
+
 @pytest.mark.parametrize(
     ("world_size", "conv_shape", "recurrent_shape", "snapshot_bytes"),
     [
@@ -117,7 +332,7 @@ def test_qwen36_recurrent_spec_has_exact_tp_local_bytes(
     assert spec.bytes_for_layers(48) == snapshot_bytes
 
 
-def test_qwen36_prefix_off_rejects_requested_concurrency_above_one_gib_capacity():
+def test_qwen36_recurrent_pool_rejects_explicit_cap_below_required_bytes():
     state_spec = Qwen35ForCausalLM.recurrent_state_spec(
         SimpleNamespace(
             linear_num_key_heads=16,
@@ -134,13 +349,14 @@ def test_qwen36_prefix_off_rejects_requested_concurrency_above_one_gib_capacity(
         recurrent_state_max_bytes=1 << 30,
         max_num_seqs_in_batch=16,
         max_decoding_seqs=16,
+        max_num_seqs_in_gpu=16,
     )
 
     with pytest.raises(
         RuntimeError,
         match=(
-            "requested_active_sequences=16.*supported_active_sequences=12.*"
-            "bytes_per_row=78446592.*budget_bytes=1073741824"
+            "required_bytes=1333592064.*limit_bytes=1073741824.*"
+            "rows=17.*active_rows=16.*bytes_per_row=78446592"
         ),
     ):
         RecurrentStateManager.resolve_capacity(config, state_spec, num_recurrent_layers=48)
@@ -163,12 +379,14 @@ def test_qwen36_recurrent_capacity_counts_rows_and_scratch_exactly():
         recurrent_state_max_bytes=1 << 30,
         max_num_seqs_in_batch=4,
         max_decoding_seqs=4,
+        max_num_seqs_in_gpu=12,
     )
     prefix_on = SimpleNamespace(
         enable_prefix_caching=True,
         recurrent_state_max_bytes=1 << 30,
-        max_num_seqs_in_batch=16,
-        max_decoding_seqs=16,
+        max_num_seqs_in_batch=4,
+        max_decoding_seqs=4,
+        max_num_seqs_in_gpu=12,
     )
 
     off_capacity = RecurrentStateManager.resolve_capacity(
@@ -185,9 +403,9 @@ def test_qwen36_recurrent_capacity_counts_rows_and_scratch_exactly():
     assert off_capacity.row_capacity == 12
     assert off_capacity.total_rows == 13
     assert off_capacity.pool_bytes == 1_019_805_696
-    assert on_capacity.row_capacity == 48
-    assert on_capacity.total_rows == 49
-    assert on_capacity.pool_bytes == 3_843_883_008
+    assert on_capacity.row_capacity == 12
+    assert on_capacity.total_rows == 13
+    assert on_capacity.pool_bytes == 1_019_805_696
 
 
 def _deprecation_messages(mock_log_once):
@@ -237,7 +455,7 @@ def test_recurrent_budget_rejects_conflicting_new_and_deprecated_names(tmp_path)
         )
 
 
-def test_deprecated_recurrent_budget_does_not_cap_prefix_on_capacity(tmp_path):
+def test_deprecated_recurrent_budget_caps_prefix_on_live_pool(tmp_path):
     config = _make_config(
         tmp_path,
         enable_prefix_caching=True,
@@ -245,15 +463,13 @@ def test_deprecated_recurrent_budget_does_not_cap_prefix_on_capacity(tmp_path):
     )
     state_spec = Qwen35ForCausalLM.recurrent_state_spec(config.hf_config, world_size=1)
 
-    capacity = RecurrentStateManager.resolve_capacity(
-        config,
-        state_spec,
-        num_recurrent_layers=48,
-    )
-
     assert config.recurrent_state_max_bytes == 1
-    assert capacity.row_capacity == 96
-    assert capacity.pool_bytes > config.recurrent_state_max_bytes
+    with pytest.raises(RuntimeError, match="required_bytes=.*limit_bytes=1"):
+        RecurrentStateManager.resolve_capacity(
+            config,
+            state_spec,
+            num_recurrent_layers=48,
+        )
 
 
 @pytest.mark.parametrize("manager_cls", [StandardCacheManager, QuestCacheManager])
@@ -277,6 +493,7 @@ def test_mixed_cache_manager_rows_do_not_exceed_recurrent_pool(
         max_model_len=121_000,
         max_num_seqs_in_batch=max_num_seqs_in_batch,
         max_decoding_seqs=12,
+        max_num_seqs_in_gpu=12,
         recurrent_state_row_capacity=12,
     )
     manager = object.__new__(manager_cls)
@@ -300,6 +517,7 @@ def test_dense_cache_manager_keeps_redundant_row_capacity():
         max_model_len=128,
         max_num_seqs_in_batch=8,
         max_decoding_seqs=12,
+        max_num_seqs_in_gpu=24,
     )
     manager = object.__new__(StandardCacheManager)
 
@@ -365,6 +583,7 @@ def _budget_test_manager(
         gpu_memory_utilization=0.9,
         max_num_batched_tokens=1,
         chunk_prefill_size=1,
+        long_prefill_offload_threshold=1,
         prefill_schedule_policy="long_bs1full_short_batch",
         enable_prefix_caching=prefix_on,
         prefix_cache_block_size=4,
@@ -614,9 +833,13 @@ def test_qwen35_pyramidkv_allocates_slots_only_for_kv_layers(tmp_path):
 def test_qwen35_snapkv_initializes_compact_kv_metadata(tmp_path):
     outer_config = _qwen35_outer_config(num_layers=8, full_layers=(3, 7))
     with patch("sparsevllm.config.AutoConfig.from_pretrained", return_value=outer_config):
-        cfg = Config(model=str(tmp_path), vllm_sparse_method="snapkv")
+        cfg = Config(
+            model=str(tmp_path),
+            vllm_sparse_method="snapkv",
+            max_num_seqs_in_batch=2,
+            max_decoding_seqs=2,
+        )
     cfg.max_model_len = 8
-    cfg.max_num_seqs_in_batch = 2
 
     def allocate_small_cache(manager):
         manager.config.num_kvcache_slots = 16
@@ -1400,6 +1623,8 @@ def test_recurrent_state_manager_reuses_preallocated_rows_for_decode():
         enable_prefix_caching=True,
         max_num_seqs_in_batch=2,
         max_decoding_seqs=4,
+        max_num_seqs_in_gpu=6,
+        recurrent_state_max_bytes=None,
         prefix_cache_block_size=4,
     )
     manager = RecurrentStateManager(
@@ -1469,6 +1694,8 @@ def test_recurrent_state_manager_uses_model_declared_state_schema():
         enable_prefix_caching=True,
         max_num_seqs_in_batch=1,
         max_decoding_seqs=1,
+        max_num_seqs_in_gpu=3,
+        recurrent_state_max_bytes=None,
         prefix_cache_block_size=4,
     )
     manager = RecurrentStateManager(

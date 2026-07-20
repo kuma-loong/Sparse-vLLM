@@ -6,7 +6,6 @@ from dataclasses import dataclass, field
 import torch
 
 from sparsevllm.config import Config
-from sparsevllm.constant import REDUNDANCY_BATCH_SIZE_FACTOR
 from sparsevllm.distributed import ParallelContext
 from sparsevllm.engine.sequence import Sequence
 
@@ -173,35 +172,23 @@ class RecurrentStateManager:
                 f"num_recurrent_layers must be positive, got {num_recurrent_layers}."
             )
         bytes_per_row = state_spec.bytes_for_layers(num_recurrent_layers)
-        requested_active = max(
-            int(config.max_num_seqs_in_batch),
-            int(config.max_decoding_seqs),
-        )
-        requested_rows = max(
-            int(config.max_num_seqs_in_batch) * REDUNDANCY_BATCH_SIZE_FACTOR,
-            int(config.max_decoding_seqs),
-        )
-        supported_active = requested_rows
-        row_capacity = requested_rows
-        if not bool(config.enable_prefix_caching):
-            budget_bytes = int(config.recurrent_state_max_bytes)
-            supported_active = budget_bytes // bytes_per_row - 1
-            if requested_active > supported_active:
-                raise RuntimeError(
-                    f"{state_spec.name} recurrent state exceeds the prefix-off live-state budget: "
-                    f"requested_active_sequences={requested_active} "
-                    f"supported_active_sequences={supported_active} "
-                    f"bytes_per_row={bytes_per_row} budget_bytes={budget_bytes} "
-                    "(one additional scratch row is required)."
-                )
-            row_capacity = min(requested_rows, supported_active)
+        row_capacity = int(config.max_num_seqs_in_gpu)
         total_rows = row_capacity + 1
+        pool_bytes = int(total_rows * bytes_per_row)
+        budget_bytes = getattr(config, "recurrent_state_max_bytes", None)
+        if budget_bytes is not None and pool_bytes > int(budget_bytes):
+            raise RuntimeError(
+                f"{state_spec.name} live recurrent-state pool exceeds recurrent_state_max_bytes: "
+                f"required_bytes={pool_bytes} limit_bytes={int(budget_bytes)} "
+                f"rows={total_rows} active_rows={row_capacity} "
+                f"bytes_per_row={bytes_per_row}."
+            )
         return RecurrentCapacity(
             row_capacity=int(row_capacity),
             total_rows=int(total_rows),
             bytes_per_row=int(bytes_per_row),
-            pool_bytes=int(total_rows * bytes_per_row),
-            supported_active_sequences=int(supported_active),
+            pool_bytes=pool_bytes,
+            supported_active_sequences=int(row_capacity),
         )
 
     def _allocate_row(self, seq_id: int) -> int:

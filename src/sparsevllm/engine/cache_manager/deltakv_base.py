@@ -501,7 +501,7 @@ class DeltaKVCacheManager(CacheManager):
         # If we under-estimate this, the system should backpressure at scheduling time
         # (queue) rather than crashing in _allocate_temp_deltakv_full().
         max_seqs = self._max_decode_scratch_seqs()
-        max_admission_seqs = int(config.max_num_seqs_in_batch)
+        max_admission_seqs = int(config.max_num_seqs_in_gpu)
         top_tokens = int(config.decode_keep_tokens)
         # Worst-case total reconstructed top tokens within a single attention call:
         #   num_seqs_in_batch * top_k_per_seq
@@ -1125,7 +1125,7 @@ class DeltaKVCacheManager(CacheManager):
         """
         remaining = max(0, int(center_budget))
         total = 0
-        max_seqs = int(self.config.max_num_seqs_in_batch)
+        max_seqs = int(self.config.max_num_seqs_in_gpu)
         for _ in range(max_seqs):
             if remaining <= 0:
                 break

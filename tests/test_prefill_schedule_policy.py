@@ -395,6 +395,98 @@ class PrefillPolicyRegistryTest(unittest.TestCase):
 
 
 class StandardCacheManagerAdmissionTest(unittest.TestCase):
+    def make_manager_for_prefill_estimate(
+        self,
+        *,
+        estimated_max_tokens,
+        policy,
+        chunk_prefill_size,
+        long_prefill_offload_threshold,
+    ):
+        total_memory = int(estimated_max_tokens) * 40
+        manager = object.__new__(StandardCacheManager)
+        manager.config = SimpleNamespace(
+            hf_config=SimpleNamespace(
+                hidden_size=1,
+                intermediate_size=1,
+                torch_dtype=torch.bfloat16,
+            ),
+            gpu_memory_utilization=0.5,
+            max_num_batched_tokens=chunk_prefill_size,
+            chunk_prefill_size=chunk_prefill_size,
+            long_prefill_offload_threshold=long_prefill_offload_threshold,
+            prefill_schedule_policy=policy,
+        )
+        manager.tp_size = 1
+        manager.device = torch.device("cuda:0")
+        manager.num_kv_heads = 1
+        manager.head_dim = 1
+        manager.platform = SimpleNamespace(
+            get_available_memory=lambda _device_id: (total_memory, total_memory),
+            get_allocator_stats=lambda _device: SimpleNamespace(
+                peak_allocated_bytes=0,
+                current_allocated_bytes=0,
+            ),
+        )
+        return manager
+
+    def test_long_policy_caps_chunk_and_threshold_to_estimated_tokens(self):
+        manager = self.make_manager_for_prefill_estimate(
+            estimated_max_tokens=93828,
+            policy=PREFILL_POLICY_LONG_BS1FULL_SHORT_BATCH,
+            chunk_prefill_size=98304,
+            long_prefill_offload_threshold=98304,
+        )
+
+        with patch.dict(os.environ, {"SPARSEVLLM_ALLOW_LARGE_PREFILL_CHUNK": "0"}):
+            manager._get_available_slots_info()
+
+        self.assertEqual(manager.config.chunk_prefill_size, 93828)
+        self.assertEqual(manager.config.long_prefill_offload_threshold, 93828)
+
+    def test_long_policy_keeps_chunk_and_threshold_below_estimated_tokens(self):
+        manager = self.make_manager_for_prefill_estimate(
+            estimated_max_tokens=100000,
+            policy=PREFILL_POLICY_LONG_BS1FULL_SHORT_BATCH,
+            chunk_prefill_size=98304,
+            long_prefill_offload_threshold=98304,
+        )
+
+        with patch.dict(os.environ, {"SPARSEVLLM_ALLOW_LARGE_PREFILL_CHUNK": "0"}):
+            manager._get_available_slots_info()
+
+        self.assertEqual(manager.config.chunk_prefill_size, 98304)
+        self.assertEqual(manager.config.long_prefill_offload_threshold, 98304)
+
+    def test_all_chunked_does_not_cap_chunk_or_threshold(self):
+        manager = self.make_manager_for_prefill_estimate(
+            estimated_max_tokens=93828,
+            policy=PREFILL_POLICY_ALL_CHUNKED,
+            chunk_prefill_size=98304,
+            long_prefill_offload_threshold=98304,
+        )
+
+        with patch.dict(os.environ, {"SPARSEVLLM_ALLOW_LARGE_PREFILL_CHUNK": "0"}):
+            manager._get_available_slots_info()
+
+        self.assertEqual(manager.config.max_num_batched_tokens, 93828)
+        self.assertEqual(manager.config.chunk_prefill_size, 98304)
+        self.assertEqual(manager.config.long_prefill_offload_threshold, 98304)
+
+    def test_long_policy_requires_matching_chunk_and_threshold(self):
+        manager = self.make_manager_for_prefill_estimate(
+            estimated_max_tokens=93828,
+            policy=PREFILL_POLICY_LONG_BS1FULL_SHORT_BATCH,
+            chunk_prefill_size=98304,
+            long_prefill_offload_threshold=8192,
+        )
+
+        with self.assertRaisesRegex(
+            AssertionError,
+            "long_prefill_offload_threshold to equal chunk_prefill_size",
+        ):
+            manager._get_available_slots_info()
+
     def test_prefill_token_estimate_keeps_ten_x_activation_headroom(self):
         total_memory = 80 * 1024**3
         manager = object.__new__(StandardCacheManager)
@@ -409,7 +501,7 @@ class StandardCacheManagerAdmissionTest(unittest.TestCase):
             chunk_prefill_size=4096,
             prefill_schedule_policy="all_chunked",
         )
-        manager.world_size = 1
+        manager.tp_size = 1
         manager.device = torch.device("cuda:0")
         manager.num_kv_heads = 8
         manager.head_dim = 128

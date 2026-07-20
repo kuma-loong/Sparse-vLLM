@@ -8,6 +8,7 @@ from typing import Any, Union
 import torch
 from transformers import AutoConfig
 
+from sparsevllm.constant import REDUNDANCY_BATCH_SIZE_FACTOR
 from sparsevllm.method_registry import (
     DECODE_CUDA_GRAPH_SUPPORTED_METHODS,
     PREFILL_POLICY_AUTO,
@@ -585,6 +586,7 @@ class Config:
     max_num_seqs_in_batch: int = 32  # 不能设置太大
     max_model_len: int = 128_000
     max_decoding_seqs: int = 64
+    max_num_seqs_in_gpu: int | None = None
 
     chunk_prefill_size: int | None = None
     long_prefill_offload_threshold: int = 96 * 1024
@@ -806,6 +808,37 @@ class Config:
                 f"Supported methods: '', {supported}."
             )
         self.enable_prefix_caching = _coerce_bool_config("enable_prefix_caching", self.enable_prefix_caching)
+        self.max_num_seqs_in_batch = int(self.max_num_seqs_in_batch)
+        if self.max_num_seqs_in_batch <= 0:
+            raise ValueError(
+                "max_num_seqs_in_batch must be > 0, "
+                f"got {self.max_num_seqs_in_batch}."
+            )
+        self.max_decoding_seqs = int(self.max_decoding_seqs)
+        if self.max_decoding_seqs <= 0:
+            raise ValueError(
+                f"max_decoding_seqs must be > 0, got {self.max_decoding_seqs}."
+            )
+        configured_max_num_seqs_in_gpu = _coerce_optional_positive_int(
+            "max_num_seqs_in_gpu",
+            self.max_num_seqs_in_gpu,
+        )
+        if configured_max_num_seqs_in_gpu is None:
+            configured_max_num_seqs_in_gpu = max(
+                self.max_num_seqs_in_batch * REDUNDANCY_BATCH_SIZE_FACTOR,
+                self.max_decoding_seqs,
+            )
+        if configured_max_num_seqs_in_gpu < self.max_num_seqs_in_batch:
+            raise ValueError(
+                "max_num_seqs_in_gpu must be >= max_num_seqs_in_batch: "
+                f"{configured_max_num_seqs_in_gpu} < {self.max_num_seqs_in_batch}."
+            )
+        if configured_max_num_seqs_in_gpu < self.max_decoding_seqs:
+            raise ValueError(
+                "max_num_seqs_in_gpu must be >= max_decoding_seqs: "
+                f"{configured_max_num_seqs_in_gpu} < {self.max_decoding_seqs}."
+            )
+        self.max_num_seqs_in_gpu = int(configured_max_num_seqs_in_gpu)
         self.prefix_cache_block_size = _coerce_optional_positive_int(
             "prefix_cache_block_size",
             self.prefix_cache_block_size,
@@ -825,8 +858,8 @@ class Config:
         if self.prefix_cache_max_recurrent_bytes is not None:
             log_once(
                 "prefix_cache_max_recurrent_bytes is deprecated; use "
-                "recurrent_state_max_bytes instead. The budget applies only when "
-                "prefix caching is disabled.",
+                "recurrent_state_max_bytes instead. The budget is an explicit "
+                "hard limit for the live recurrent-state pool.",
                 level="WARNING",
             )
             if (
@@ -840,9 +873,7 @@ class Config:
                     f"{self.prefix_cache_max_recurrent_bytes}."
                 )
             recurrent_state_max_bytes = self.prefix_cache_max_recurrent_bytes
-        self.recurrent_state_max_bytes = (
-            1 << 30 if recurrent_state_max_bytes is None else recurrent_state_max_bytes
-        )
+        self.recurrent_state_max_bytes = recurrent_state_max_bytes
         if self.enable_prefix_caching and self.vllm_sparse_method not in PREFIX_CACHE_SUPPORTED_METHODS:
             raise ValueError("prefix caching only supports vanilla, omnikv, quest.")
         self.prefix_cache_salt = str(self.prefix_cache_salt or "")
@@ -1014,9 +1045,6 @@ class Config:
                     "SkipKV is supported only for the official models with released steering vectors: "
                     f"{supported}. Got model basename {model_name!r} from model path {self.model!r}."
                 )
-        if int(self.max_decoding_seqs) <= 0:
-            raise ValueError(f"max_decoding_seqs must be > 0, got {self.max_decoding_seqs}.")
-        self.max_decoding_seqs = int(self.max_decoding_seqs)
         self.tensor_parallel_size = int(self.tensor_parallel_size)
         self.expert_parallel_size = int(self.expert_parallel_size)
         self.data_parallel_size = int(self.data_parallel_size)

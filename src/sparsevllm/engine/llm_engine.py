@@ -574,6 +574,7 @@ class LLMEngine:
             "max_model_len": int(getattr(config, "max_model_len", 0) or 0),
             "max_num_seqs_in_batch": int(getattr(config, "max_num_seqs_in_batch", 0) or 0),
             "max_decoding_seqs": int(getattr(config, "max_decoding_seqs", 0) or 0),
+            "max_num_seqs_in_gpu": int(getattr(config, "max_num_seqs_in_gpu", 0) or 0),
             "prefix_cache_enabled": bool(getattr(config, "enable_prefix_caching", False)),
             "prefix_cache_block_size": getattr(config, "prefix_cache_block_size", None),
             "tags": sorted(str(tag) for tag in (tags or []) if str(tag)),
@@ -591,6 +592,7 @@ class LLMEngine:
             "total_preemptions": int(getattr(scheduler, "total_preemptions", 0)),
             "max_num_seqs_in_batch": int(getattr(scheduler, "max_num_seqs_in_batch", 0)),
             "max_decoding_seqs": int(getattr(scheduler, "max_decoding_seqs", 0)),
+            "max_num_seqs_in_gpu": int(getattr(scheduler.config, "max_num_seqs_in_gpu", 0)),
             "cache": {str(key): int(value) for key, value in cache_stats.items() if isinstance(value, int)},
         }
 

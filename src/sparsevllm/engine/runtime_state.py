@@ -55,6 +55,7 @@ class RuntimeState:
         self.cache_manager = cache_manager
         self.recurrent_state_manager = recurrent_state_manager
         self.prefix_cache_coordinator = prefix_cache_coordinator
+        self._resident_seq_ids: set[int] = set()
 
     @property
     def num_free_slots(self) -> int:
@@ -134,6 +135,7 @@ class RuntimeState:
             self.prefix_cache_coordinator.release_seq(seq_id)
         if self.recurrent_state_manager is not None:
             self.recurrent_state_manager.free_seq(seq_id)
+        self._resident_seq_ids.discard(int(seq_id))
 
     @torch.inference_mode()
     def reset_after_warmup(self) -> None:
@@ -148,6 +150,7 @@ class RuntimeState:
                 reset_prefix_cache()
         if self.recurrent_state_manager is not None:
             self.recurrent_state_manager.reset_after_warmup()
+        self._resident_seq_ids.clear()
 
     def refresh_prefix_cache_hit(self, seq: Sequence) -> None:
         if self.prefix_cache_coordinator is not None:
@@ -202,13 +205,17 @@ class RuntimeState:
 
     def prompt_admission_budgets(self, waiting_seqs, chunk_prefill_size: int) -> dict[str, int]:
         budgets = dict(self.cache_manager.prompt_admission_budgets(waiting_seqs, chunk_prefill_size))
+        budgets["resident_seqs"] = max(
+            0,
+            int(self.config.max_num_seqs_in_gpu) - len(self._resident_seq_ids),
+        )
         extra = self._mixed_prefix_evictable_slots()
         if extra <= 0:
             return budgets
         if "slots" in budgets:
             budgets["slots"] = int(budgets["slots"]) + extra
-        elif len(budgets) == 1:
-            key = next(iter(budgets))
+        elif len(budgets) == 2 and "resident_seqs" in budgets:
+            key = next(key for key in budgets if key != "resident_seqs")
             budgets[key] = int(budgets[key]) + extra
         else:
             raise RuntimeError(
@@ -234,9 +241,14 @@ class RuntimeState:
 
     def on_prompt_admitted(self, seq: Sequence, costs: dict[str, int]) -> None:
         self.cache_manager.on_prompt_admitted(seq, costs)
+        if int(costs.get("resident_seqs", 0) or 0) > 0:
+            self._resident_seq_ids.add(int(seq.seq_id))
 
     def prompt_admission_costs(self, seq: Sequence) -> dict[str, int]:
         costs = dict(self.cache_manager.prompt_admission_costs(seq))
+        costs["resident_seqs"] = (
+            0 if int(seq.seq_id) in self._resident_seq_ids else 1
+        )
         if self.prefix_cache_coordinator is None:
             return costs
         extra = int(self.prefix_cache_coordinator.prefix_hit_evictable_slots(seq))
@@ -244,8 +256,8 @@ class RuntimeState:
             return costs
         if "slots" in costs:
             costs["slots"] = int(costs["slots"]) + extra
-        elif len(costs) == 1:
-            key = next(iter(costs))
+        elif len(costs) == 2 and "resident_seqs" in costs:
+            key = next(key for key in costs if key != "resident_seqs")
             costs[key] = int(costs[key]) + extra
         else:
             raise RuntimeError(
@@ -276,6 +288,12 @@ class RuntimeState:
 
     def free_slot_stats(self) -> dict[str, int]:
         stats = self.cache_manager.free_slot_stats()
+        stats["resident_sequences"] = int(len(self._resident_seq_ids))
+        stats["resident_sequence_capacity"] = int(self.config.max_num_seqs_in_gpu)
+        stats["free_resident_sequence_slots"] = max(
+            0,
+            int(self.config.max_num_seqs_in_gpu) - len(self._resident_seq_ids),
+        )
         if self.prefix_cache_coordinator is not None:
             stats.update(self.prefix_cache_coordinator.stats())
         return stats
