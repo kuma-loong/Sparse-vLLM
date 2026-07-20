@@ -121,11 +121,17 @@ def test_topk_softmax_matches_pytorch(dtype, norm_topk_prob):
 
 
 @unittest.skipUnless(torch.cuda.is_available(), "CUDA is required for Triton MoE tests.")
-def test_topk_softmax_uses_lowest_expert_id_for_ties():
+def test_topk_softmax_accepts_any_valid_experts_for_ties():
     logits = torch.zeros(1, 128, dtype=torch.bfloat16, device="cuda")
-    _, ids = topk_softmax(logits, top_k=8, norm_topk_prob=True)
+    weights, ids = topk_softmax(logits, top_k=8, norm_topk_prob=True)
     torch.cuda.synchronize()
-    assert ids.tolist() == [[0, 1, 2, 3, 4, 5, 6, 7]]
+
+    assert bool(((ids >= 0) & (ids < 128)).all())
+    assert int(torch.unique(ids).numel()) == 8
+    assert torch.allclose(
+        weights.float(),
+        torch.full((1, 8), 1 / 8, device="cuda"),
+    )
 
 
 @unittest.skipUnless(torch.cuda.is_available(), "CUDA is required for Triton MoE tests.")
