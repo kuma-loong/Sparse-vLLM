@@ -6,6 +6,7 @@ from sparsevllm.config import Config
 from sparsevllm.engine.activation_controller import ActivationController
 from sparsevllm.engine.sequence import Sequence
 from sparsevllm.engine.cache_manager import CacheManager, SparseSelection
+from sparsevllm.engine.cache_manager.base import _debug_tensor_summary, _debug_value_summary
 from sparsevllm.utils.profiler import profiler
 from sparsevllm.utils.context import get_context
 from sparsevllm.utils.log import logger, log_level
@@ -152,6 +153,33 @@ class SparseController:
         if t.dtype in (torch.int8, torch.int16, torch.int32, torch.int64, torch.long, torch.bool):
             return [int(x) for x in t.tolist()]
         return [float(x) for x in t.tolist()]
+
+    def debug_state_summary(self) -> dict[str, object]:
+        layers = {}
+        for layer_idx, state in sorted(self.layer_batch_sparse_states.items()):
+            tensors = {}
+            for name in (
+                "active_indices",
+                "active_slots",
+                "active_compressed_indices",
+                "req_indices",
+                "global_req_indices",
+                "context_lens",
+            ):
+                tensor = getattr(state, name)
+                if tensor is not None:
+                    tensors[name] = _debug_tensor_summary(tensor)
+            if tensors or state.max_context_len is not None:
+                layers[str(layer_idx)] = {
+                    "max_context_len": state.max_context_len,
+                    "tensors": tensors,
+                }
+        return {
+            "sparse_method": str(self.sparse_method or ""),
+            "layers": layers,
+            "dynamic_selection": _debug_value_summary(self.debug_dynamic_selection),
+            "cache": self.cache_manager.debug_state_summary(),
+        }
 
     def _decode_softmax_token_scores(
         self,

@@ -8,6 +8,7 @@ import numpy as np
 import torch
 
 from sparsevllm.config import Config
+from sparsevllm.distributed import ParallelContext
 from sparsevllm.engine.sequence import Sequence
 from sparsevllm.engine.prefix_cache import (
     PrefixCacheBlock,
@@ -55,8 +56,8 @@ def _complement_ranges(start: int, end: int, ranges: list[tuple[int, int]]) -> l
 
 class StandardCacheManager(PrefixCacheMixin, CacheManager):
 
-    def __init__(self, config: Config, rank: int, world_size: int):
-        super().__init__(config, rank, world_size)
+    def __init__(self, config: Config, parallel_context: ParallelContext):
+        super().__init__(config, parallel_context)
         self.allocate_kv_cache()
 
         num_slots = config.num_kvcache_slots

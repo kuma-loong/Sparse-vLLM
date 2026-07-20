@@ -1,20 +1,65 @@
 from __future__ import annotations
 
 import os
+import hashlib
 from collections import deque
-from dataclasses import dataclass
+from dataclasses import dataclass, fields, is_dataclass
 from abc import ABC, abstractmethod
 from typing import Any
 
 import torch
 
 from sparsevllm.config import Config
+from sparsevllm.distributed import ParallelContext
 from sparsevllm.engine.sequence import Sequence
 from sparsevllm.constant import REDUNDANCY_BATCH_SIZE_FACTOR
 from sparsevllm.method_registry import SUPPORTED_SPARSE_METHODS, normalize_sparse_method
 from sparsevllm.triton_kernel.store_kvcache import store_kvcache
 import sparsevllm.platforms as platforms
 from sparsevllm.utils.log import logger, log_level
+
+
+def _debug_tensor_summary(tensor: torch.Tensor) -> dict[str, Any]:
+    detached = tensor.detach().contiguous().cpu()
+    raw = detached.reshape(-1).view(torch.uint8).numpy().tobytes()
+    summary = {
+        "shape": list(detached.shape),
+        "dtype": str(detached.dtype),
+        "numel": int(detached.numel()),
+        "sha256": hashlib.sha256(raw).hexdigest(),
+    }
+    if detached.numel() > 0 and not detached.is_complex():
+        numeric = detached.to(torch.float64)
+        summary.update(
+            {
+                "min": float(numeric.min().item()),
+                "max": float(numeric.max().item()),
+                "sum": float(numeric.sum().item()),
+            }
+        )
+    return summary
+
+
+def _debug_value_summary(value: Any) -> Any:
+    if isinstance(value, torch.Tensor):
+        return _debug_tensor_summary(value)
+    if is_dataclass(value):
+        return {
+            field.name: _debug_value_summary(getattr(value, field.name))
+            for field in fields(value)
+        }
+    if isinstance(value, dict):
+        return {
+            str(key): _debug_value_summary(item)
+            for key, item in sorted(value.items(), key=lambda pair: str(pair[0]))
+        }
+    if isinstance(value, (list, tuple)):
+        return [_debug_value_summary(item) for item in value]
+    if isinstance(value, (str, int, float, bool)) or value is None:
+        return value
+    if hasattr(value, "tolist"):
+        return _debug_value_summary(value.tolist())
+    return repr(value)
 
 
 @dataclass
@@ -125,12 +170,19 @@ class PrefillComputeView:
 class CacheManager(ABC):
     """每个 Rank 只有一个 CacheManager，内部管理所有层的物理槽位和 KV Cache。"""
 
-    def __init__(self, config: Config, rank: int, world_size: int):
+    def __init__(self, config: Config, parallel_context: ParallelContext):
         self.config = config
-        self.rank = rank
-        self.world_size = world_size
+        self.parallel_context = parallel_context
+        self.rank = parallel_context.world_rank
+        self.world_size = parallel_context.world_size
+        self.tp_rank = parallel_context.tp_rank
+        self.tp_size = parallel_context.tp_size
+        self.ep_rank = parallel_context.ep_rank
+        self.ep_size = parallel_context.ep_size
+        self.dp_rank = parallel_context.dp_rank
+        self.dp_size = parallel_context.dp_size
         self.platform = platforms.current_platform
-        self.device = self.platform.get_device(rank)
+        self.device = self.platform.get_device(self.rank)
         self.hf_config = config.hf_config
         self.num_layers = self.hf_config.num_hidden_layers
         self.runtime_layout = getattr(config, "runtime_layout", None)
@@ -140,7 +192,7 @@ class CacheManager(ABC):
             self.runtime_layout = RuntimeLayout.dense(self.num_layers)
         self.num_kv_layers = int(self.runtime_layout.num_kv_layers)
 
-        self.num_kv_heads = self.hf_config.num_key_value_heads // world_size
+        self.num_kv_heads = self.hf_config.num_key_value_heads // self.tp_size
         self.head_dim = getattr(
             self.hf_config,
             "head_dim",
@@ -200,7 +252,7 @@ class CacheManager(ABC):
         return bool(torch.cuda.is_available() and torch.cuda.is_current_stream_capturing())
 
     @staticmethod
-    def create(config: Config, rank: int, world_size: int) -> "CacheManager":
+    def create(config: Config, parallel_context: ParallelContext) -> "CacheManager":
         sparse_method = normalize_sparse_method(config.vllm_sparse_method)
         model_type = getattr(getattr(config, "hf_config", None), "model_type", "") or ""
 
@@ -211,35 +263,35 @@ class CacheManager(ABC):
         if sparse_method == "deltakv":
             from .deltakv_runtime import DeltaKVCacheManager
 
-            return DeltaKVCacheManager(config, rank, world_size)
+            return DeltaKVCacheManager(config, parallel_context)
         if sparse_method in ("streamingllm", "attention-sink", "attention_sink"):
             from .streamingllm import StreamingLLMCacheManager
 
-            return StreamingLLMCacheManager(config, rank, world_size)
+            return StreamingLLMCacheManager(config, parallel_context)
         if sparse_method in ("snapkv", "pyramidkv"):
             from .snapkv import SnapKVCacheManager
 
-            return SnapKVCacheManager(config, rank, world_size)
+            return SnapKVCacheManager(config, parallel_context)
         if sparse_method == "rkv":
             from .rkv import RKVCacheManager
 
-            return RKVCacheManager(config, rank, world_size)
+            return RKVCacheManager(config, parallel_context)
         if sparse_method == "skipkv":
             from .skipkv import SkipKVCacheManager
 
-            return SkipKVCacheManager(config, rank, world_size)
+            return SkipKVCacheManager(config, parallel_context)
         if sparse_method == "quest":
             from .quest import QuestCacheManager
 
-            return QuestCacheManager(config, rank, world_size)
+            return QuestCacheManager(config, parallel_context)
         if sparse_method == "omnikv":
             from .omnikv import OmniKVCacheManager
 
-            return OmniKVCacheManager(config, rank, world_size)
+            return OmniKVCacheManager(config, parallel_context)
 
         from .standard import StandardCacheManager
 
-        return StandardCacheManager(config, rank, world_size)
+        return StandardCacheManager(config, parallel_context)
 
     def _get_available_slots_info(self) -> tuple[int, int]:
         """返回 (可用显存字节数, 每层每 token 的字节数)"""
@@ -250,8 +302,8 @@ class CacheManager(ABC):
         # 动态估计 max_num_batched_tokens
         reserved_mem = total * (1 - config.gpu_memory_utilization)
         intermediate_size = getattr(hf_config, "intermediate_size", hf_config.hidden_size * 4)
-        # MLP TP layers already assert intermediate_size is divisible by world_size.
-        intermediate_size_per_rank = intermediate_size // self.world_size
+        # Dense MLP activations are sharded only by tensor parallelism.
+        intermediate_size_per_rank = intermediate_size // self.tp_size
         dtype_size = torch.tensor([], dtype=hf_config.torch_dtype).element_size()
 
         # Keep this heuristic conservative: large prefill batches can still peak on
@@ -1002,6 +1054,83 @@ class CacheManager(ABC):
     def free_slot_stats(self) -> dict[str, int]:
         """Return a small set of free-slot stats for logging/debugging."""
         return {"free_slots": int(self.num_free_slots)}
+
+    def debug_state_summary(self) -> dict[str, Any]:
+        """Return a synchronized-test snapshot without touching the inference hot path."""
+        live_rows = {}
+        seq_id_to_row = getattr(self, "seq_id_to_row", {})
+        mappings = (
+            [(layer_idx, mapping) for layer_idx, mapping in enumerate(seq_id_to_row)]
+            if isinstance(seq_id_to_row, list)
+            else [(None, seq_id_to_row)]
+        )
+        for layer_idx, mapping in mappings:
+            if not isinstance(mapping, dict) or not mapping:
+                continue
+            row_seq_lens = getattr(self, "row_seq_lens")
+            token_slots = getattr(self, "buffer_req_to_token_slots")
+            if layer_idx is not None:
+                row_seq_lens = row_seq_lens[layer_idx]
+                token_slots = token_slots[layer_idx]
+            records = []
+            for seq_id, row_idx in sorted(mapping.items()):
+                row_len = int(row_seq_lens[row_idx])
+                record = {
+                    "seq_id": int(seq_id),
+                    "row_idx": int(row_idx),
+                    "row_len": row_len,
+                    "token_slots": _debug_tensor_summary(
+                        token_slots[row_idx, :row_len]
+                    ),
+                }
+                page_slots = getattr(self, "buffer_req_to_page_slots", None)
+                if layer_idx is None and page_slots is not None:
+                    page_size = int(getattr(self, "page_size"))
+                    num_pages = (row_len + page_size - 1) // page_size
+                    record["page_slots"] = _debug_tensor_summary(
+                        page_slots[row_idx, :num_pages]
+                    )
+                records.append(record)
+            live_rows["shared" if layer_idx is None else str(layer_idx)] = records
+
+        prefix_state: dict[str, Any] | None = None
+        prefix_cache = getattr(self, "prefix_cache", None)
+        if prefix_cache is not None:
+            blocks = []
+            for block_id, block in sorted(prefix_cache.blocks.items()):
+                blocks.append(
+                    {
+                        "stable_block_id": block_id.hex(),
+                        "parent_block_id": (
+                            None
+                            if block.parent_block_id is None
+                            else block.parent_block_id.hex()
+                        ),
+                        "logical_block_idx": int(block.logical_block_idx),
+                        "token_ids": [int(token_id) for token_id in block.token_ids],
+                        "ref_count": int(block.ref_count),
+                        "last_access": int(block.last_access),
+                        "eviction_priority": int(block.eviction_priority),
+                        "payload": _debug_value_summary(block.payload),
+                    }
+                )
+            prefix_state = {
+                "fingerprint": prefix_cache.fingerprint.hex(),
+                "stats": {
+                    str(key): int(value)
+                    for key, value in prefix_cache.stats().items()
+                },
+                "blocks": blocks,
+            }
+
+        return {
+            "cache_manager_class": type(self).__name__,
+            "free_slot_stats": {
+                str(key): int(value) for key, value in self.free_slot_stats().items()
+            },
+            "live_rows": live_rows,
+            "prefix_cache": prefix_state,
+        }
 
     def _cache_slot_dtype_size(self) -> int:
         dtype = getattr(self.hf_config, "torch_dtype", torch.float16)

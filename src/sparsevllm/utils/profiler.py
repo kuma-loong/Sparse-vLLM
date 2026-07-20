@@ -49,6 +49,20 @@ class Profiler:
         self.times.clear()
         self.counts.clear()
 
+    def snapshot(self):
+        return {
+            name: {
+                "calls": int(self.counts[name]),
+                "total_s": float(total_s),
+                "avg_ms": (
+                    float(total_s) * 1000.0 / int(self.counts[name])
+                    if self.counts[name]
+                    else 0.0
+                ),
+            }
+            for name, total_s in sorted(self.times.items())
+        }
+
     def print_stats(self):
         if not self.enabled or not self.times:
             return

@@ -8,6 +8,7 @@ import torch
 
 import sparsevllm.platforms as platforms
 from sparsevllm.config import Config, RuntimeLayout
+from sparsevllm.distributed import ParallelContext, ParallelGroup
 from sparsevllm.engine.cache_manager.base import (
     CacheManager,
     LayerBatchStates,
@@ -35,6 +36,11 @@ from sparsevllm.models.qwen3_5 import (
 )
 from sparsevllm.platforms.cpu import CpuPlatform
 from sparsevllm.utils.loader import _target_weight_name_for_model, _validate_all_quantized_weights_loaded
+
+
+def _single_process_parallel_context() -> ParallelContext:
+    group = ParallelGroup(process_group=None, ranks=(0,), rank=0, size=1)
+    return ParallelContext(world=group, tensor=group, expert=group, data=group)
 
 
 def _qwen35_outer_config(*, num_layers: int = 64, full_layers: tuple[int, ...] | None = None):
@@ -276,7 +282,7 @@ def test_mixed_cache_manager_rows_do_not_exceed_recurrent_pool(
     manager = object.__new__(manager_cls)
 
     with patch.object(platforms, "_current_platform", CpuPlatform()):
-        CacheManager.__init__(manager, config, rank=0, world_size=1)
+        CacheManager.__init__(manager, config, _single_process_parallel_context())
 
     assert manager.max_buffer_rows == 12
 
@@ -298,7 +304,7 @@ def test_dense_cache_manager_keeps_redundant_row_capacity():
     manager = object.__new__(StandardCacheManager)
 
     with patch.object(platforms, "_current_platform", CpuPlatform()):
-        CacheManager.__init__(manager, config, rank=0, world_size=1)
+        CacheManager.__init__(manager, config, _single_process_parallel_context())
 
     assert manager.max_buffer_rows == 24
 
@@ -377,6 +383,7 @@ def _budget_test_manager(
         prefix_recurrent_bytes_per_block=400 if prefix_on else 0,
     )
     manager.world_size = 1
+    manager.tp_size = 1
     manager.device = torch.device("cpu")
     manager.num_kv_heads = 1
     manager.head_dim = 10
@@ -463,12 +470,21 @@ def test_model_runner_resets_inherited_allocator_peak_before_model_construction(
     config = SimpleNamespace(
         enable_profiler=False,
         enforce_eager=True,
+        world_size=1,
         tensor_parallel_size=1,
+        expert_parallel_size=1,
+        data_parallel_size=1,
+        mlp_chunk_size=16384,
+        moe_backend="triton",
         hf_config=SimpleNamespace(model_type="qwen2", torch_dtype=torch.float32),
     )
     with (
         patch.object(platforms, "_current_platform", platform),
         patch("sparsevllm.engine.model_runner.dist.is_initialized", return_value=True),
+        patch(
+            "sparsevllm.engine.model_runner.init_parallel_context",
+            return_value=_single_process_parallel_context(),
+        ),
         patch("sparsevllm.engine.model_runner.Qwen2ForCausalLM", side_effect=stop_at_model_construction),
         pytest.raises(RuntimeError, match="stop after model construction boundary"),
     ):
@@ -610,7 +626,7 @@ def test_qwen35_snapkv_initializes_compact_kv_metadata(tmp_path):
         patch.object(platforms, "_current_platform", CpuPlatform()),
         patch.object(SnapKVCacheManager, "allocate_kv_cache", allocate_small_cache),
     ):
-        manager = SnapKVCacheManager(cfg, rank=0, world_size=1)
+        manager = SnapKVCacheManager(cfg, _single_process_parallel_context())
 
     assert manager.buffer_req_to_token_slots_tensor.shape == (2, 6, 8)
     assert manager.free_slots_stack_tensor.shape == (2, 16)
@@ -728,7 +744,10 @@ def test_qwen35_raw_config_fallback_when_transformers_autoconfig_is_unknown(tmp_
 
 
 def test_qwen35_linear_conv1d_matches_hf_biasless_checkpoint():
-    with patch("torch.distributed.get_rank", return_value=0), patch("torch.distributed.get_world_size", return_value=1):
+    with patch(
+        "sparsevllm.models.qwen3_5.get_parallel_context",
+        return_value=_single_process_parallel_context(),
+    ):
         conv = Qwen35LinearConv1D(conv_dim=16, kernel_size=4, qk_dim=4, v_dim=8)
 
     assert conv.bias is None
@@ -753,6 +772,17 @@ def test_qwen35_rmsnorm_uses_hf_offset_weight_semantics():
     expected = x * torch.rsqrt(x.pow(2).mean(dim=-1, keepdim=True) + 1.0e-6)
     expected = expected * (1.0 + norm.weight)
     assert torch.allclose(out, expected)
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+def test_qwen35_rmsnorm_does_not_modify_input(dtype):
+    norm = Qwen35RMSNorm(4, eps=1.0e-6)
+    x = torch.randn(3, 4, dtype=dtype)
+    original = x.clone()
+
+    norm(x)
+
+    assert torch.equal(x, original)
 
 
 def test_qwen35_rmsnorm_residual_path_uses_hf_offset_weight_semantics():
@@ -1374,8 +1404,7 @@ def test_recurrent_state_manager_reuses_preallocated_rows_for_decode():
     )
     manager = RecurrentStateManager(
         config,
-        rank=0,
-        world_size=1,
+        _single_process_parallel_context(),
         device=torch.device("cpu"),
         state_spec=RecurrentStateSpec(
             name="test recurrent",
@@ -1444,8 +1473,7 @@ def test_recurrent_state_manager_uses_model_declared_state_schema():
     )
     manager = RecurrentStateManager(
         config,
-        rank=0,
-        world_size=1,
+        _single_process_parallel_context(),
         device=torch.device("cpu"),
         state_spec=RecurrentStateSpec(
             name="single-state model",

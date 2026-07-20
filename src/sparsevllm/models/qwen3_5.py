@@ -3,10 +3,10 @@ from __future__ import annotations
 import os
 
 import torch
-import torch.distributed as dist
 from torch import nn
 import torch.nn.functional as F
 
+from sparsevllm.distributed import get_parallel_context
 from sparsevllm.layers.activation import SiluAndMul
 from sparsevllm.layers.attention import Attention
 from sparsevllm.layers.layernorm import RMSNorm
@@ -100,7 +100,7 @@ class Qwen35QKVGatedParallelLinear(ColumnParallelLinear):
         bias: bool = False,
         quantization=None,
     ) -> None:
-        tp_size = dist.get_world_size()
+        tp_size = get_parallel_context().tp_size
         self.head_size = int(head_size)
         self.total_num_heads = int(total_num_heads)
         self.total_num_kv_heads = int(total_num_kv_heads)
@@ -226,7 +226,7 @@ class Qwen35QKVGatedParallelLinear(ColumnParallelLinear):
 class Qwen35FullAttention(nn.Module):
     def __init__(self, config) -> None:
         super().__init__()
-        tp_size = dist.get_world_size()
+        tp_size = get_parallel_context().tp_size
         self.total_num_heads = int(config.num_attention_heads)
         self.total_num_kv_heads = int(config.num_key_value_heads)
         if self.total_num_heads % tp_size != 0 or self.total_num_kv_heads % tp_size != 0:
@@ -286,7 +286,7 @@ class Qwen35FullAttention(nn.Module):
         context = get_context()
         layer_idx = context.now_layer_idx
         cache_manager = context.cache_manager
-        pre_rope_k = k.clone()
+        pre_rope_k = k
         cache_manager.save_raw_kv_if_needed(layer_idx, pre_rope_k, v)
         q = self.q_norm(q)
         k = self.k_norm(k)
@@ -366,8 +366,9 @@ class Qwen35LinearConv1D(nn.Module):
         self.kernel_size = int(kernel_size)
         self.qk_dim = int(qk_dim)
         self.v_dim = int(v_dim)
-        self.tp_rank = dist.get_rank()
-        self.tp_size = dist.get_world_size()
+        parallel_context = get_parallel_context()
+        self.tp_rank = parallel_context.tp_rank
+        self.tp_size = parallel_context.tp_size
         self.weight = nn.Parameter(torch.empty(self.conv_dim, self.kernel_size), requires_grad=False)
         self.register_parameter("bias", None)
         self.weight.weight_loader = self.weight_loader
@@ -398,7 +399,7 @@ class Qwen35LinearConv1D(nn.Module):
 class Qwen35LinearAttention(nn.Module):
     def __init__(self, config) -> None:
         super().__init__()
-        tp_size = dist.get_world_size()
+        tp_size = get_parallel_context().tp_size
         self.total_num_k_heads = int(getattr(config, "linear_num_key_heads"))
         self.total_num_v_heads = int(getattr(config, "linear_num_value_heads"))
         self.head_k_dim = int(getattr(config, "linear_key_head_dim"))
@@ -623,8 +624,9 @@ class Qwen35LinearAttention(nn.Module):
             raise ValueError(
                 f"qwen3_5 linear vector parameter size mismatch: expected={expected}, got={loaded_weight.numel()}."
             )
-        shard_size = expected // dist.get_world_size()
-        start = dist.get_rank() * shard_size
+        parallel_context = get_parallel_context()
+        shard_size = expected // parallel_context.tp_size
+        start = parallel_context.tp_rank * shard_size
         param.data.copy_(loaded_weight.reshape(-1).narrow(0, start, shard_size).to(dtype=param.dtype))
 
     def _project_qkvzba(self, hidden_states: torch.Tensor):

@@ -6,6 +6,7 @@ from time import perf_counter
 import threading
 from tqdm.auto import tqdm
 from transformers import AutoTokenizer, GenerationConfig, Qwen2Tokenizer
+import torch
 import torch.multiprocessing as mp
 from sparsevllm.utils.log import logger
 import sys
@@ -24,7 +25,7 @@ def _deltakv_graph_warmup_profile(config: Config) -> str:
     graph_warmup = bool(getattr(config, "decode_cuda_graph", False))
     method = normalize_sparse_method(getattr(config, "vllm_sparse_method", "") or "")
     if not graph_warmup:
-        return "prefill_only"
+        return "decode_1seq"
     if method == "deltakv":
         warmup_policy = os.getenv("SPARSEVLLM_DELTAKV_GRAPH_WARMUP", "graph").strip().lower()
         if warmup_policy in ("eager", "minimal", "current", "prefill", "prefill_only"):
@@ -187,13 +188,13 @@ class LLMEngine:
         # 初始化 Profiler
         profiler.set_enabled(config.enable_profiler)
         
-        # 2. 启动多进程张量并行 (TP) 环境
+        # 2. 启动 world worker 进程；TP/EP/DP 语义由 ParallelContext 管理。
         self.ps = []
         self.events = []
         ctx = mp.get_context("spawn")
-        tp_shm_name = make_tp_shm_name() if config.tensor_parallel_size > 1 else None
-        for i in range(1, config.tensor_parallel_size):
-            event = ctx.Event()
+        tp_shm_name = make_tp_shm_name() if config.world_size > 1 else None
+        for i in range(1, config.world_size):
+            event = (ctx.Event(), ctx.Event())
             # 为每一个非零 Rank 启动一个独立的 ModelRunner 进程
             process = ctx.Process(target=ModelRunner, args=(config, i, event, tp_shm_name))
             process.start()
@@ -227,7 +228,15 @@ class LLMEngine:
         # 4. 初始化调度器
         # 关键设计：将 Rank 0 的 CacheManager 传给 Scheduler。
         # Scheduler 通过它来感知全局显存的余量，从而做出调度和抢占决策。
-        self.scheduler = Scheduler(config, self.model_runner.runtime_state)
+        self.scheduler = Scheduler(
+            config,
+            self.model_runner.runtime_state,
+            prefix_cache_hit_refresher=(
+                self._refresh_prefix_cache_hit
+                if config.enable_prefix_caching
+                else None
+            ),
+        )
         
         self._exited = False
         self._throughput_logger = _ThroughputIntervalLogger(config.throughput_log_interval_s)
@@ -345,33 +354,7 @@ class LLMEngine:
         logger.info("Warmup finished.")
 
     def _after_warmup_debug_cleanup(self):
-        model_runner = getattr(self, "model_runner", None)
-        runtime_state = getattr(model_runner, "runtime_state", None)
-        reset_after_warmup = getattr(runtime_state, "reset_after_warmup", None)
-        if callable(reset_after_warmup):
-            reset_after_warmup()
-        else:
-            cache_manager = getattr(model_runner, "cache_manager", None)
-            reset_cache = getattr(cache_manager, "reset_after_warmup", None)
-            if callable(reset_cache):
-                reset_cache()
-            else:
-                reset_prefix_cache = getattr(cache_manager, "reset_prefix_cache", None)
-                if callable(reset_prefix_cache):
-                    reset_prefix_cache()
-
-        runner = getattr(model_runner, "decode_cuda_graph_runner", None)
-        if runner is not None and os.getenv("SPARSEVLLM_DELTAKV_CLEAR_GRAPHS_AFTER_WARMUP", "0") == "1":
-            runner.clear_captured_graphs()
-            logger.info("Cleared decode CUDA graphs after warmup.")
-
-        sparse_controller = getattr(model_runner, "sparse_controller", None)
-        if (
-            sparse_controller is not None
-            and os.getenv("SPARSEVLLM_DELTAKV_CLEAR_ATTN_SCORE_BUFFERS_AFTER_WARMUP", "0") == "1"
-        ):
-            sparse_controller.clear_decode_attn_score_buffers()
-            logger.info("Cleared decode attention score buffers after warmup.")
+        self.model_runner.call("reset_after_warmup")
 
     @staticmethod
     def _cleanup_model_runner_shared_memory(model_runner):
@@ -451,9 +434,17 @@ class LLMEngine:
         if hasattr(self, "ps"):
             join_timeout_s = float(os.getenv("SPARSEVLLM_WORKER_JOIN_TIMEOUT_S", "5"))
             for p in self.ps:
-                if p.is_alive():
-                    p.terminate()
+                # The exit RPC has already asked each worker to leave its loop.
+                # Give it time to release distributed/Event resources before using
+                # terminate(), which can leave multiprocessing semaphores registered.
                 p.join(timeout=max(0.0, join_timeout_s))
+                if p.is_alive():
+                    logger.warning(
+                        "Worker process pid={} did not stop after the exit RPC; terminating.",
+                        p.pid,
+                    )
+                    p.terminate()
+                    p.join(timeout=max(0.0, join_timeout_s))
                 if p.is_alive():
                     logger.warning(
                         "Worker process pid={} did not stop after terminate; killing.",
@@ -461,6 +452,11 @@ class LLMEngine:
                     )
                     p.kill()
                     p.join(timeout=max(0.0, join_timeout_s))
+                close = getattr(p, "close", None)
+                if callable(close) and not p.is_alive():
+                    close()
+        if hasattr(self, "events"):
+            self.events.clear()
         return runner_exit_completed, runner_platform
 
     def add_request(self, prompt: str | list[int], sampling_params: SamplingParams):
@@ -484,6 +480,9 @@ class LLMEngine:
         seq = Sequence(prompt, sampling_params)
         self.scheduler.add(seq)
         return seq.seq_id
+
+    def _refresh_prefix_cache_hit(self, seq: Sequence) -> None:
+        self.model_runner.call("refresh_prefix_cache_hit", seq)
 
     def abort_request(self, seq_id: int):
         """Abort a queued or running request and release any owned KV slots."""
@@ -525,6 +524,38 @@ class LLMEngine:
             int(priority),
         )
 
+    def debug_sparse_state_summaries(self) -> list[dict[str, object]]:
+        summaries = self.model_runner.call("debug_sparse_state_summaries")
+        if not isinstance(summaries, list) or len(summaries) != self.config.world_size:
+            raise RuntimeError(
+                "Sparse-state summary did not return one record per world rank: "
+                f"expected={self.config.world_size}, got={summaries!r}."
+            )
+        return summaries
+
+    def debug_last_logits(self) -> torch.Tensor:
+        logits = self.model_runner.call("debug_last_logits_cpu")
+        if not isinstance(logits, torch.Tensor):
+            raise RuntimeError(f"Rank 0 did not return debug logits: {logits!r}.")
+        return logits
+
+    def debug_hidden_states(self) -> dict[int, torch.Tensor]:
+        snapshots = self.model_runner.call("debug_hidden_states_cpu")
+        if not isinstance(snapshots, dict) or not all(
+            isinstance(layer_idx, int) and isinstance(tensor, torch.Tensor)
+            for layer_idx, tensor in snapshots.items()
+        ):
+            raise RuntimeError(
+                f"Rank 0 did not return hidden-state snapshots: {snapshots!r}."
+            )
+        return snapshots
+
+    def debug_moe_states(self) -> dict[int, dict[str, torch.Tensor]]:
+        snapshots = self.model_runner.call("debug_moe_states_cpu")
+        if not isinstance(snapshots, dict):
+            raise RuntimeError(f"Rank 0 did not return MoE snapshots: {snapshots!r}.")
+        return snapshots
+
     def worker_info(
         self,
         served_model_name: str | None = None,
@@ -536,7 +567,10 @@ class LLMEngine:
             "model": str(config.model),
             "model_type": str(getattr(config.hf_config, "model_type", "")),
             "sparse_method": str(getattr(config, "vllm_sparse_method", "") or ""),
+            "world_size": int(getattr(config, "world_size", 1)),
             "tensor_parallel_size": int(getattr(config, "tensor_parallel_size", 1)),
+            "expert_parallel_size": int(getattr(config, "expert_parallel_size", 1)),
+            "data_parallel_size": int(getattr(config, "data_parallel_size", 1)),
             "max_model_len": int(getattr(config, "max_model_len", 0) or 0),
             "max_num_seqs_in_batch": int(getattr(config, "max_num_seqs_in_batch", 0) or 0),
             "max_decoding_seqs": int(getattr(config, "max_decoding_seqs", 0) or 0),

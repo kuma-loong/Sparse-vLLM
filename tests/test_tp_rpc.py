@@ -13,6 +13,8 @@ import torch.distributed as dist
 from sparsevllm.engine.model_runner import (
     ModelRunner,
     PREFIX_CACHE_CONTROL_RPC_METHODS,
+    TP_RUN_STATUS_FAILED,
+    TP_RUN_STATUS_SUCCESS,
     TP_RPC_STATUS_SYNC_METHODS,
     TP_SHM_NAME_PREFIX,
     make_tp_shm_name,
@@ -21,13 +23,21 @@ from sparsevllm.engine.model_runner import (
 
 def test_write_shm_waits_until_worker_reads_command():
     ctx = get_context("spawn")
-    event = ctx.Event()
+    command_event = ctx.Event()
+    completion_event = ctx.Event()
+    event = (command_event, completion_event)
     shm = SharedMemory(
         name=f"sparsevllm_test_rpc_{os.getpid()}_{uuid4().hex}",
         create=True,
         size=2**20,
     )
-    rank0 = SimpleNamespace(world_size=2, rank=0, event=[event], shm=shm)
+    rank0 = SimpleNamespace(
+        world_size=2,
+        rank=0,
+        event=[event],
+        shm=shm,
+        _run_status_offset=lambda rank: len(shm.buf) - 2 + rank,
+    )
     worker = SimpleNamespace(world_size=2, rank=1, event=event, shm=shm)
     errors: list[BaseException] = []
 
@@ -41,7 +51,7 @@ def test_write_shm_waits_until_worker_reads_command():
     writer.start()
 
     try:
-        assert event.wait(timeout=1.0)
+        assert command_event.wait(timeout=1.0)
         time.sleep(0.02)
         assert writer.is_alive()
 
@@ -53,8 +63,8 @@ def test_write_shm_waits_until_worker_reads_command():
         assert method_name == "free_slots"
         assert args == [123]
     finally:
-        if event.is_set():
-            event.clear()
+        if command_event.is_set():
+            command_event.clear()
         writer.join(timeout=1.0)
         shm.close()
         shm.unlink()
@@ -87,6 +97,9 @@ def test_prefix_cache_control_rpc_reports_any_tp_worker_failure():
     runner = object.__new__(ModelRunner)
     runner.world_size = 2
     runner.device = torch.device("cpu")
+    runner.parallel_context = SimpleNamespace(
+        world_all_reduce=lambda tensor, op: dist.all_reduce(tensor, op=op)
+    )
 
     def mark_failed(tensor, op=None):
         assert op == dist.ReduceOp.MAX
@@ -96,7 +109,7 @@ def test_prefix_cache_control_rpc_reports_any_tp_worker_failure():
         try:
             ModelRunner._sync_prefix_cache_control_rpc_status(runner, "prefix_cache_delete_subtree", None)
         except RuntimeError as exc:
-            assert "At least one TP worker failed" in str(exc)
+            assert "At least one world worker failed" in str(exc)
         else:
             raise AssertionError("expected worker failure to be surfaced on rank 0")
 
@@ -107,21 +120,270 @@ def test_prefix_cache_match_uses_tp_failure_synchronized_control_path():
 
 
 def test_run_rpc_reports_any_tp_worker_failure():
-    runner = object.__new__(ModelRunner)
-    runner.world_size = 2
-    runner.device = torch.device("cpu")
+    ctx = get_context("spawn")
+    events = (ctx.Event(), ctx.Event())
+    shm = SharedMemory(
+        name=f"sparsevllm_test_status_{os.getpid()}_{uuid4().hex}",
+        create=True,
+        size=2**20,
+    )
+    rank0 = object.__new__(ModelRunner)
+    rank0.world_size = 2
+    rank0.rank = 0
+    rank0.event = [events]
+    rank0.shm = shm
+    rank0.device = torch.device("cpu")
+    rank0.platform = SimpleNamespace(synchronize=lambda: None)
+    worker = object.__new__(ModelRunner)
+    worker.world_size = 2
+    worker.rank = 1
+    worker.event = events
+    worker.shm = shm
+    worker.device = torch.device("cpu")
+    worker.platform = SimpleNamespace(synchronize=lambda: None)
 
-    def mark_failed(tensor, op=None):
-        assert op == dist.ReduceOp.MAX
-        tensor.fill_(1)
-
-    with patch.object(dist, "is_initialized", return_value=True), patch.object(dist, "all_reduce", side_effect=mark_failed):
+    try:
+        ModelRunner._sync_tp_run_status(worker, RuntimeError("worker failed"))
+        assert shm.buf[ModelRunner._run_status_offset(worker, 1)] == TP_RUN_STATUS_FAILED
         try:
-            ModelRunner._sync_tp_rpc_status(runner, "run", None)
+            ModelRunner._sync_tp_run_status(rank0, None)
         except RuntimeError as exc:
-            assert "At least one TP worker failed during run" in str(exc)
+            assert "TP worker rank(s) 1 failed during run" in str(exc)
         else:
             raise AssertionError("expected worker failure to be surfaced on rank 0")
+    finally:
+        shm.close()
+        shm.unlink()
+
+
+def test_run_rpc_uses_host_completion_without_collective():
+    ctx = get_context("spawn")
+    events = (ctx.Event(), ctx.Event())
+    shm = SharedMemory(
+        name=f"sparsevllm_test_status_{os.getpid()}_{uuid4().hex}",
+        create=True,
+        size=2**20,
+    )
+    sync_calls: list[int] = []
+    rank0 = object.__new__(ModelRunner)
+    rank0.world_size = 2
+    rank0.rank = 0
+    rank0.event = [events]
+    rank0.shm = shm
+    rank0.device = torch.device("cpu")
+    rank0.platform = SimpleNamespace(synchronize=lambda: sync_calls.append(0))
+    worker = object.__new__(ModelRunner)
+    worker.world_size = 2
+    worker.rank = 1
+    worker.event = events
+    worker.shm = shm
+    worker.device = torch.device("cpu")
+    worker.platform = SimpleNamespace(synchronize=lambda: sync_calls.append(1))
+
+    try:
+        ModelRunner._sync_tp_run_status(worker, None)
+        assert shm.buf[ModelRunner._run_status_offset(worker, 1)] == TP_RUN_STATUS_SUCCESS
+        ModelRunner._sync_tp_run_status(rank0, None)
+        assert sync_calls == [1, 0]
+    finally:
+        shm.close()
+        shm.unlink()
+
+
+def test_run_rpc_uses_host_status_with_decode_graph():
+    runner = object.__new__(ModelRunner)
+    runner.world_size = 1
+    runner.rank = 0
+    runner.config = SimpleNamespace(decode_cuda_graph=True)
+    runner.run = lambda seqs, is_prefill: (seqs, is_prefill)
+    calls = []
+    runner._sync_tp_run_status = lambda error: calls.append(("host", error))
+    runner._sync_tp_rpc_status = lambda method, error: calls.append(
+        ("collective", method, error)
+    )
+
+    result = ModelRunner.call(runner, "run", [1], False)
+
+    assert result == ([1], False)
+    assert calls == [("host", None)]
+
+
+def test_run_rpc_keeps_collective_status_without_decode_graph():
+    runner = object.__new__(ModelRunner)
+    runner.world_size = 1
+    runner.rank = 0
+    runner.config = SimpleNamespace(decode_cuda_graph=False)
+    runner.run = lambda seqs, is_prefill: (seqs, is_prefill)
+    calls = []
+    runner._sync_tp_run_status = lambda error: calls.append(("host", error))
+    runner._sync_tp_rpc_status = lambda method, error: calls.append(
+        ("collective", method, error)
+    )
+
+    result = ModelRunner.call(runner, "run", [1], False)
+
+    assert result == ([1], False)
+    assert calls == [("collective", "run", None)]
+
+
+def test_warmup_reset_uses_failure_synchronized_world_rpc():
+    assert "reset_after_warmup" in TP_RPC_STATUS_SYNC_METHODS
+
+
+def test_prefix_cache_lookup_uses_failure_synchronized_world_rpc():
+    assert "refresh_prefix_cache_hit" in TP_RPC_STATUS_SYNC_METHODS
+
+
+def test_prefix_cache_lookup_rpc_checks_rank_results():
+    runner = object.__new__(ModelRunner)
+    runner.world_size = 1
+    runner.rank = 0
+    calls = []
+    result = {"enabled": False, "hit_len": 0}
+    runner.refresh_prefix_cache_hit = lambda seq: calls.append(("lookup", seq)) or result
+    runner._sync_tp_rpc_status = lambda method, error: calls.append(("status", method, error))
+    runner._sync_prefix_cache_lookup_result = lambda value: calls.append(("result", value))
+
+    seq = object()
+    actual = ModelRunner.call(runner, "refresh_prefix_cache_hit", seq)
+
+    assert actual is result
+    assert calls == [
+        ("lookup", seq),
+        ("status", "refresh_prefix_cache_hit", None),
+        ("result", result),
+    ]
+
+
+def test_prefix_cache_lookup_rejects_rank_divergence():
+    runner = object.__new__(ModelRunner)
+    runner.world_size = 2
+    runner.parallel_context = SimpleNamespace(
+        world=SimpleNamespace(process_group=object())
+    )
+
+    def gather(results, local_result, group=None):
+        assert group is runner.parallel_context.world.process_group
+        results[:] = [local_result, {**local_result, "hit_len": 0}]
+
+    with patch.object(dist, "all_gather_object", side_effect=gather):
+        try:
+            ModelRunner._sync_prefix_cache_lookup_result(
+                runner,
+                {"enabled": True, "hit_len": 8},
+            )
+        except RuntimeError as exc:
+            assert "lookup diverged across world ranks" in str(exc)
+        else:
+            raise AssertionError("expected divergent prefix-cache lookup to fail")
+
+
+def test_model_runner_prefix_cache_lookup_returns_sequence_metadata():
+    runner = object.__new__(ModelRunner)
+
+    def refresh(seq):
+        seq.prefix_cache_enabled = True
+        seq.prefix_cache_hit_len = 8
+        seq.prefix_cache_hit_block_count = 2
+        seq.prefix_cache_hit_last_block_id = b"block"
+        seq.prefix_cache_block_size = 4
+        seq.prefix_cache_method = "quest"
+
+    runner.runtime_state = SimpleNamespace(refresh_prefix_cache_hit=refresh)
+    seq = SimpleNamespace(
+        prefix_cache_enabled=False,
+        prefix_cache_hit_len=0,
+        prefix_cache_hit_block_count=0,
+        prefix_cache_hit_last_block_id=None,
+        prefix_cache_block_size=0,
+        prefix_cache_method="",
+    )
+
+    result = ModelRunner.refresh_prefix_cache_hit(runner, seq)
+
+    assert result == {
+        "enabled": True,
+        "hit_len": 8,
+        "hit_block_count": 2,
+        "hit_last_block_id": b"block",
+        "block_size": 4,
+        "method": "quest",
+    }
+
+
+def test_hidden_state_debug_uses_failure_synchronized_world_rpc():
+    assert "debug_hidden_states_cpu" in TP_RPC_STATUS_SYNC_METHODS
+    assert "debug_moe_states_cpu" in TP_RPC_STATUS_SYNC_METHODS
+
+
+def test_model_runner_reset_after_warmup_resets_local_runtime_state():
+    calls = []
+    runner = object.__new__(ModelRunner)
+    runner.runtime_state = SimpleNamespace(
+        reset_after_warmup=lambda: calls.append("runtime")
+    )
+    runner.decode_cuda_graph_runner = SimpleNamespace(
+        clear_captured_graphs=lambda: calls.append("graphs")
+    )
+    runner.sparse_controller = SimpleNamespace(
+        clear_decode_attn_score_buffers=lambda: calls.append("scores")
+    )
+
+    with patch.dict(
+        os.environ,
+        {
+            "SPARSEVLLM_DELTAKV_CLEAR_GRAPHS_AFTER_WARMUP": "0",
+            "SPARSEVLLM_DELTAKV_CLEAR_ATTN_SCORE_BUFFERS_AFTER_WARMUP": "0",
+        },
+    ):
+        ModelRunner.reset_after_warmup(runner)
+
+    assert calls == ["runtime"]
+
+
+def test_model_runner_exit_drains_graphs_before_barrier():
+    calls = []
+    runner = object.__new__(ModelRunner)
+    runner.platform = SimpleNamespace(
+        synchronize=lambda: calls.append("sync"),
+        barrier_device_ids=lambda rank: [rank],
+    )
+    runner.config = SimpleNamespace(decode_cuda_graph=True)
+    runner.decode_cuda_graph_runner = SimpleNamespace(
+        clear_captured_graphs=lambda: calls.append("clear_graphs")
+    )
+    runner.world_size = 2
+    runner.rank = 0
+    runner.shm = SimpleNamespace(
+        close=lambda: calls.append("close_shm"),
+        unlink=lambda: calls.append("unlink_shm"),
+    )
+    runner.parallel_context = SimpleNamespace(
+        world_barrier=lambda **_: calls.append("barrier")
+    )
+
+    with (
+        patch(
+            "sparsevllm.engine.model_runner.reset_parallel_context",
+            side_effect=lambda: calls.append("reset"),
+        ),
+        patch(
+            "sparsevllm.engine.model_runner.dist.destroy_process_group",
+            side_effect=lambda: calls.append("destroy"),
+        ),
+    ):
+        ModelRunner.exit(runner)
+
+    assert calls == [
+        "sync",
+        "clear_graphs",
+        "sync",
+        "close_shm",
+        "barrier",
+        "unlink_shm",
+        "reset",
+        "destroy",
+    ]
 
 
 def test_tp_worker_decode_skips_rank0_sampling_path():

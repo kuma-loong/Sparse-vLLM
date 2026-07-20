@@ -7,6 +7,7 @@ import torch
 
 from sparsevllm.config import Config
 from sparsevllm.constant import REDUNDANCY_BATCH_SIZE_FACTOR
+from sparsevllm.distributed import ParallelContext
 from sparsevllm.engine.sequence import Sequence
 
 
@@ -91,16 +92,20 @@ class RecurrentStateManager:
     def __init__(
         self,
         config: Config,
-        rank: int,
-        world_size: int,
+        parallel_context: ParallelContext,
         *,
         device: torch.device,
         platform=None,
         state_spec: RecurrentStateSpec,
     ):
         self.config = config
-        self.rank = int(rank)
-        self.world_size = int(world_size)
+        self.parallel_context = parallel_context
+        self.rank = parallel_context.world_rank
+        self.world_size = parallel_context.world_size
+        self.tp_rank = parallel_context.tp_rank
+        self.tp_size = parallel_context.tp_size
+        self.ep_rank = parallel_context.ep_rank
+        self.ep_size = parallel_context.ep_size
         self.device = torch.device(device)
         self.runtime_layout = config.runtime_layout
         self.state_spec = state_spec

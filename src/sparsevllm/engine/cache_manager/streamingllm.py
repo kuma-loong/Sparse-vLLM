@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from sparsevllm.config import Config
+from sparsevllm.distributed import ParallelContext
 from sparsevllm.engine.sequence import Sequence
 
 from .snapkv import SnapKVCacheManager
@@ -14,8 +15,8 @@ class StreamingLLMCacheManager(SnapKVCacheManager):
     score-based top-k eviction.
     """
 
-    def __init__(self, config: Config, rank: int, world_size: int):
-        super().__init__(config, rank, world_size)
+    def __init__(self, config: Config, parallel_context: ParallelContext):
+        super().__init__(config, parallel_context)
         # StreamingLLM applies the same prefix/recent window on every layer, so
         # decode metadata stays layer-uniform even after compaction.
         self._uniform_decode_metadata = True

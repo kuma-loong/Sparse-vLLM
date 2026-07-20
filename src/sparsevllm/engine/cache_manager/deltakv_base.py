@@ -8,6 +8,7 @@ import numpy as np
 import torch
 
 from sparsevllm.config import Config
+from sparsevllm.distributed import ParallelContext
 from sparsevllm.engine.sequence import Sequence
 from sparsevllm.method_registry import (
     PREFILL_POLICY_LONG_BS1FULL_SHORT_BATCH,
@@ -68,9 +69,9 @@ class DeltaKVCacheManager(CacheManager):
                 return tuple(sorted(rope_scaling.items()))
         raise NotImplementedError(f"Unsupported DeltaKV cache RoPE scaling: {rope_scaling!r}.")
 
-    def __init__(self, config: Config, rank: int, world_size: int):
-        super().__init__(config, rank, world_size)
-        assert world_size == 1, "DeltaKVCacheManager currently only supports world_size=1 (No TP support for compressors)"
+    def __init__(self, config: Config, parallel_context: ParallelContext):
+        super().__init__(config, parallel_context)
+        assert self.tp_size == 1, "DeltaKVCacheManager currently does not support TP compressors"
 
         self.full_attn_layers = config.full_attn_layers
         if not isinstance(self.full_attn_layers, list) or not all(

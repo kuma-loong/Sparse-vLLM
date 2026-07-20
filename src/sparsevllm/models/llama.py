@@ -3,8 +3,8 @@ from typing import Any
 
 import torch
 from torch import nn
-import torch.distributed as dist
 
+from sparsevllm.distributed import get_parallel_context
 from sparsevllm.layers.activation import SiluAndMul
 from sparsevllm.layers.attention import Attention
 from sparsevllm.layers.layernorm import RMSNorm
@@ -65,7 +65,7 @@ class LlamaAttention(nn.Module):
         proj_chunk_size: int = 16384,
     ) -> None:
         super().__init__()
-        tp_size = dist.get_world_size()
+        tp_size = get_parallel_context().tp_size
         self.total_num_heads = num_heads
         assert self.total_num_heads % tp_size == 0
         self.num_heads = self.total_num_heads // tp_size

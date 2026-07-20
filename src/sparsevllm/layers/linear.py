@@ -1,8 +1,8 @@
 import torch
 from torch import nn
 import torch.nn.functional as F
-import torch.distributed as dist
 
+from sparsevllm.distributed import get_parallel_context
 from sparsevllm.quantization import QuantizationRegistry
 
 
@@ -23,8 +23,9 @@ class LinearBase(nn.Module):
     ):
         super().__init__()
         self.tp_dim = tp_dim
-        self.tp_rank = dist.get_rank()
-        self.tp_size = dist.get_world_size()
+        self.parallel_context = get_parallel_context()
+        self.tp_rank = self.parallel_context.tp_rank
+        self.tp_size = self.parallel_context.tp_size
         self.quantization_config = quantization
         self.quantized = bool(getattr(quantization, "enabled", False))
         self._quantized_weight_loaded = not self.quantized
@@ -176,7 +177,7 @@ class ColumnParallelLinear(LinearBase):
         bias: bool = False,
         quantization=None,
     ):
-        tp_size = dist.get_world_size()
+        tp_size = get_parallel_context().tp_size
         super().__init__(input_size, divide(output_size, tp_size), bias, 0, quantization=quantization)
 
     def weight_loader(self, param: nn.Parameter, loaded_weight: torch.Tensor):
@@ -282,7 +283,7 @@ class QKVParallelLinear(ColumnParallelLinear):
         bias: bool = False,
         quantization=None,
     ):
-        tp_size = dist.get_world_size()
+        tp_size = get_parallel_context().tp_size
         total_num_kv_heads = total_num_kv_heads or total_num_heads
         self.head_size = head_size
         self.num_heads = divide(total_num_heads, tp_size)
@@ -354,7 +355,7 @@ class RowParallelLinear(LinearBase):
         bias: bool = False,
         quantization=None,
     ):
-        tp_size = dist.get_world_size()
+        tp_size = get_parallel_context().tp_size
         super().__init__(divide(input_size, tp_size), output_size, bias, 1, quantization=quantization)
 
     def weight_loader(self, param: nn.Parameter, loaded_weight: torch.Tensor):
@@ -393,6 +394,4 @@ class RowParallelLinear(LinearBase):
             y = self.quant_backend(x, self.weight, self.weight_scale_inv, bias)
         else:
             y = F.linear(x, self.weight, bias)
-        if self.tp_size > 1:
-            dist.all_reduce(y)
-        return y
+        return self.parallel_context.tp_all_reduce(y)

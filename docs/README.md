@@ -12,7 +12,8 @@ repo-facing result claim needs evidence.
 
 - [Getting Started](getting_started/README.md): installation, checkpoint
   download, and a minimal Sparse-vLLM usage example.
-- [Features](features/README.md): sparse method taxonomy and DeltaKV notes.
+- [Features](features/README.md): sparse method taxonomy, DeltaKV notes, and
+  Qwen3MoE expert parallelism.
 - [Design](design/README.md): repository layout, runtime flow, and method
   ownership boundaries.
 - [Configuration](configuration/README.md): canonical runtime parameters and

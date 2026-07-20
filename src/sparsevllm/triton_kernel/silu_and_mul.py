@@ -4,7 +4,7 @@ import triton
 import triton.language as tl
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["size_m"])
 def _silu_and_mul_kernel(
     input_ptr,
     stride_input_m,

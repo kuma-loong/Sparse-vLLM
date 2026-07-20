@@ -6,6 +6,7 @@ import numpy as np
 import torch
 
 from sparsevllm.config import Config
+from sparsevllm.distributed import ParallelContext
 from sparsevllm.engine.sequence import Sequence
 from sparsevllm.method_registry import PREFILL_POLICY_LONG_BS1FULL_SHORT_BATCH
 from sparsevllm.platforms import device_runtime
@@ -19,8 +20,8 @@ from .raw_kv_offload import RawKVOffloadBuffer
 
 
 class SnapKVCacheManager(CacheManager):
-    def __init__(self, config: Config, rank: int, world_size: int):
-        super().__init__(config, rank, world_size)
+    def __init__(self, config: Config, parallel_context: ParallelContext):
+        super().__init__(config, parallel_context)
         self.pyramidkv_prefill_staging_num_slots = 0
         self.pyramidkv_prefill_staging_kv_cache = None
         self._pyramidkv_prefill_staging_active = False

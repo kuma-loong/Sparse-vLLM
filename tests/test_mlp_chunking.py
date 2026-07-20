@@ -5,13 +5,19 @@ import torch
 
 from sparsevllm.models.qwen2 import Qwen2MLP
 from sparsevllm.models.qwen3 import Qwen3MLP
+from sparsevllm.distributed import ParallelContext, ParallelGroup
+
+
+def _single_process_parallel_context() -> ParallelContext:
+    group = ParallelGroup(process_group=None, ranks=(0,), rank=0, size=1)
+    return ParallelContext(world=group, tensor=group, expert=group, data=group)
 
 
 class MLPChunkingTest(unittest.TestCase):
     def _assert_chunked_matches_full(self, cls):
-        with patch("torch.distributed.get_rank", return_value=0), patch(
-            "torch.distributed.get_world_size",
-            return_value=1,
+        with patch(
+            "sparsevllm.layers.linear.get_parallel_context",
+            return_value=_single_process_parallel_context(),
         ):
             torch.manual_seed(0)
             full = cls(8, 16, "silu", mlp_chunk_size=1024)

@@ -456,20 +456,26 @@ def load_deltakv_compressors_to_cache_manager(cache_manager, path: str):
     print(f"Successfully loaded {loaded_count} DeltaKV compressor weights into cache manager from {path}")
 
 
-def load_model(model: nn.Module, path: str, *, rank: int | None = None, world_size: int | None = None):
+def load_model(
+    model: nn.Module,
+    path: str,
+    *,
+    tp_rank: int | None = None,
+    tp_size: int | None = None,
+):
     packed_modules_mapping = getattr(model, "packed_modules_mapping", {})
     files = sorted(glob(os.path.join(path, "*.safetensors")))
     assert len(files) > 0, f"No safetensors found in {path}"
 
     # Some tensor-parallel converters emit one file per rank:
-    #   model{rank}-mp{world_size}.safetensors
+    #   model{tp_rank}-mp{tp_size}.safetensors
     # In that case load only the local rank shard.
-    if rank is not None and world_size is not None:
-        shard = os.path.join(path, f"model{rank}-mp{world_size}.safetensors")
+    if tp_rank is not None and tp_size is not None:
+        shard = os.path.join(path, f"model{tp_rank}-mp{tp_size}.safetensors")
         if os.path.isfile(shard):
             files = [shard]
         else:
-            mp_files = sorted(glob(os.path.join(path, f"model*-mp{world_size}.safetensors")))
+            mp_files = sorted(glob(os.path.join(path, f"model*-mp{tp_size}.safetensors")))
             if mp_files:
                 raise FileNotFoundError(
                     "Detected per-rank weight shards but missing expected shard for this rank. "
@@ -477,6 +483,7 @@ def load_model(model: nn.Module, path: str, *, rank: int | None = None, world_si
                 )
     
     loaded_count = 0
+    loaded_parameter_names: set[str] = set()
     for file in files:
         with safe_open(file, "pt", "cpu") as f:
             keys = list(f.keys())
@@ -538,6 +545,7 @@ def load_model(model: nn.Module, path: str, *, rank: int | None = None, world_si
                             param = model.get_parameter(packed_param_name)
                             weight_loader = getattr(param, "weight_loader")
                             weight_loader(param, f.get_tensor(source_weight_name), shard_id)
+                        loaded_parameter_names.add(packed_param_name)
                         loaded_count += 1
                         break
                 else:
@@ -561,6 +569,7 @@ def load_model(model: nn.Module, path: str, *, rank: int | None = None, world_si
                     param = model.get_parameter(param_name)
                     weight_loader = getattr(param, "weight_loader", default_weight_loader)
                     weight_loader(param, f.get_tensor(source_weight_name))
+                    loaded_parameter_names.add(param_name)
                     loaded_count += 1
             unused_scale_keys = sorted(scale_keys - consumed_scale_keys)
             if unused_scale_keys:
@@ -571,4 +580,7 @@ def load_model(model: nn.Module, path: str, *, rank: int | None = None, world_si
     
     assert loaded_count > 0, f"No weights were loaded from {path}"
     _validate_all_quantized_weights_loaded(model)
+    strict_validator = getattr(model, "validate_loaded_weights", None)
+    if callable(strict_validator):
+        strict_validator(loaded_parameter_names)
     print(f"Successfully loaded {loaded_count} weights from {path}")

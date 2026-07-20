@@ -28,6 +28,8 @@ def _cfg(method="", salt="", block_size=4):
         model="/models/qwen",
         hf_config=SimpleNamespace(model_type="qwen2", torch_dtype=torch.float16),
         tensor_parallel_size=1,
+        expert_parallel_size=1,
+        data_parallel_size=1,
         vllm_sparse_method=method,
         prefix_cache_salt=salt,
         prefix_cache_block_size=block_size,
@@ -180,6 +182,55 @@ def test_prefix_cache_fingerprint_isolates_salt_and_method():
     assert vanilla != salted
     assert vanilla != omnikv
     assert omnikv != quest
+
+
+def test_prefix_cache_fingerprint_ignores_world_and_ep_rank():
+    rank0 = _cfg()
+    rank0.world_rank = 0
+    rank0.ep_rank = 0
+    rank1 = _cfg()
+    rank1.world_rank = 1
+    rank1.ep_rank = 1
+
+    fingerprint0 = build_prefix_cache_fingerprint(rank0, 4)
+    fingerprint1 = build_prefix_cache_fingerprint(rank1, 4)
+    assert fingerprint0 == fingerprint1
+
+    index0 = RadixPrefixIndex(block_size=4, fingerprint=fingerprint0)
+    index1 = RadixPrefixIndex(block_size=4, fingerprint=fingerprint1)
+    assert index0.stable_block_id([1, 2, 3, 4], None) == index1.stable_block_id(
+        [1, 2, 3, 4],
+        None,
+    )
+
+
+def test_prefix_cache_debug_summary_includes_refs_slots_and_stable_ids():
+    manager = _make_standard_manager_for_prefix(block_size=2)
+    block_id = manager.prefix_cache.stable_block_id([1, 2], None)
+    payload = StandardPrefixBlockPayload(
+        token_slots=torch.tensor([10, 11], dtype=torch.int32)
+    )
+    manager.prefix_cache.insert_block(
+        PrefixCacheBlock(
+            stable_block_id=block_id,
+            parent_block_id=None,
+            block_size=2,
+            logical_block_idx=0,
+            payload=payload,
+            token_ids=(1, 2),
+            ref_count=2,
+            eviction_priority=7,
+        )
+    )
+
+    summary = manager.debug_state_summary()
+
+    assert summary["prefix_cache"]["fingerprint"] == manager.prefix_cache.fingerprint.hex()
+    block = summary["prefix_cache"]["blocks"][0]
+    assert block["stable_block_id"] == block_id.hex()
+    assert block["ref_count"] == 2
+    assert block["eviction_priority"] == 7
+    assert block["payload"]["token_slots"]["shape"] == [2]
 
 
 def test_standard_prompt_admission_accounts_for_free_rows():

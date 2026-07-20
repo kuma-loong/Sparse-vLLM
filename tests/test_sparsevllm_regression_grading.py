@@ -33,6 +33,12 @@ from benchmark.sparsevllm_regression.manifest import (
 from benchmark.sparsevllm_regression.run_suite import _perf_command, _scbench_command, _stress_command, _stress_v2_command
 from benchmark.sparsevllm_regression.run_suite import _quality_command
 from sparsevllm.engine.cache_manager.base import CacheManager
+from sparsevllm.distributed import ParallelContext, ParallelGroup
+
+
+def _single_process_parallel_context() -> ParallelContext:
+    group = ParallelGroup(process_group=None, ranks=(0,), rank=0, size=1)
+    return ParallelContext(world=group, tensor=group, expert=group, data=group)
 
 
 class FakeTokenizer:
@@ -60,7 +66,7 @@ class FakeCacheManager(CacheManager):
             max_num_seqs_in_batch=2,
             num_kvcache_slots=16,
         )
-        super().__init__(config, rank=0, world_size=1)
+        super().__init__(config, _single_process_parallel_context())
         self.kv_cache = torch.empty((2, 2, 16, 1, 4), dtype=torch.float16)
         self.buffer_req_to_token_slots = torch.empty((2, 10), dtype=torch.int32)
         self.latent_scales = torch.empty((2, 16, 1), dtype=torch.float16)
