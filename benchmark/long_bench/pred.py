@@ -89,8 +89,12 @@ def seed_everything(seed):
     torch.cuda.manual_seed_all(seed)
 
 
+def should_use_chat_template(dataset, no_chat_template=False, thinking_mode="off"):
+    return not no_chat_template and dataset not in NO_CHAT_TEMPLATE_DATASETS
+
+
 def build_chat(tokenizer, prompt, dataset, no_chat_template=False, thinking_mode="off"):
-    if no_chat_template or (dataset in NO_CHAT_TEMPLATE_DATASETS and thinking_mode != "off"):
+    if not should_use_chat_template(dataset, no_chat_template, thinking_mode):
         return prompt
     if hasattr(tokenizer, 'apply_chat_template') and tokenizer.chat_template is not None:
         msgs = [
@@ -316,7 +320,11 @@ def get_pred(rank, data, dataset_info, args, model, tokenizer, model_max_length,
                     raise ValueError("LongBench sample must contain answers and all_classes fields.")
 
                 if args.sparse_method == "kvzip" and args.backend == "hf":
-                    use_kvzip_template = not args.no_chat_template and dataset not in NO_CHAT_TEMPLATE_DATASETS
+                    use_kvzip_template = should_use_chat_template(
+                        dataset,
+                        args.no_chat_template,
+                        args.thinking_mode,
+                    )
                     prompt_parts = build_kvzip_prompt_parts(
                         prompt_format,
                         json_obj,

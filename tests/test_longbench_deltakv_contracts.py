@@ -14,6 +14,25 @@ from deltakv.modeling.cache_factory import (
 
 
 class LongBenchDeltaKVContractsTest(unittest.TestCase):
+    def test_no_chat_datasets_remain_raw_for_every_thinking_mode(self):
+        for dataset in longbench_pred.NO_CHAT_TEMPLATE_DATASETS:
+            for thinking_mode in ("off", "on", "on_strip"):
+                with self.subTest(dataset=dataset, thinking_mode=thinking_mode):
+                    self.assertFalse(
+                        longbench_pred.should_use_chat_template(dataset, thinking_mode=thinking_mode)
+                    )
+
+    def test_chat_template_policy_matches_regular_and_kvzip_prompt_paths(self):
+        self.assertTrue(
+            longbench_pred.should_use_chat_template("hotpotqa", thinking_mode="off")
+        )
+        self.assertTrue(
+            longbench_pred.should_use_chat_template("hotpotqa", thinking_mode="on_strip")
+        )
+        self.assertFalse(
+            longbench_pred.should_use_chat_template("hotpotqa", no_chat_template=True)
+        )
+
     def test_hotpotqa_and_trec_metric_contracts(self):
         self.assertEqual(qa_f1_score("Paris", "Paris"), 1.0)
         self.assertEqual(qa_f1_score("Paris", "London"), 0)
