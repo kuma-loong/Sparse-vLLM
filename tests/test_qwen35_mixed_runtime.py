@@ -117,6 +117,9 @@ class _ResidentAdmissionCache:
     def prefill_step_free_slots_for(self, seq):
         return self.num_free_slots
 
+    def min_final_prefill_chunk_size(self, seq):
+        return 0
+
     def prefill_step_reservation_cost(self, seq, scheduled_tokens):
         return int(scheduled_tokens)
 

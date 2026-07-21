@@ -297,8 +297,9 @@ class CacheManager(ABC):
         dtype_size = torch.tensor([], dtype=hf_config.torch_dtype).element_size()
 
         # Keep this heuristic conservative: large prefill batches can still peak on
-        # MLP activations and allocator fragmentation after KV cache allocation.
-        estimated_max_tokens = int(reserved_mem / (intermediate_size_per_rank * dtype_size * 10))
+        # MLP/linear-attention projections and allocator fragmentation after KV
+        # cache allocation.
+        estimated_max_tokens = int(reserved_mem / (intermediate_size_per_rank * dtype_size * 16))
         allow_large_prefill_chunk = os.getenv("SPARSEVLLM_ALLOW_LARGE_PREFILL_CHUNK", "0") == "1"
         prefill_policy = getattr(config, "prefill_schedule_policy", None)
         if estimated_max_tokens <= 0:
@@ -968,6 +969,11 @@ class CacheManager(ABC):
     def prefill_step_free_slots_for(self, seq: Sequence) -> int:
         """Writable KV capacity for a specific prefill candidate."""
         return int(self.prefill_step_free_slots())
+
+    def min_final_prefill_chunk_size(self, seq: Sequence) -> int:
+        """Minimum final chunk size required by method-specific prefill logic."""
+        del seq
+        return 0
 
     def requires_long_prefill_offload(self, seq: Sequence) -> bool:
         """Whether this long prefill should be internally chunked through offload staging."""

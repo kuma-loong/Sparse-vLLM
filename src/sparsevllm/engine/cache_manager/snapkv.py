@@ -398,6 +398,28 @@ class SnapKVCacheManager(CacheManager):
             return max(0, int(self.pyramidkv_prefill_staging_num_slots) - int(seq.num_prefilled_tokens))
         return super().prefill_step_free_slots_for(seq)
 
+    def min_final_prefill_chunk_size(self, seq: Sequence) -> int:
+        if self.config.vllm_sparse_method != "snapkv":
+            return 0
+        window = int(getattr(self.config, "snapkv_window_size", 0) or 0)
+        if window <= 0:
+            return 0
+        if (
+            int(getattr(self.config, "snapkv_num_full_layers", 0) or 0)
+            >= int(self.num_kv_layers)
+        ):
+            return 0
+        budget = (
+            int(self.config.num_sink_tokens)
+            + int(self.config.decode_keep_tokens)
+            + int(self.config.num_recent_tokens)
+        )
+        # Match the ModelRunner long-prefill gate used by score collection.
+        long_prefill_threshold = budget + int(self.config.chunk_prefill_size)
+        if int(seq.num_prompt_tokens) <= long_prefill_threshold:
+            return 0
+        return min(window, int(seq.num_prompt_tokens))
+
     def prefill_step_reservation_cost(self, seq: Sequence, scheduled_tokens: int) -> int:
         if self.requires_long_prefill_offload(seq):
             return 0

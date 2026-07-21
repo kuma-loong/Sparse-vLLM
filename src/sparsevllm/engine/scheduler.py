@@ -220,6 +220,23 @@ class Scheduler:
             )
         raise ValueError(f"Unknown prefill_schedule_policy={self.prefill_schedule_policy!r}")
 
+    def _respect_min_final_prefill_chunk(
+        self,
+        seq: Sequence,
+        remaining_prefill_tokens: int,
+        proposed_tokens: int,
+    ) -> int:
+        min_final = int(self.memory_oracle.min_final_prefill_chunk_size(seq))
+        if min_final < 0:
+            raise ValueError(
+                "min_final_prefill_chunk_size must be non-negative, "
+                f"got {min_final} for seq_id={seq.seq_id}."
+            )
+        remaining_after = int(remaining_prefill_tokens) - int(proposed_tokens)
+        if min_final == 0 or remaining_after <= 0 or remaining_after >= min_final:
+            return int(proposed_tokens)
+        return max(0, int(remaining_prefill_tokens) - min_final)
+
     def _raise_prompt_admission_failure(
         self,
         seq: Sequence,
@@ -367,6 +384,11 @@ class Scheduler:
                     remaining_prefill_tokens=remaining_prefill_tokens,
                     num_batched_tokens=num_batched_tokens,
                     step_free_count=candidate_step_free_count,
+                )
+                can_prefill_tokens = self._respect_min_final_prefill_chunk(
+                    seq,
+                    remaining_prefill_tokens,
+                    can_prefill_tokens,
                 )
 
                 if can_prefill_tokens <= 0:

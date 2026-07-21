@@ -21,6 +21,7 @@ from sparsevllm.engine.cache_manager.snapkv import SnapKVCacheManager
 from sparsevllm.engine.decode_cuda_graph import DecodeCudaGraphKey, DecodeCudaGraphRunner, DecodeCudaGraphState
 from sparsevllm.engine.llm_engine import _deltakv_graph_warmup_profile, _use_graph_scaled_warmup
 from sparsevllm.engine.model_runner import ModelRunner
+from sparsevllm.engine.runtime_state import RuntimeState
 from sparsevllm.engine.scheduler import Scheduler
 from sparsevllm.engine.sequence import Sequence
 from sparsevllm.sampling_params import SamplingParams
@@ -46,6 +47,7 @@ class FakeMemoryOracle:
         prefix_hit_len=0,
         prefix_hit_blocks=0,
         long_prefill_offload=False,
+        min_final_prefill_chunk_size=0,
     ):
         self._free_slots = int(free_slots)
         self._step_free_slots = int(step_free_slots) if step_free_slots is not None else int(free_slots)
@@ -54,6 +56,7 @@ class FakeMemoryOracle:
         self.prefix_hit_len = int(prefix_hit_len)
         self.prefix_hit_blocks = int(prefix_hit_blocks)
         self._long_prefill_offload = bool(long_prefill_offload)
+        self._min_final_prefill_chunk_size = int(min_final_prefill_chunk_size)
         self.refresh_calls = 0
         self.clear_calls = 0
 
@@ -81,6 +84,9 @@ class FakeMemoryOracle:
 
     def prefill_step_reservation_cost(self, seq, scheduled_tokens):
         return int(scheduled_tokens)
+
+    def min_final_prefill_chunk_size(self, seq):
+        return self._min_final_prefill_chunk_size
 
     def decode_step_free_slots(self):
         return self._free_slots
@@ -403,7 +409,7 @@ class StandardCacheManagerAdmissionTest(unittest.TestCase):
         chunk_prefill_size,
         long_prefill_offload_threshold,
     ):
-        total_memory = int(estimated_max_tokens) * 40
+        total_memory = int(estimated_max_tokens) * 64
         manager = object.__new__(StandardCacheManager)
         manager.config = SimpleNamespace(
             hf_config=SimpleNamespace(
@@ -487,7 +493,7 @@ class StandardCacheManagerAdmissionTest(unittest.TestCase):
         ):
             manager._get_available_slots_info()
 
-    def test_prefill_token_estimate_keeps_ten_x_activation_headroom(self):
+    def test_prefill_token_estimate_keeps_sixteen_x_activation_headroom(self):
         total_memory = 80 * 1024**3
         manager = object.__new__(StandardCacheManager)
         manager.config = SimpleNamespace(
@@ -515,7 +521,7 @@ class StandardCacheManagerAdmissionTest(unittest.TestCase):
 
         expected_max_tokens = int(
             total_memory * (1 - manager.config.gpu_memory_utilization)
-            / (manager.config.hf_config.intermediate_size * 2 * 10)
+            / (manager.config.hf_config.intermediate_size * 2 * 16)
         )
         with patch.dict(os.environ, {"SPARSEVLLM_ALLOW_LARGE_PREFILL_CHUNK": "0"}):
             manager._get_available_slots_info()
@@ -1305,6 +1311,125 @@ class SchedulerPrefillPolicyTest(unittest.TestCase):
         self.assertTrue(is_prefill)
         self.assertEqual(scheduled, [seq])
         self.assertEqual(seq.current_chunk_size, 4)
+
+    def test_all_chunked_reserves_minimum_final_prefill_chunk(self):
+        scheduler = make_scheduler(
+            PREFILL_POLICY_ALL_CHUNKED,
+            chunk=5,
+            max_tokens=10,
+            oracle=FakeMemoryOracle(min_final_prefill_chunk_size=2),
+        )
+        seq = seq_with_len(10)
+        seq.num_prefilled_tokens = 4
+        scheduler.add(seq)
+
+        scheduled, is_prefill, _ = scheduler.schedule()
+
+        self.assertTrue(is_prefill)
+        self.assertEqual(scheduled, [seq])
+        self.assertEqual(seq.current_chunk_size, 4)
+        self.assertEqual(seq.num_prompt_tokens - seq.num_prefilled_tokens - seq.current_chunk_size, 2)
+
+    def test_all_chunked_preserves_snapkv_window_at_reported_boundaries(self):
+        cases = (
+            (16_966, 8_771, 16_934),
+            (15_056, 6_845, 15_024),
+        )
+        for prompt_len, num_prefilled_tokens, expected_chunk_end in cases:
+            with self.subTest(prompt_len=prompt_len):
+                scheduler = make_scheduler(
+                    PREFILL_POLICY_ALL_CHUNKED,
+                    chunk=8_192,
+                    max_tokens=65_536,
+                    oracle=FakeMemoryOracle(min_final_prefill_chunk_size=32),
+                )
+                seq = seq_with_len(prompt_len)
+                seq.num_prefilled_tokens = num_prefilled_tokens
+                scheduler.add(seq)
+
+                scheduled, is_prefill, _ = scheduler.schedule()
+
+                self.assertTrue(is_prefill)
+                self.assertEqual(scheduled, [seq])
+                self.assertEqual(seq.num_prefilled_tokens + seq.current_chunk_size, expected_chunk_end)
+                self.assertEqual(seq.num_prompt_tokens - expected_chunk_end, 32)
+
+    def test_all_chunked_defers_final_window_when_batch_tail_is_too_small(self):
+        scheduler = make_scheduler(
+            PREFILL_POLICY_ALL_CHUNKED,
+            chunk=5,
+            max_tokens=5,
+            oracle=FakeMemoryOracle(min_final_prefill_chunk_size=2),
+        )
+        first = seq_with_len(10)
+        first.num_prefilled_tokens = 6
+        final_window = seq_with_len(10)
+        final_window.num_prefilled_tokens = 8
+        scheduler.add(first)
+        scheduler.add(final_window)
+
+        scheduled, is_prefill, _ = scheduler.schedule()
+
+        self.assertTrue(is_prefill)
+        self.assertEqual(scheduled, [first])
+        self.assertIsNone(final_window.current_chunk_size)
+
+        scheduled, is_prefill, _ = scheduler.schedule()
+
+        self.assertTrue(is_prefill)
+        self.assertEqual(scheduled, [final_window])
+        self.assertEqual(final_window.current_chunk_size, 2)
+
+    def test_snapkv_final_prefill_window_only_applies_to_scored_long_prompts(self):
+        manager = object.__new__(SnapKVCacheManager)
+        manager.num_kv_layers = 2
+        manager.config = SimpleNamespace(
+            vllm_sparse_method="snapkv",
+            snapkv_window_size=2,
+            snapkv_num_full_layers=0,
+            num_sink_tokens=1,
+            decode_keep_tokens=4,
+            num_recent_tokens=1,
+            chunk_prefill_size=5,
+        )
+
+        self.assertEqual(manager.min_final_prefill_chunk_size(seq_with_len(12)), 2)
+        self.assertEqual(manager.min_final_prefill_chunk_size(seq_with_len(11)), 0)
+
+        manager.config.snapkv_num_full_layers = 2
+        self.assertEqual(manager.min_final_prefill_chunk_size(seq_with_len(12)), 0)
+
+        manager.config.vllm_sparse_method = "pyramidkv"
+        manager.config.snapkv_num_full_layers = 0
+        self.assertEqual(manager.min_final_prefill_chunk_size(seq_with_len(12)), 0)
+
+    def test_snapkv_scoring_accepts_preserved_reported_final_windows(self):
+        manager = object.__new__(SnapKVCacheManager)
+        manager.runtime_layout = identity_runtime_layout(1)
+        manager.config = SimpleNamespace(
+            vllm_sparse_method="snapkv",
+            snapkv_window_size=32,
+            snapkv_num_full_layers=0,
+            num_sink_tokens=64,
+            decode_keep_tokens=4_096,
+            num_recent_tokens=512,
+        )
+
+        for prompt_len in (16_966, 15_056):
+            with self.subTest(prompt_len=prompt_len):
+                seq = seq_with_len(prompt_len)
+                seq.num_prefilled_tokens = prompt_len - 32
+                seq.current_chunk_size = 32
+
+                rows = manager._prefill_score_rows(0, [seq])
+
+                self.assertEqual(rows, [(0, seq, prompt_len - 32, prompt_len)])
+
+    def test_runtime_state_forwards_minimum_final_prefill_chunk(self):
+        cache_manager = SimpleNamespace(min_final_prefill_chunk_size=lambda seq: seq.num_prompt_tokens)
+        runtime_state = RuntimeState(SimpleNamespace(), cache_manager)
+
+        self.assertEqual(runtime_state.min_final_prefill_chunk_size(seq_with_len(7)), 7)
 
     def test_long_bs1full_policy_chunks_long_as_single_offload_prefill(self):
         scheduler = make_scheduler(
