@@ -9,6 +9,11 @@ from torch import nn
 from sparsevllm.distributed import get_parallel_context
 from sparsevllm.layers.attention import Attention
 from sparsevllm.layers.embed_head import ParallelLMHead
+from sparsevllm.layers.fp8_moe import (
+    copy_fp8_expert_shard,
+    flashinfer_fp8_moe,
+    require_fp8_moe_alignment,
+)
 from sparsevllm.layers.layernorm import RMSNorm
 from sparsevllm.layers.linear import QKVParallelLinear, RowParallelLinear
 from sparsevllm.layers.rotary_embedding import (
@@ -75,11 +80,11 @@ class MiniMaxM2PackedExperts(nn.Module):
             raise ValueError(
                 f"MiniMax experts={self.num_experts} must be divisible by EP={self.ep_size}."
             )
-        if self.hidden_size % 128 or self.intermediate_size % 128:
-            raise ValueError(
-                "MiniMax packed FP8 experts require hidden/intermediate dimensions "
-                f"aligned to 128, got {self.hidden_size}/{self.intermediate_size}."
-            )
+        require_fp8_moe_alignment(
+            model_name="MiniMax",
+            hidden_size=self.hidden_size,
+            intermediate_size=self.intermediate_size,
+        )
         self.num_local_experts = self.num_experts // self.ep_size
         self.local_expert_start = self.ep_rank * self.num_local_experts
         self.local_expert_end = self.local_expert_start + self.num_local_experts
@@ -145,21 +150,6 @@ class MiniMaxM2PackedExperts(nn.Module):
                 f"Duplicate MiniMax expert weight for expert={global_expert_id}, "
                 f"projection={projection}."
             )
-        if loaded_scale is None:
-            raise ValueError(
-                f"Missing FP8 weight_scale_inv for MiniMax expert={global_expert_id}, "
-                f"projection={projection}."
-            )
-        if loaded_weight.dtype != torch.float8_e4m3fn:
-            raise TypeError(
-                f"MiniMax expert weight must be FP8 E4M3, got {loaded_weight.dtype}."
-            )
-        if loaded_scale.dtype != torch.float32:
-            raise TypeError(
-                "MiniMax expert weight_scale_inv must be FP32, "
-                f"got {loaded_scale.dtype}."
-            )
-
         local_expert_id = global_expert_id - self.local_expert_start
         if projection == "w2":
             weight_target = self.w2_weight.data[local_expert_id]
@@ -179,20 +169,15 @@ class MiniMaxM2PackedExperts(nn.Module):
                 local_expert_id,
                 scale_offset : scale_offset + scale_rows,
             ]
-        if tuple(loaded_weight.shape) != tuple(weight_target.shape):
-            raise ValueError(
-                f"MiniMax expert weight shape mismatch for expert={global_expert_id}, "
-                f"projection={projection}: expected={tuple(weight_target.shape)}, "
-                f"got={tuple(loaded_weight.shape)}."
-            )
-        if tuple(loaded_scale.shape) != tuple(scale_target.shape):
-            raise ValueError(
-                f"MiniMax expert scale shape mismatch for expert={global_expert_id}, "
-                f"projection={projection}: expected={tuple(scale_target.shape)}, "
-                f"got={tuple(loaded_scale.shape)}."
-            )
-        weight_target.copy_(loaded_weight)
-        scale_target.copy_(loaded_scale)
+        copy_fp8_expert_shard(
+            model_name="MiniMax",
+            expert_id=global_expert_id,
+            projection=projection,
+            loaded_weight=loaded_weight,
+            loaded_scale=loaded_scale,
+            weight_target=weight_target,
+            scale_target=scale_target,
+        )
         self._loaded_expert_shards.add(load_key)
 
     def validate_loaded_weights(self) -> None:
@@ -215,27 +200,17 @@ class MiniMaxM2PackedExperts(nn.Module):
         topk_ids: torch.Tensor,
         topk_weights: torch.Tensor,
     ) -> torch.Tensor:
-        from flashinfer.fused_moe import cutlass_fused_moe
-        from flashinfer.tllm_enums import ActivationType
-
-        output = torch.empty_like(hidden_states)
-        cutlass_fused_moe(
+        return flashinfer_fp8_moe(
             hidden_states,
-            topk_ids.to(dtype=torch.int32),
+            topk_ids,
             topk_weights,
             self.w13_weight,
             self.w2_weight,
-            hidden_states.dtype,
-            quant_scales=[self.w13_scale_inv, self.w2_scale_inv],
+            self.w13_scale_inv,
+            self.w2_scale_inv,
             ep_size=self.ep_size,
             ep_rank=self.ep_rank,
-            output=output,
-            use_deepseek_fp8_block_scale=True,
-            use_fused_finalize=False,
-            enable_pdl=False,
-            activation_type=ActivationType.Swiglu,
         )
-        return output
 
 
 class MiniMaxM2SparseMoeBlock(nn.Module):

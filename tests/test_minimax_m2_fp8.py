@@ -13,6 +13,7 @@ from sparsevllm.layers.rotary_embedding import (
     apply_rotary_emb,
 )
 from sparsevllm.quantization.fp8 import (
+    Fp8BlockScaledLinearBackend,
     finegrained_fp8_source_sha256,
     fp8_blockwise_dequantize,
     fp8_blockwise_linear_reference,
@@ -81,6 +82,33 @@ def test_block_fp8_linear_reference_matches_dynamic_w8a8_oracle():
             )
 
     torch.testing.assert_close(actual, expected, atol=0.0, rtol=0.0)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@pytest.mark.parametrize("tokens", [1, 7, 128])
+def test_flashinfer_block_fp8_linear_matches_reference(tokens):
+    if torch.cuda.get_device_capability() != (9, 0):
+        pytest.skip("FlashInfer block-scaled FP8 GEMM requires Hopper SM90")
+
+    torch.manual_seed(0)
+    device = torch.device("cuda")
+    weight = (
+        torch.randn(256, 256, device=device, dtype=torch.bfloat16)
+        .clamp(-4, 4)
+        .to(torch.float8_e4m3fn)
+    )
+    scale = torch.rand(2, 2, device=device, dtype=torch.float32) + 0.25
+    inputs = torch.randn(tokens, 256, device=device, dtype=torch.bfloat16)
+
+    backend = Fp8BlockScaledLinearBackend(
+        backend="auto",
+        model_name="test",
+    )
+    actual = backend(inputs, weight, scale)
+    expected = fp8_blockwise_linear_reference(inputs, weight, scale)
+
+    assert actual.dtype == torch.bfloat16
+    torch.testing.assert_close(actual, expected, atol=1.0, rtol=0.03)
 
 
 def test_block_fp8_dequant_rejects_wrong_scale_axis():

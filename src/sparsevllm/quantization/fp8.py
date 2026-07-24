@@ -69,6 +69,11 @@ def require_fp8_backend(
             f"{model_name} FP8 requires a CUDA device with native FP8 matmul support."
         )
     major, minor = torch.cuda.get_device_capability()
+    if backend == "auto" and (int(major), int(minor)) != (9, 0):
+        raise RuntimeError(
+            f"{model_name} FlashInfer FP8 requires Hopper SM90; "
+            f"detected compute capability {major}.{minor}."
+        )
     if (int(major), int(minor)) < (8, 9):
         raise RuntimeError(
             f"{model_name} FP8 requires Hopper/Ada-or-newer native FP8 CUDA support; "
@@ -314,14 +319,29 @@ class Fp8BlockScaledLinearBackend:
         output_dtype = (
             x.dtype if x.dtype in (torch.float16, torch.bfloat16) else torch.bfloat16
         )
-        kernel = load_finegrained_fp8_kernel()
-        output = kernel.matmul(
-            x_2d,
-            weight,
-            weight_scale_inv,
-            list(self.block_size),
-            output_dtype,
-        )
+        if self.backend == "auto":
+            if x_2d.dtype != torch.bfloat16:
+                raise RuntimeError(
+                    "FlashInfer FP8 Linear requires BF16 activations, "
+                    f"got dtype={x_2d.dtype}."
+                )
+            from flashinfer.gemm import fp8_blockscale_gemm_sm90
+
+            output = fp8_blockscale_gemm_sm90(
+                x_2d,
+                weight,
+                weight_scale=weight_scale_inv,
+                out_dtype=torch.bfloat16,
+            )
+        else:
+            kernel = load_finegrained_fp8_kernel()
+            output = kernel.matmul(
+                x_2d,
+                weight,
+                weight_scale_inv,
+                list(self.block_size),
+                output_dtype,
+            )
         if bias is not None:
             output.add_(bias)
         return output.reshape(*original_shape, weight.shape[0])
