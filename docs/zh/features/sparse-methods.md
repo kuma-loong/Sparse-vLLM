@@ -12,7 +12,7 @@ Sparse-vLLM 围绕 cache-manager-first sparse runtime 构建。engine 支持 phy
 | `streamingllm` | Physical eviction | StreamingLLM 风格的固定 sink 加 recent-window cache。保留 prefix/tail 策略之外的 token 会从 active KV cache 中被物理淘汰。 | `sink_keep_tokens`, `recent_keep_tokens` |
 | `attention-sink` | Physical eviction | attention-sink alias policy，使用相同的 sink-token 和 recent-window 保留模型。适合将 sink-window 行为与其他 physical eviction 方法对比。 | `sink_keep_tokens`, `recent_keep_tokens` |
 | `snapkv` | Physical eviction | SnapKV 风格的 token selection 在 prefill 后保留紧凑的重要历史 token 集合，只物理保留选中的 KV position，以减小 cache footprint。 | `decode_keep_tokens`, `sink_keep_tokens`, `recent_keep_tokens`, `sparse_prefill_score_mode` |
-| `h2o` | Physical eviction | H2O 默认使用 `prefill_sparse_method=h2o_prefill`，为每个 KV layer 和物理 row 分别维护累计 attention-importance vector。Prefill 每个 chunk 都评分并物理淘汰，最后一个 prefill chunk 收缩到 decode budget。选择其他兼容 prefill attention method 只改变 attention 计算，H2O 的 posthoc 评分和压缩仍会执行。当前关闭 decode 评分和周期淘汰：decode 保持 score-free，物理 row 随生成 token 增长。 | `h2o_decode_budget`, `h2o_prefill_budget`, `h2o_recent_ratio`, `h2o_prefill_score_window`, `sparse_prefill_score_mode` |
+| `h2o` | Physical eviction | H2O 默认使用 `prefill_sparse_method=h2o_prefill`，逐 layer、逐 query head 累计 attention probability。MHA 逐 head 独立选择，GQA 在 KV 组内聚合，MLA 在层内聚合并保留原生 latent 存储。Prefill 每个 chunk 都评分并物理淘汰，最后一个 prefill chunk 收缩到 decode budget。选择其他兼容 prefill attention method 只改变 attention 计算，H2O 的 posthoc 评分和压缩仍会执行。当前关闭 decode 评分和周期淘汰：decode 保持 score-free，物理 row 随生成 token 增长。 | `h2o_decode_budget`, `h2o_prefill_budget`, `h2o_recent_ratio`, `h2o_prefill_score_window`, `h2o_head_reduction` |
 | `pyramidkv` | Physical eviction | PyramidKV 风格、依赖 layer 的 KV 保留方式。它在 layer 之间分配 sparse budget，并物理存储选中的 context token。 | `decode_keep_tokens`, `sink_keep_tokens`, `recent_keep_tokens`, `sparse_prefill_score_mode` |
 | `omnikv` | Logical masking | OmniKV 保留 physical cache，但为选定 layer 构建 sparse attention view。适用于不改写 cache storage、同时降低 attention 计算量的场景。 | `full_attention_layers`, `decode_keep_tokens`, `sink_keep_tokens`, `recent_keep_tokens` |
 | `quest` | Query-aware page selection | QuEST 根据持久化的 page min/max summary 选择 token page，prefill 保持 dense。显式 KV 模型在 key 坐标中评分；GLM-4.7-Flash 使用匹配的 absorbed decode query 对融合 MLA latent/RoPE cache 评分，同时 compute payload 继续保持 latent。 | `quest_chunk_size`, `quest_skip_layers`, `sink_keep_tokens`, `decode_keep_tokens`, `recent_keep_tokens` |
@@ -28,15 +28,18 @@ Sparse-vLLM 在 public command、`LLM(...)`、runtime config 与内部消费者�
 
 SnapKV 的 `sparse_prefill_score_mode` 默认值改为 `logits`；`probability`
 仍可显式启用以复现实验，但它需要额外执行归一化 QK sweep，在已测长上下文
-prefill 中开销明显更高。PyramidKV 和 H2O 继续默认使用 `probability`。对 H2O
-而言这是 canonical 路径：每个 KV layer 都独立地对
-完整当前 query chunk 的归一化 softmax attention probability 求和，并在
-prefill chunk 之间累计 attention mass。当前明确关闭 decode score 收集与
-淘汰。Sparse-vLLM 复用 FA3 的
-softmax LSE；由于 FlashAttention 不物化 probability matrix，还需额外执行
-一遍 QK。`h2o_prefill_score_window=0` 表示完整当前 chunk，是 canonical
-默认设置；`[1, 128]` 的非零 window 或显式 `logits` 模式均属于非 canonical
-近似，但都不会改变每个 H2O KV layer 必须独立计算并保存 prefill score 的要求。
+prefill 中开销明显更高。PyramidKV 和 H2O 使用 `probability`。H2O 逐 query head 跨 prefill chunks
+累计 FP32 概率和；驱逐时通过 `h2o_head_reduction=max`（默认）或 `mean`，
+在 GQA 的每个 KV 组内或 MLA 的整个 layer 内归约累计分数。MHA 各 head 独立选择。
+每套选择在预算内保留 heavy hitters 和 recent tokens，保持 GQA 的原生 KV 共享
+以及 MLA 的原生 latent 存储。MLA H2O prefill 当前要求 TP1。
+
+`h2o_prefill_score_window=0` 观察完整当前 chunk；`[1, 128]` 的窗口属于显式近似。
+H2O 拒绝 `logits` 模式，因为归约后的 logits 无法表示逐 head 累计概率。
+Attention 提供 softmax LSE 时复用该结果，否则使用同一可见 KV 集合重新计算归一化。
+中间 chunk 的实际驱逐会改变后续 attention，结果因此可能随 chunk size 和预算变化。
+Decode 评分和驱逐仍保持关闭；`h2o_decode_budget` 用于最后一个 prefill chunk 的保留预算，
+之后缓存随生成增长。
 
 ## Prefill Scheduling Policy
 

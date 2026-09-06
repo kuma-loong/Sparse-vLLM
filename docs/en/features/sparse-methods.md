@@ -14,7 +14,7 @@ Set `sparse_method` to one of the following method names.
 | `streamingllm` | Physical eviction | StreamingLLM-style fixed sink plus recent-window cache. Tokens outside the retained prefix/tail policy are physically evicted from the active KV cache. | `sink_keep_tokens`, `recent_keep_tokens` |
 | `attention-sink` | Physical eviction | Alias-style attention-sink policy with the same sink-token and recent-window retention model. It is useful for comparing sink-window behavior against other physical eviction methods. | `sink_keep_tokens`, `recent_keep_tokens` |
 | `snapkv` | Physical eviction | SnapKV-style token selection keeps a compact set of important historical tokens after prefill. It reduces cache footprint by physically retaining only selected KV positions. | `decode_keep_tokens`, `sink_keep_tokens`, `recent_keep_tokens`, `sparse_prefill_score_mode` |
-| `h2o` | Physical eviction | H2O defaults to `prefill_sparse_method=h2o_prefill`, which maintains an independent cumulative attention-importance vector for every KV layer and physical row. Prefill scores and physically evicts after every chunk, and the final prefill chunk contracts to the decode budget. A different compatible prefill attention method changes the attention computation but preserves H2O's posthoc scoring and compaction. Decode scoring and periodic eviction are currently disabled: decode is score-free and its physical row grows with generated tokens. | `h2o_decode_budget`, `h2o_prefill_budget`, `h2o_recent_ratio`, `h2o_prefill_score_window`, `sparse_prefill_score_mode` |
+| `h2o` | Physical eviction | H2O defaults to `prefill_sparse_method=h2o_prefill`, which accumulates attention probabilities independently per query head and layer. MHA selects independently per head; GQA reduces within each KV group; MLA reduces across the layer while retaining native latent storage. Prefill scores and physically evicts after every chunk, and the final prefill chunk contracts to the decode budget. A different compatible prefill attention method changes the attention computation but preserves H2O's posthoc scoring and compaction. Decode scoring and periodic eviction are currently disabled: decode is score-free and its physical row grows with generated tokens. | `h2o_decode_budget`, `h2o_prefill_budget`, `h2o_recent_ratio`, `h2o_prefill_score_window`, `h2o_head_reduction` |
 | `pyramidkv` | Physical eviction | PyramidKV-style layer-dependent KV retention. It allocates sparse budgets across layers and physically stores the selected context tokens. | `decode_keep_tokens`, `sink_keep_tokens`, `recent_keep_tokens`, `sparse_prefill_score_mode` |
 | `omnikv` | Logical masking | OmniKV keeps the physical cache available but constructs sparse attention views for selected layers. This is useful when the method should avoid rewriting cache storage while still reducing attention work. | `full_attention_layers`, `decode_keep_tokens`, `sink_keep_tokens`, `recent_keep_tokens` |
 | `quest` | Query-aware page selection | QuEST selects token pages from persistent min/max page summaries. Prefill stays dense. Explicit-KV models score in key coordinates; GLM-4.7-Flash scores the fused MLA latent/RoPE cache with the matching absorbed decode query while keeping the compute payload latent. | `quest_chunk_size`, `quest_skip_layers`, `sink_keep_tokens`, `decode_keep_tokens`, `recent_keep_tokens` |
@@ -33,16 +33,21 @@ runtime config, and internal consumers.
 SnapKV defaults `sparse_prefill_score_mode` to `logits`; `probability` remains
 an explicit reproducibility option because its additional normalized QK sweep
 is substantially more expensive in measured long-context prefill. PyramidKV
-and H2O continue to default to `probability`. For H2O this is the canonical
-path: every KV layer independently sums its
-normalized softmax attention probabilities over the full current query chunk,
-then accumulates that attention mass across prefill chunks. Decode score
-collection and eviction are intentionally disabled. Sparse-vLLM
-reuses FA3's softmax LSE and performs one additional QK sweep because FlashAttention
-does not materialize its probability matrix. `h2o_prefill_score_window=0` selects
-the full current chunk and is the canonical default. A nonzero window in `[1, 128]`
-or explicit `logits` mode is a non-canonical approximation; neither changes the
-requirement that every H2O KV layer computes and retains its own prefill score.
+and H2O use `probability`. H2O accumulates FP32 probability sums per query
+head across prefill chunks. At eviction, `h2o_head_reduction=max` (default) or
+`mean` combines the cumulative scores within each GQA KV group, or across the
+whole layer for MLA. MHA heads select independently. Each selection retains
+heavy hitters plus recent tokens within its token budget; native GQA KV sharing
+and MLA latent storage are preserved. MLA H2O prefill currently requires TP1.
+
+`h2o_prefill_score_window=0` scores all queries in each chunk. Windows in
+`[1, 128]` are explicit approximations. H2O rejects `logits` mode because a
+reduced logit vector cannot represent per-head cumulative probabilities.
+When attention provides its softmax LSE, scoring reuses it; otherwise it
+recomputes normalization from the same visible keys. Intermediate chunk eviction
+changes subsequent attention, so results can depend on chunk size and budgets.
+Decode scoring and eviction remain disabled; `h2o_decode_budget` determines the
+final prefill retention budget, and the cache grows during generation.
 
 ## Prefill Scheduling Policies
 
