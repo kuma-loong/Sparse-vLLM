@@ -6,6 +6,50 @@ import triton.language as tl
 
 
 @triton.jit
+def _write_static_fp8(K, V, KD, VD, KS, VS, Slots,
+                      K0: tl.constexpr, K1: tl.constexpr, K2: tl.constexpr,
+                      V0: tl.constexpr, V1: tl.constexpr, V2: tl.constexpr,
+                      H: tl.constexpr, D: tl.constexpr, COUNT: tl.constexpr,
+                      BLOCK: tl.constexpr):
+    token = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    head = tl.program_id(1)
+    dim = tl.arange(0, D)
+    slot = tl.load(Slots + token, token < COUNT, other=-1)
+    valid = (token < COUNT) & (slot >= 0)
+    k = tl.load(K + token[:, None] * K0 + head * K1 + dim[None, :] * K2,
+                valid[:, None], other=0).to(tl.float32)
+    v = tl.load(V + token[:, None] * V0 + head * V1 + dim[None, :] * V2,
+                valid[:, None], other=0).to(tl.float32)
+    ks = tl.load(KS)
+    vs = tl.load(VS)
+    dest = (slot[:, None] * H + head) * D + dim[None, :]
+    tl.store(KD + dest, tl.clamp(k / ks, -448.0, 448.0), valid[:, None])
+    tl.store(VD + dest, tl.clamp(v / vs, -448.0, 448.0), valid[:, None])
+
+
+def write_fp8_kv(key, value, payload, write_slots):
+    """Quantize each live token directly into its final FP8 cache slot."""
+    if payload.format != "fp8_kv":
+        raise ValueError("Static FP8 writer requires an FP8 KV payload.")
+    h, d = payload.k_cache.shape[-2:]
+    count = key.shape[0]
+    if key.shape != value.shape or tuple(key.shape) != (count, h, d):
+        raise ValueError("FP8 KV inputs must have matching [tokens, heads, dim] shapes.")
+    if write_slots.shape != (count,) or write_slots.dtype != torch.int32:
+        raise ValueError("FP8 KV write slots must be one int32 value per input token.")
+    if key.device != payload.k_cache.device or value.device != key.device or write_slots.device != key.device:
+        raise ValueError("FP8 KV inputs, slots, and storage must share a device.")
+    if not count:
+        return
+    _write_static_fp8[(triton.cdiv(count, 16), h)](
+        key, value, payload.k_cache, payload.v_cache,
+        payload.key_scale, payload.value_scale, write_slots,
+        *key.stride(), *value.stride(), H=h, D=d, COUNT=count, BLOCK=16,
+        num_warps=4,
+    )
+
+
+@triton.jit
 def _decode_append(K, V, KD, VD, KS, KM, VS, VM, RK, RV, C, Slots, Rows, Lengths, Writes,
                        K0: tl.constexpr, K1: tl.constexpr, K2: tl.constexpr,
                        V0: tl.constexpr, V1: tl.constexpr, V2: tl.constexpr,
@@ -46,6 +90,9 @@ def quantized_decode_append(key, value, payload, slots, rows, lengths, write_slo
     if write_slots.shape != rows.shape:
         raise ValueError("Quantized decode write slots must match request rows.")
     if not rows.numel():
+        return
+    if payload.format == "fp8_kv":
+        write_fp8_kv(key, value, payload, write_slots)
         return
     tile = g if payload.format == "kivi" else min(g, 32)
     _decode_append[(rows.numel(), h, g // tile)](
@@ -99,13 +146,17 @@ def _encode_vectors(k, v, page, head, t, KD, VD, KS, KM, VS, VM, C,
                 threshold = (tl.load(C + i) + tl.load(C + i + 1)) * 0.5
                 kq += (kn > threshold).to(tl.int32)
                 vq += (vn > threshold).to(tl.int32)
-        else:
+        elif MODE == 2:
             ks = tl.maximum(tl.max(tl.abs(k), 1) / 448.0, 1.0e-30)
             vs = tl.maximum(tl.max(tl.abs(v), 1) / 448.0, 1.0e-30)
-        scale_off = (page * G + t) * H + head
-        tl.store(KS + scale_off, ks)
-        tl.store(VS + scale_off, vs)
-    if MODE == 2:
+        else:
+            ks = tl.load(KS)
+            vs = tl.load(VS)
+        if MODE != 3:
+            scale_off = (page * G + t) * H + head
+            tl.store(KS + scale_off, ks)
+            tl.store(VS + scale_off, vs)
+    if MODE == 2 or MODE == 3:
         dest = ((page * G + t[:, None]) * H + head) * D + d[None, :]
         tl.store(KD + dest, tl.minimum(tl.maximum(k / ks[:, None], -448.0), 448.0))
         tl.store(VD + dest, tl.minimum(tl.maximum(v / vs[:, None], -448.0), 448.0))
@@ -131,7 +182,7 @@ def _load_vectors(KD, VD, KS, KM, VS, VM, RK, RV, C, Slots,
                   W: tl.constexpr, BITS: tl.constexpr, MODE: tl.constexpr):
     d = tl.arange(0, D)
     valid = positions < length
-    packed = valid & (positions < (length // G) * G)
+    packed = valid if MODE == 3 else valid & (positions < (length // G) * G)
     slot = tl.load(Slots + row * slot_stride + positions, valid, 0)
     if MODE == 2:
         off = (slot[:, None] * H + head) * D + d[None, :]
@@ -149,15 +200,21 @@ def _load_vectors(KD, VD, KS, KM, VS, VM, RK, RV, C, Slots,
         vo = (slot[:, None] * H + head) * (D // G) + d[None, :] // G
         k = k.to(tl.float32) * tl.load(KS + ko, packed[:, None], 0) + tl.load(KM + ko, packed[:, None], 0)
         v = v.to(tl.float32) * tl.load(VS + vo, packed[:, None], 0) + tl.load(VM + vo, packed[:, None], 0)
+    elif MODE == 3:
+        k = k.to(tl.float32) * tl.load(KS)
+        v = v.to(tl.float32) * tl.load(VS)
     else:
         so = slot * H + head
         k = k.to(tl.float32) * tl.load(KS + so, packed, 0)[:, None]
         v = v.to(tl.float32) * tl.load(VS + so, packed, 0)[:, None]
-    raw_off = ((row * G + positions[:, None] % G) * H + head) * D + d[None, :]
-    tail = valid & ~packed
-    raw_k = tl.load(RK + raw_off, tail[:, None], 0).to(tl.float32)
-    raw_v = tl.load(RV + raw_off, tail[:, None], 0).to(tl.float32)
-    return tl.where(packed[:, None], k, raw_k), tl.where(packed[:, None], v, raw_v)
+    if MODE == 3:
+        return k, v
+    else:
+        raw_off = ((row * G + positions[:, None] % G) * H + head) * D + d[None, :]
+        tail = valid & ~packed
+        raw_k = tl.load(RK + raw_off, tail[:, None], 0).to(tl.float32)
+        raw_v = tl.load(RV + raw_off, tail[:, None], 0).to(tl.float32)
+        return tl.where(packed[:, None], k, raw_k), tl.where(packed[:, None], v, raw_v)
 
 
 @triton.jit
@@ -226,7 +283,7 @@ def _args(payload):
 def _constants(payload):
     return dict(H=payload.raw_key.shape[-2], D=payload.raw_key.shape[-1], G=payload.page_size,
                 W=payload.k_cache.shape[-1], BITS=payload.bits,
-                MODE={"kivi": 0, "turboquant": 1, "fp8_kv": 2}[payload.format])
+                MODE={"kivi": 0, "turboquant": 1, "fp8_kv": 3}[payload.format])
 
 
 def encode_pages(key, value, pages, payload):

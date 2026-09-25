@@ -33,3 +33,7 @@ def validate_quantized_kv(config) -> None:
         raise ValueError("Quantized KV methods do not yet support prefix caching/offload.")
     if config.prefill_sparse_method:
         raise ValueError("Quantized KV methods currently require dense prefill attention.")
+    if config.sparse_method == "fp8_kv" and hasattr(config, "runtime_layout"):
+        from sparseengine.configs.fp8_kv_scales import resolve_fp8_kv_scales
+
+        config.resolved_fp8_kv_scales = resolve_fp8_kv_scales(config)

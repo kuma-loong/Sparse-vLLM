@@ -206,13 +206,15 @@ def build_mha_decode_attention_spec(
         page_size=(
             int(getattr(runtime_config, "quest_chunk_size", 16))
             if normalized_method == "quest"
+            else int(getattr(runtime_config, "kv_quant_page_size", 32))
+            if cache_method == "fp8_kv"
             else 1
         ),
         # Score demand can change between decode steps for sparse methods.
         # Bind the score-capable implementation up front instead of
         # switching providers in the runtime path.
         may_require_attention_scores=requires_decode_scores,
-        layer_varying_page_table=bool(cache_method),
+        layer_varying_page_table=bool(cache_method and cache_method != "fp8_kv"),
         cuda_graph=bool(cuda_graph),
         h2o_layerwise_probability_scores=(
             normalized_method == "h2o" and requires_decode_scores

@@ -135,6 +135,7 @@ class KVQuantConfig:
     kivi_bits: int = 4
     turboquant_bits: int = 4
     turboquant_seed: int = 0
+    fp8_kv_scale_path: str | None = None
 
 
 @dataclass(kw_only=True)

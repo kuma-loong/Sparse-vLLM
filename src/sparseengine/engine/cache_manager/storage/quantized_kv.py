@@ -7,6 +7,8 @@ from statistics import NormalDist
 
 import torch
 
+from sparseengine.configs.fp8_kv_scales import FP8KVScales
+
 from ..base import ExplicitKVPayload
 from .base import CacheLayout
 
@@ -18,7 +20,7 @@ def quantized_kv_reserved_bytes(config, *, num_layers, num_heads, head_dim):
     capacity = int(config.max_num_seqs_in_batch) * int(config.max_model_len)
     rows = int(config.max_num_seqs_in_gpu)
     workspace = 2 * capacity * h * d * (item + (8 if config.sparse_method == "turboquant" else 0))
-    tail = 2 * num_layers * rows * g * h * d * item
+    tail = 0 if config.sparse_method == "fp8_kv" else 2 * num_layers * rows * g * h * d * item
     maps = (rows * int(config.max_model_len) + capacity) * 4
     scratch = 2 * (int(config.max_num_batched_tokens) + g) * h * d * (item + 4)
     return workspace + tail + maps + scratch + d * d * 4 + 64
@@ -66,13 +68,16 @@ class QuantizedKVPayload(ExplicitKVPayload):
     raw_value: torch.Tensor | None = None
     codebook: torch.Tensor | None = None
     rotation: torch.Tensor | None = None
+    key_scale_float: float | None = None
+    value_scale_float: float | None = None
 
 
 class QuantizedKVStorage:
     layout = CacheLayout.EXPLICIT_KV
 
     def __init__(self, *, format: str, bits: int, page_size: int,
-                 num_kv_heads: int, head_dim: int, dtype: torch.dtype, seed: int):
+                 num_kv_heads: int, head_dim: int, dtype: torch.dtype, seed: int,
+                 fp8_scales: FP8KVScales | None = None):
         if format not in {"kivi", "turboquant", "fp8_kv"}:
             raise ValueError(f"Unsupported quantized KV format {format!r}.")
         if (format == "kivi" and bits not in {2, 4}) or (format == "turboquant" and bits not in {2, 3, 4}):
@@ -82,6 +87,9 @@ class QuantizedKVStorage:
         self.format, self.bits, self.page_size = format, bits, page_size
         self.num_kv_heads, self.head_dim, self.dtype = num_kv_heads, head_dim, dtype
         self.seed = seed
+        if format == "fp8_kv" and fp8_scales is None:
+            raise ValueError("FP8 KV storage requires calibrated per-layer K/V scales.")
+        self.fp8_scales = fp8_scales
         self.packed_dim = head_dim if format == "fp8_kv" else math.ceil(head_dim / (32 // bits))
         self.tensors: tuple[torch.Tensor, ...] = ()
 
@@ -89,7 +97,7 @@ class QuantizedKVStorage:
         g, h, d = self.page_size, self.num_kv_heads, self.head_dim
         data = 2 * g * h * self.packed_dim * (1 if self.format == "fp8_kv" else 4)
         # FP32 metadata avoids underflow for small vector magnitudes.
-        metadata = 4 * h * d if self.format == "kivi" else 2 * g * h
+        metadata = 0 if self.format == "fp8_kv" else 4 * h * d if self.format == "kivi" else 2 * g * h
         return data + metadata * 4
 
     def bytes_per_slot_per_layer(self) -> int:
@@ -102,12 +110,19 @@ class QuantizedKVStorage:
         p, g, h, d = num_slots // self.page_size, self.page_size, self.num_kv_heads, self.head_dim
         packed_dtype = torch.float8_e4m3fn if self.format == "fp8_kv" else torch.int32
         self.data = torch.empty(2, num_layers, p, g, h, self.packed_dim, dtype=packed_dtype, device=device)
-        self.raw = torch.empty(2, num_layers, num_rows, g, h, d, dtype=self.dtype, device=device)
+        raw_rows = 0 if self.format == "fp8_kv" else num_rows
+        self.raw = torch.empty(2, num_layers, raw_rows, g, h, d, dtype=self.dtype, device=device)
         if self.format == "kivi":
             self.key_scale = torch.empty(num_layers, p, h, d, dtype=torch.float32, device=device)
             self.value_scale = torch.empty(num_layers, p, g, h, d // g, dtype=torch.float32, device=device)
             self.key_min = torch.empty_like(self.key_scale)
             self.value_min = torch.empty_like(self.value_scale)
+        elif self.format == "fp8_kv":
+            if len(self.fp8_scales.key) != num_layers or len(self.fp8_scales.value) != num_layers:
+                raise ValueError("FP8 KV scale count must equal the number of KV layers.")
+            self.key_scale = torch.tensor(self.fp8_scales.key, dtype=torch.float32, device=device)
+            self.value_scale = torch.tensor(self.fp8_scales.value, dtype=torch.float32, device=device)
+            self.key_min = self.value_min = torch.empty(0, dtype=torch.float32, device=device)
         else:
             self.key_scale = torch.empty(num_layers, p, g, h, dtype=torch.float32, device=device)
             self.value_scale = torch.empty_like(self.key_scale)
@@ -130,6 +145,8 @@ class QuantizedKVStorage:
             value_min=self.value_min[layer_idx] if self.format == "kivi" else self.value_min,
             raw_key=self.raw[0, layer_idx], raw_value=self.raw[1, layer_idx],
             codebook=self.codebook, rotation=self.rotation,
+            key_scale_float=(self.fp8_scales.key[layer_idx] if self.format == "fp8_kv" else None),
+            value_scale_float=(self.fp8_scales.value[layer_idx] if self.format == "fp8_kv" else None),
         )
 
     def validate_slot_mapping(self, slots: torch.Tensor) -> None:

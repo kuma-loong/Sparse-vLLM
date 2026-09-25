@@ -19,6 +19,10 @@ if TYPE_CHECKING:
     from sparseengine.operators.decode_attention import DecodeAttentionOpSpec
 
 
+def _kv_dtype(spec: DecodeAttentionOpSpec) -> torch.dtype:
+    return torch.float8_e4m3fn if spec.kv_storage_format == "fp8_kv" else spec.activation_dtype
+
+
 class FlashInferPagedDecodeState:
     """Provider-owned eager plan state for FlashInfer paged decode."""
 
@@ -73,6 +77,7 @@ class FlashInferPagedDecodeState:
             indices,
             context_capacity=max_context_len,
             page_size=page_size,
+            token_slots=spec.kv_storage_format == "fp8_kv",
         )
         page_counts = torch.div(
             context_lens + page_size - 1,
@@ -96,7 +101,7 @@ class FlashInferPagedDecodeState:
             page_size=spec.page_size,
             sm_scale=spec.softmax_scale,
             q_data_type=spec.activation_dtype,
-            kv_data_type=spec.activation_dtype,
+            kv_data_type=_kv_dtype(spec),
             non_blocking=True,
         )
 
@@ -221,7 +226,7 @@ class FlashInferPagedDecodeGraphState:
             page_size=self.spec.page_size,
             sm_scale=self.spec.softmax_scale,
             q_data_type=self.spec.activation_dtype,
-            kv_data_type=self.spec.activation_dtype,
+            kv_data_type=_kv_dtype(self.spec),
             non_blocking=True,
         )
 
@@ -365,9 +370,12 @@ class FlashInferPagedDecodeGraphState:
             packed_indices,
             context_capacity=min(
                 int(self.contract.context_capacity),
-                int(active_slots.shape[1]) * int(self.spec.page_size),
+                int(active_slots.shape[1]) * (
+                    1 if self.spec.kv_storage_format == "fp8_kv" else int(self.spec.page_size)
+                ),
             ),
             page_size=int(self.spec.page_size),
+            token_slots=self.spec.kv_storage_format == "fp8_kv",
         )
         keys[bool(is_sparse)] = key
         return True

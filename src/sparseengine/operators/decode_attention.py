@@ -8,6 +8,7 @@ import torch
 
 import sparseengine.platforms as platforms
 from sparseengine.kernels.external.flashinfer.decode import (
+    flashinfer_fp8_paged_decode_support,
     flashinfer_paged_decode_support,
 )
 from sparseengine.kernels.external.sgl.fa3 import (
@@ -531,8 +532,10 @@ class FlashInferPagedDecodeAttentionProvider(DecodeAttentionProvider):
         spec: DecodeAttentionOpSpec,
         caps: DeviceCaps,
     ) -> SupportResult:
-        if spec.kv_storage_format != "dense":
-            return SupportResult.unsupported("requires dense KV storage")
+        if spec.kv_storage_format not in {"dense", "fp8_kv"}:
+            return SupportResult.unsupported("requires dense or static FP8 KV storage")
+        if spec.kv_storage_format == "fp8_kv" and not caps.supports_native_fp8:
+            return SupportResult.unsupported("FP8 KV requires native FP8 support")
         if spec.may_use_full_layer_kivi_int4:
             return SupportResult.unsupported(
                 "does not support mixed dense and full-layer KIVI int4 storage"
@@ -546,7 +549,11 @@ class FlashInferPagedDecodeAttentionProvider(DecodeAttentionProvider):
             return common
         if not spec.causal:
             return SupportResult.unsupported("requires causal attention")
-        supported, reason = flashinfer_paged_decode_support()
+        supported, reason = (
+            flashinfer_fp8_paged_decode_support()
+            if spec.kv_storage_format == "fp8_kv"
+            else flashinfer_paged_decode_support()
+        )
         return SupportResult.yes(reason) if supported else SupportResult.unsupported(reason)
 
     def prepare(
@@ -659,10 +666,11 @@ class FlashInferPagedDecodeAttentionProvider(DecodeAttentionProvider):
             raise TypeError(
                 f"FlashInfer decode expected {spec.activation_dtype} Q, got {q.dtype}."
             )
-        if payload.k_cache.dtype != q.dtype or payload.v_cache.dtype != q.dtype:
+        kv_dtype = torch.float8_e4m3fn if spec.kv_storage_format == "fp8_kv" else q.dtype
+        if payload.k_cache.dtype != kv_dtype or payload.v_cache.dtype != kv_dtype:
             raise TypeError(
-                "FlashInfer decode requires Q/K/V with the same dtype, got "
-                f"{q.dtype}/{payload.k_cache.dtype}/{payload.v_cache.dtype}."
+                "FlashInfer decode received an incompatible KV dtype: "
+                f"expected={kv_dtype} actual={payload.k_cache.dtype}/{payload.v_cache.dtype}."
             )
         wrapper = state.wrapper
         if spec.cuda_graph:
@@ -704,18 +712,27 @@ class FlashInferPagedDecodeAttentionProvider(DecodeAttentionProvider):
         output = torch.empty_like(q)
         return_softmax_lse = spec.kernel_request.requires_softmax_lse
         page_size = int(spec.page_size)
-        if int(payload.k_cache.shape[0]) % page_size:
+        if spec.kv_storage_format != "fp8_kv" and int(payload.k_cache.shape[0]) % page_size:
             raise ValueError(
                 "FlashInfer KV slot capacity must be divisible by page_size: "
                 f"slots={int(payload.k_cache.shape[0])} page_size={page_size}."
             )
-        paged_k_cache = payload.k_cache.view(
-            -1,
-            page_size,
-            int(payload.k_cache.shape[1]),
-            int(payload.k_cache.shape[2]),
-        )
-        paged_v_cache = payload.v_cache.view_as(paged_k_cache)
+        if spec.kv_storage_format == "fp8_kv":
+            if payload.k_cache.ndim != 4 or int(payload.k_cache.shape[1]) != page_size:
+                raise ValueError("FlashInfer FP8 KV cache must use [pages, page_size, heads, dim].")
+            paged_k_cache, paged_v_cache = payload.k_cache, payload.v_cache
+            if payload.key_scale_float is None or payload.value_scale_float is None:
+                raise ValueError("FlashInfer FP8 KV decode requires resolved static scales.")
+            scale_kwargs = {"k_scale": payload.key_scale_float, "v_scale": payload.value_scale_float}
+        else:
+            paged_k_cache = payload.k_cache.view(
+                -1,
+                page_size,
+                int(payload.k_cache.shape[1]),
+                int(payload.k_cache.shape[2]),
+            )
+            paged_v_cache = payload.v_cache.view_as(paged_k_cache)
+            scale_kwargs = {}
         result = wrapper.run(
             q,
             (
@@ -724,6 +741,7 @@ class FlashInferPagedDecodeAttentionProvider(DecodeAttentionProvider):
             ),
             out=output,
             return_lse=return_softmax_lse,
+            **scale_kwargs,
         )
         if not return_softmax_lse:
             if not isinstance(result, torch.Tensor) or (
@@ -1504,7 +1522,7 @@ class QuantizedPagesDecodeAttentionProvider(DecodeAttentionProvider):
             return SupportResult.unsupported("requires score-free quantized page decode")
         if spec.head_dim not in {64, 128, 256} or spec.activation_dtype not in {torch.float16, torch.bfloat16}:
             return SupportResult.unsupported("requires head_dim 64/128/256 and FP16/BF16 queries")
-        if spec.page_size != 1 or spec.context_capacity is None:
+        if (spec.page_size != 1 and spec.kv_storage_format != "fp8_kv") or spec.context_capacity is None:
             return SupportResult.unsupported("requires token slot maps and a bounded context capacity")
         return SupportResult.yes()
 

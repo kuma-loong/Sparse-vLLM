@@ -18,6 +18,7 @@ def _pack_page_indices_kernel(
     PAGE_CAPACITY: tl.constexpr,
     PAGE_SIZE: tl.constexpr,
     PAGE_BLOCK: tl.constexpr,
+    TOKEN_SLOTS: tl.constexpr,
 ):
     batch_idx = tl.program_id(0)
     token_block_idx = tl.program_id(1)
@@ -37,9 +38,11 @@ def _pack_page_indices_kernel(
     slots = tl.load(
         active_slots
         + request_idx * active_slots_stride_0
-        + page_offsets * active_slots_stride_1,
+        + page_offsets * (PAGE_SIZE if TOKEN_SLOTS else 1) * active_slots_stride_1,
         mask=valid,
     )
+    if TOKEN_SLOTS:
+        slots = slots // PAGE_SIZE
     tl.store(packed_indices + packed_start + page_offsets, slots, mask=valid)
 
 
@@ -51,6 +54,7 @@ def pack_flashinfer_page_indices(
     *,
     context_capacity: int,
     page_size: int = 1,
+    token_slots: bool = False,
 ) -> None:
     """Pack a layer's canonical page table into graph-stable storage."""
 
@@ -69,7 +73,8 @@ def pack_flashinfer_page_indices(
     if page_size <= 0:
         raise ValueError(f"FlashInfer graph page_size must be positive, got {page_size}.")
     page_capacity = (context_capacity + page_size - 1) // page_size
-    if page_capacity <= 0 or page_capacity > int(active_slots.shape[1]):
+    required_width = context_capacity if token_slots else page_capacity
+    if page_capacity <= 0 or required_width > int(active_slots.shape[1]):
         raise ValueError(
             "FlashInfer graph context capacity is outside the slot table: "
             f"tokens={context_capacity} pages={page_capacity} "
@@ -99,6 +104,7 @@ def pack_flashinfer_page_indices(
         PAGE_CAPACITY=page_capacity,
         PAGE_SIZE=page_size,
         PAGE_BLOCK=page_block,
+        TOKEN_SLOTS=token_slots,
     )
 
 

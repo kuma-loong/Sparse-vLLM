@@ -92,6 +92,7 @@ class Config(
     hf_config: AutoConfig | None = None
     outer_hf_config: Any | None = None
     runtime_layout: RuntimeLayout | None = None
+    resolved_fp8_kv_scales: Any | None = field(default=None, init=False, repr=False)
     attention_cache_layout: str = field(default="explicit_kv", init=False)
     quantization_config: QuantizationConfig = field(default_factory=QuantizationConfig.disabled)
     model_spec: ModelSpec = field(init=False, repr=False)

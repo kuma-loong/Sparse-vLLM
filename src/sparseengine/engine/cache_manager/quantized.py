@@ -5,7 +5,7 @@ import math
 import numpy as np
 import torch
 
-from sparseengine.kernels.triton.quantized_kv import encode_pages, quantized_decode_append, materialize_sequence
+from sparseengine.kernels.triton.quantized_kv import encode_pages, quantized_decode_append, materialize_sequence, write_fp8_kv
 from .base import ExplicitKVPayload, ExplicitKVWrite
 from .quantized_pages import QuantizedPagePool
 from .standard import StandardCacheManager
@@ -22,6 +22,7 @@ class QuantizedCacheManager(StandardCacheManager):
             format=method, bits=bits, page_size=self.page_size,
             num_kv_heads=self.num_kv_heads, head_dim=self.head_dim,
             dtype=self.hf_config.dtype, seed=config.turboquant_seed,
+            fp8_scales=getattr(config, "resolved_fp8_kv_scales", None),
         )
         self.attention_cache_storage = storage
         available, _ = self._get_available_slots_info()
@@ -161,6 +162,9 @@ class QuantizedCacheManager(StandardCacheManager):
         if layer.rotation is not None:
             k = (k.float() @ layer.rotation).to(self.hf_config.dtype)
             v = (v.float() @ layer.rotation).to(self.hf_config.dtype)
+        if layer.format == "fp8_kv":
+            write_fp8_kv(k, v, layer, self.layer_batch_state.slot_mapping[:expected[0]])
+            return self.layer_batch_state.slot_mapping
         for row, start, end, offset, page_ids in self._write_plan:
             current_k, current_v = k[offset:offset + end - start], v[offset:offset + end - start]
             previous = start % self.page_size
@@ -231,6 +235,9 @@ class QuantizedCacheManager(StandardCacheManager):
         full_pages = sum(length // self.page_size for length in self.page_pool.lengths.values())
         tail_tokens = sum(length % self.page_size for length in self.page_pool.lengths.values())
         storage = self.attention_cache_storage
+        if storage.format == "fp8_kv":
+            used_pages = sum(math.ceil(length / self.page_size) for length in self.page_pool.lengths.values())
+            return self.num_kv_layers * used_pages * storage.bytes_per_page_per_layer()
         return self.num_kv_layers * (
             full_pages * storage.bytes_per_page_per_layer()
             + tail_tokens * 2 * self.num_kv_heads * self.head_dim * storage.raw.element_size()
