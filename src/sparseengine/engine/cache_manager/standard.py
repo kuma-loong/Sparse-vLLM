@@ -121,6 +121,11 @@ class StandardCacheManager(PrefixPruneScoringMixin, PrefixCacheMixin, CacheManag
             parallel_context,
             allocation_budget_bytes=allocation_budget_bytes,
         )
+        self.fp8_kv_calibration = None
+        if getattr(config, "fp8_kv_calibration", False):
+            from .fp8_kv_calibration import FP8KVCalibrationObserver
+
+            self.fp8_kv_calibration = FP8KVCalibrationObserver(self.num_kv_layers, self.device)
         self.attention_cache_storage = create_attention_cache_storage(
             config,
             num_kv_heads=self.num_kv_heads,
@@ -337,6 +342,14 @@ class StandardCacheManager(PrefixPruneScoringMixin, PrefixCacheMixin, CacheManag
         if slot_mapping is None:
             raise RuntimeError(
                 f"Attention cache store requires slot_mapping at layer={layer_idx}."
+            )
+        if self.fp8_kv_calibration is not None:
+            from .base import ExplicitKVWrite
+
+            if not isinstance(payload, ExplicitKVWrite):
+                raise TypeError("FP8 KV calibration requires explicit K/V writes.")
+            self.fp8_kv_calibration.update(
+                self.kv_layer_index(layer_idx), payload.key, payload.value, slot_mapping
             )
         self.attention_cache_storage.store(
             self.kv_layer_index(layer_idx),
@@ -1456,6 +1469,8 @@ class StandardCacheManager(PrefixPruneScoringMixin, PrefixCacheMixin, CacheManag
             controller.prefix_cache = self._require_prefix_cache()
 
     def reset_after_warmup(self) -> None:
+        if self.fp8_kv_calibration is not None:
+            self.fp8_kv_calibration.reset()
         if getattr(self.config, "resolved_prefix_cache_mode", "disabled") == "chain":
             # TP workers do not own the scheduler's resident-sequence ledger.
             # Reclaim their retained warmup chains from the local allocator.

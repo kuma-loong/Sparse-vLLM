@@ -9,7 +9,7 @@ import triton.language as tl
 def _write_static_fp8(K, V, KD, VD, KS, VS, Slots,
                       K0: tl.constexpr, K1: tl.constexpr, K2: tl.constexpr,
                       V0: tl.constexpr, V1: tl.constexpr, V2: tl.constexpr,
-                      H: tl.constexpr, D: tl.constexpr, COUNT: tl.constexpr,
+                      H: tl.constexpr, D: tl.constexpr, COUNT,
                       BLOCK: tl.constexpr):
     token = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
     head = tl.program_id(1)
@@ -184,7 +184,7 @@ def _load_vectors(KD, VD, KS, KM, VS, VM, RK, RV, C, Slots,
     valid = positions < length
     packed = valid if MODE == 3 else valid & (positions < (length // G) * G)
     slot = tl.load(Slots + row * slot_stride + positions, valid, 0)
-    if MODE == 2:
+    if MODE == 2 or MODE == 3:
         off = (slot[:, None] * H + head) * D + d[None, :]
         k = tl.load(KD + off, packed[:, None], 0.0).to(tl.float32)
         v = tl.load(VD + off, packed[:, None], 0.0).to(tl.float32)

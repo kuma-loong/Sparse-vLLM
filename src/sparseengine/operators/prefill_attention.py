@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+import inspect
 from dataclasses import dataclass, replace
 from typing import Any
 
@@ -83,6 +84,7 @@ class PrefillAttentionOpSpec:
     softmax_scale: float
     causal: bool = True
     page_size: int = 1
+    kv_storage_format: str = "dense"
     score_output: AttentionScoreKind = AttentionScoreKind.NONE
     optional_score_output: bool = False
     layer_varying_page_table: bool = False
@@ -100,6 +102,8 @@ class PrefillAttentionOpSpec:
             raise ValueError("Query heads must be divisible by KV heads.")
         if self.head_dim <= 0 or self.page_size <= 0:
             raise ValueError("Prefill attention dimensions must be positive.")
+        if self.kv_storage_format not in {"dense", "fp8_kv"}:
+            raise ValueError(f"Unsupported prefill KV storage format {self.kv_storage_format!r}.")
         if self.softmax_scale <= 0:
             raise ValueError("Prefill attention softmax_scale must be positive.")
         if self.optional_score_output and self.score_output == AttentionScoreKind.NONE:
@@ -199,6 +203,7 @@ PREFILL_ATTENTION_REGISTRY: OpRegistry[
     portfolio=PortfolioPolicy(
         upstream_standard=(
             "sgl_fa3_paged_prefill_sm90",
+            "flashinfer_fp8_paged_prefill_fa2_sm90",
             "flashinfer_paged_prefill_fa3_sm90",
             "flashinfer_paged_prefill_fa2_sm120",
         ),
@@ -240,8 +245,8 @@ class FlashInferPagedPrefillAttentionProvider(PrefillAttentionProvider):
         platforms=frozenset({PlatformEnum.CUDA}),
         compute_capabilities=frozenset({(9, 0)}),
         activation_dtypes=frozenset({torch.bfloat16}),
-        head_dims=frozenset({128}),
-        page_sizes=frozenset({1}),
+        head_dims=frozenset({64, 128, 256}),
+        page_sizes=frozenset({1, 16, 32, 64, 128}),
         score_outputs=frozenset({AttentionScoreKind.NONE}),
         layer_varying_page_table=False,
         varlen=True,
@@ -255,6 +260,10 @@ class FlashInferPagedPrefillAttentionProvider(PrefillAttentionProvider):
         semantics = _require_dense_prefill_semantics(spec)
         if not semantics.supported:
             return semantics
+        if spec.kv_storage_format == "fp8_kv" and cls.backend == "fa3":
+            return SupportResult.unsupported("FlashInfer FA3 mixed BF16/FP8 prefill JIT is unavailable")
+        if spec.kv_storage_format == "fp8_kv" and not caps.supports_native_fp8:
+            return SupportResult.unsupported("FP8 KV prefill requires native FP8 support")
         common = match_attention_capabilities(
             spec.kernel_request, caps, cls.capabilities
         )
@@ -262,7 +271,9 @@ class FlashInferPagedPrefillAttentionProvider(PrefillAttentionProvider):
             return common
         if not spec.causal:
             return SupportResult.unsupported("requires causal attention")
-        supported, reason = flashinfer_paged_prefill_support(cls.backend)
+        supported, reason = flashinfer_paged_prefill_support(
+            cls.backend, fp8_kv=spec.kv_storage_format == "fp8_kv"
+        )
         return SupportResult.yes(reason) if supported else SupportResult.unsupported(reason)
 
     def __init__(self) -> None:
@@ -321,10 +332,11 @@ class FlashInferPagedPrefillAttentionProvider(PrefillAttentionProvider):
             raise TypeError(
                 f"FlashInfer paged prefill expected {spec.activation_dtype} Q, got {q.dtype}."
             )
-        if payload.k_cache.dtype != q.dtype or payload.v_cache.dtype != q.dtype:
+        kv_dtype = torch.float8_e4m3fn if spec.kv_storage_format == "fp8_kv" else q.dtype
+        if payload.k_cache.dtype != kv_dtype or payload.v_cache.dtype != kv_dtype:
             raise TypeError(
-                "FlashInfer paged prefill requires Q/K/V with the same dtype, got "
-                f"{q.dtype}/{payload.k_cache.dtype}/{payload.v_cache.dtype}."
+                "FlashInfer paged prefill received incompatible KV dtype: "
+                f"expected={kv_dtype} actual={payload.k_cache.dtype}/{payload.v_cache.dtype}."
             )
         from sparseengine.utils.context import get_context
 
@@ -340,13 +352,19 @@ class FlashInferPagedPrefillAttentionProvider(PrefillAttentionProvider):
                 plan_scope=plan_scope,
             )
         output = torch.empty_like(q)
+        if spec.kv_storage_format == "fp8_kv":
+            paged_k, paged_v = payload.k_cache, payload.v_cache
+            if payload.key_scale_float is None or payload.value_scale_float is None:
+                raise ValueError("FP8 paged prefill requires resolved static scales.")
+            scale_kwargs = {"k_scale": payload.key_scale_float, "v_scale": payload.value_scale_float}
+        else:
+            paged_k, paged_v = payload.k_cache.unsqueeze(1), payload.v_cache.unsqueeze(1)
+            scale_kwargs = {}
         state.wrapper.run(
             q,
-            (
-                payload.k_cache.unsqueeze(1),
-                payload.v_cache.unsqueeze(1),
-            ),
+            (paged_k, paged_v),
             out=output,
+            **scale_kwargs,
         )
         return output
 
@@ -453,28 +471,25 @@ class _FlashInferPagedPrefillState:
                 "FlashInfer paged prefill max context is outside the active slot table: "
                 f"max_context_len={max_context_len} width={int(active_slots.shape[1])}."
             )
-        rows = active_slots.index_select(0, req_indices.to(torch.long))[
-            :, :max_context_len
-        ]
-        positions = torch.arange(
-            max_context_len,
+        page_size = spec.page_size
+        page_count_max = (max_context_len + page_size - 1) // page_size
+        token_offsets = torch.arange(
+            page_count_max,
             device=context_lens.device,
             dtype=context_lens.dtype,
-        )
-        valid = positions.unsqueeze(0) < context_lens.unsqueeze(1)
-        paged_kv_indices = rows.masked_select(valid).to(torch.int32).contiguous()
+        ) * page_size
+        rows = active_slots.index_select(0, req_indices.to(torch.long))[:, token_offsets.long()]
+        page_counts = torch.div(context_lens + page_size - 1, page_size, rounding_mode="floor")
+        valid = token_offsets.unsqueeze(0) < context_lens.unsqueeze(1)
+        paged_kv_indices = (rows // page_size).masked_select(valid).to(torch.int32).contiguous()
         zero = torch.zeros(1, device=context_lens.device, dtype=torch.int32)
         paged_kv_indptr = torch.cat(
             (
                 zero,
-                context_lens.to(torch.int32).cumsum(0, dtype=torch.int32),
+                page_counts.to(torch.int32).cumsum(0, dtype=torch.int32),
             )
         )
-        last_page_len = torch.ones(
-            batch_size,
-            device=context_lens.device,
-            dtype=torch.int32,
-        )
+        last_page_len = (context_lens - 1) % page_size + 1
         plan_args = (
             qo_indptr,
             paged_kv_indptr,
@@ -489,7 +504,8 @@ class _FlashInferPagedPrefillState:
             causal=spec.causal,
             sm_scale=spec.softmax_scale,
             q_data_type=spec.activation_dtype,
-            kv_data_type=spec.activation_dtype,
+            kv_data_type=(torch.float8_e4m3fn if spec.kv_storage_format == "fp8_kv"
+                          else spec.activation_dtype),
         )
         self._ensure_workspace(*plan_args, **plan_kwargs)
         self.wrapper.plan(
@@ -498,6 +514,90 @@ class _FlashInferPagedPrefillState:
             non_blocking=True,
         )
         self.plan_scope = plan_scope
+
+
+@PREFILL_ATTENTION_REGISTRY.register_atomic(ProviderRole.UPSTREAM_STANDARD)
+class FlashInferFp8Fa2PagedPrefillAttentionProvider(FlashInferPagedPrefillAttentionProvider):
+    """FA2 reads FP8 history; FA3 consumes current BF16 K/V when history is empty."""
+
+    name = "flashinfer_fp8_paged_prefill_fa2_sm90"
+    backend = "fa2"
+    capabilities = AttentionKernelCapabilities(
+        platforms=frozenset({PlatformEnum.CUDA}),
+        compute_capabilities=frozenset({(9, 0)}),
+        activation_dtypes=frozenset({torch.bfloat16, torch.float16}),
+        head_dims=frozenset({64, 128, 256}),
+        page_sizes=frozenset({16, 32, 64, 128}),
+        score_outputs=frozenset({AttentionScoreKind.NONE}),
+        layer_varying_page_table=False,
+        varlen=True,
+        minimum_runtime_version=(12, 8),
+    )
+
+    @classmethod
+    def supports(cls, spec: PrefillAttentionOpSpec, caps: DeviceCaps) -> SupportResult:
+        if spec.kv_storage_format != "fp8_kv":
+            return SupportResult.unsupported("requires FP8 KV storage")
+        return super().supports(spec, caps)
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._current_kernel = None
+        self._logged_current = False
+
+    def prepare(self, spec: PrefillAttentionOpSpec, *, device_index: int | None = None) -> None:
+        super().prepare(spec, device_index=device_index)
+        if spec.activation_dtype == torch.bfloat16 and spec.head_dim in {128, 256}:
+            supported, _ = sgl_fa3_device_support(torch.cuda.current_device())
+            if supported:
+                try:
+                    from sgl_kernel.flash_attn import flash_attn_varlen_func
+                except ImportError:
+                    flash_attn_varlen_func = None
+                if flash_attn_varlen_func is not None:
+                    required = {
+                        "q", "k", "v", "cu_seqlens_q", "cu_seqlens_k",
+                        "max_seqlen_q", "max_seqlen_k", "softmax_scale", "causal", "out",
+                    }
+                    try:
+                        parameters = set(inspect.signature(flash_attn_varlen_func).parameters)
+                    except (TypeError, ValueError):
+                        parameters = set()
+                    if required <= parameters:
+                        self._current_kernel = flash_attn_varlen_func
+
+    def close(self) -> None:
+        self._current_kernel = None
+        self._logged_current = False
+        super().close()
+
+    def binding_metadata(self) -> dict[str, object]:
+        metadata = super().binding_metadata()
+        metadata["current_only_backend"] = (
+            "sgl-fa3-bf16-varlen" if self._current_kernel is not None else None
+        )
+        return metadata
+
+    def run(self, spec, q, view, *, qo_indptr, chunk_lens, max_context_len, layer_idx):
+        current = getattr(view, "current_kv", None)
+        if current is not None and self._current_kernel is not None:
+            if not self._logged_current:
+                logger.info("FP8 current-only prefill uses SGL FA3 over BF16 K/V.")
+                self._logged_current = True
+            if (current.key.dtype != q.dtype or current.value.dtype != q.dtype
+                    or current.key.shape[0] != q.shape[0]
+                    or current.value.shape != current.key.shape):
+                raise TypeError("Current-only FP8 prefill requires matching BF16 Q/K/V.")
+            output = torch.empty_like(q)
+            return self._current_kernel(
+                q, current.key, current.value, qo_indptr, qo_indptr,
+                max_seqlen_q=max_context_len, max_seqlen_k=max_context_len,
+                softmax_scale=spec.softmax_scale, causal=True, out=output,
+            )
+        return super().run(
+            spec, q, view, qo_indptr=qo_indptr, chunk_lens=chunk_lens,
+            max_context_len=max_context_len, layer_idx=layer_idx,
+        )
 
 
 @PREFILL_ATTENTION_REGISTRY.register_atomic(ProviderRole.UPSTREAM_STANDARD)

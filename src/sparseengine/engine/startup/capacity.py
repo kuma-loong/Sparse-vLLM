@@ -188,7 +188,8 @@ def profiling_kv_budget_bytes(config, num_slots: int) -> int:
         bits = config.kivi_bits if config.sparse_method == "kivi" else config.turboquant_bits if config.sparse_method == "turboquant" else 8
         storage = QuantizedKVStorage(format=config.sparse_method, bits=bits, page_size=g,
                                      num_kv_heads=h, head_dim=d, dtype=config.hf_config.dtype,
-                                     seed=config.turboquant_seed)
+                                     seed=config.turboquant_seed,
+                                     fp8_scales=getattr(config, "resolved_fp8_kv_scales", None))
         # Each profiling request owns a distinct rounded final page.
         pages = ceil(num_slots / g) + max(int(config.max_num_seqs_in_batch), int(config.max_decoding_seqs))
         return (quantized_kv_reserved_bytes(config, num_layers=layers, num_heads=h, head_dim=d)

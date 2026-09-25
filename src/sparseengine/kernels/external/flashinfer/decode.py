@@ -123,6 +123,12 @@ def flashinfer_paged_decode_support() -> tuple[bool, str]:
 def flashinfer_fp8_paged_decode_support() -> tuple[bool, str]:
     wrapper_type, reason = _paged_decode_wrapper_type()
     _require_parameters(
+        wrapper_type,
+        frozenset({"use_tensor_cores", "backend"}),
+        feature="FP8 paged decode",
+        entrypoint="BatchDecodeWithPagedKVCacheWrapper",
+    )
+    _require_parameters(
         wrapper_type.run,
         frozenset({"k_scale", "v_scale"}),
         feature="FP8 paged decode",
@@ -138,6 +144,7 @@ def make_flashinfer_paged_decode_wrapper(
     paged_kv_indptr_buffer: torch.Tensor | None = None,
     paged_kv_indices_buffer: torch.Tensor | None = None,
     paged_kv_last_page_len_buffer: torch.Tensor | None = None,
+    fp8_kv: bool = False,
 ):
     wrapper_type, _ = _paged_decode_wrapper_type()
     return wrapper_type(
@@ -147,7 +154,8 @@ def make_flashinfer_paged_decode_wrapper(
         paged_kv_indptr_buffer=paged_kv_indptr_buffer,
         paged_kv_indices_buffer=paged_kv_indices_buffer,
         paged_kv_last_page_len_buffer=paged_kv_last_page_len_buffer,
-        backend="auto",
+        use_tensor_cores=fp8_kv,
+        backend="fa2" if fp8_kv else "auto",
     )
 
 

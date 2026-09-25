@@ -130,7 +130,9 @@ def build_mha_prefill_attention_spec(
         activation_dtype=activation_dtype,
         softmax_scale=head_dim**-0.5,
         causal=True,
-        page_size=1,
+        page_size=(int(getattr(runtime_config, "kv_quant_page_size", 32))
+                   if cache_method == "fp8_kv" else 1),
+        kv_storage_format="fp8_kv" if cache_method == "fp8_kv" else "dense",
         score_output=contract.main_score_kind,
         optional_score_output=contract.optional_score_output,
         layer_varying_page_table=contract.layer_varying_page_table,

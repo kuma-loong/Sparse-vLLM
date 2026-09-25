@@ -1,6 +1,7 @@
 """Independent numerical and lifecycle regressions for compressed KV pages."""
 
 import copy
+import json
 import math
 import os
 from types import SimpleNamespace
@@ -9,6 +10,7 @@ import pytest
 import torch
 
 from sparseengine.configs.kv_quant import validate_quantized_kv
+from sparseengine.configs.fp8_kv_scales import model_config_sha256
 from sparseengine.engine.cache_manager.quantized_pages import QuantizedPagePool
 from sparseengine.engine.cache_manager.storage.quantized_kv import (
     QuantizedKVStorage, gaussian_codebook, orthogonal_rotation,
@@ -87,6 +89,19 @@ def _config(**changes):
     return SimpleNamespace(**config)
 
 
+def _write_fp8_scales(model_path, layer_count):
+    path = model_path / "fp8_kv_scales.json"
+    path.write_text(json.dumps({
+        "schema_version": 1,
+        "scheme": "fp8_e4m3fn_per_layer",
+        "scale_convention": "dequant_multiplier",
+        "checkpoint_id": model_path.name,
+        "model_config_sha256": model_config_sha256(model_path),
+        "layers": {str(index): {"k": 0.02, "v": 0.02} for index in range(layer_count)},
+    }))
+    return str(path)
+
+
 @pytest.mark.parametrize("changes,match", [
     ({"kivi_bits": True}, "kivi_bits"), ({"turboquant_bits": 5}, "turboquant_bits"),
     ({"kv_quant_page_size": 17}, "page_size"),
@@ -113,8 +128,10 @@ def test_parallel_budget_matches_local_attention_heads(tmp_path, method, graph):
                         vocab_size=128, max_position_embeddings=160, dtype="bfloat16")
     hf.save_pretrained(tmp_path)
     options = dict(model=str(tmp_path), sparse_method=method, max_model_len=160,
-                   max_num_batched_tokens=128, max_num_seqs_in_batch=2,
-                   max_decoding_seqs=2, max_num_seqs_in_gpu=2, decode_graph=graph)
+                       max_num_batched_tokens=128, max_num_seqs_in_batch=2,
+                       max_decoding_seqs=2, max_num_seqs_in_gpu=2, decode_graph=graph)
+    if method == "fp8_kv":
+        options["fp8_kv_scale_path"] = _write_fp8_scales(tmp_path, 2)
     single = Config(**options)
     tp = Config(**options, tensor_parallel_size=2)
     hybrid = Config(**options, tensor_parallel_size=2, expert_parallel_size=2)
@@ -123,6 +140,8 @@ def test_parallel_budget_matches_local_attention_heads(tmp_path, method, graph):
     # Independent shape oracle: a TP=1 model with the same local KV head count.
     hf.num_key_value_heads = 1
     hf.save_pretrained(tmp_path)
+    if method == "fp8_kv":
+        _write_fp8_scales(tmp_path, 2)
     assert budget(Config(**options)) == budget(tp)
 
 
@@ -195,8 +214,6 @@ def _reference_page(x, format, bits, *, key, codebook):
 
 
 @pytest.mark.parametrize("format,bits,g,d,dtype", [
-    ("fp8_kv", 8, 16, 64, torch.float16), ("fp8_kv", 8, 32, 128, torch.bfloat16),
-    ("fp8_kv", 8, 128, 256, torch.bfloat16),
     ("kivi", 2, 32, 128, torch.bfloat16), ("kivi", 4, 128, 256, torch.bfloat16),
     ("turboquant", 2, 32, 128, torch.bfloat16), ("turboquant", 3, 32, 128, torch.bfloat16),
     ("turboquant", 4, 128, 256, torch.bfloat16),
@@ -303,10 +320,11 @@ def test_manager_chunk_append_and_free_preserve_history(tmp_path, kernel_device,
     LlamaConfig(hidden_size=256, intermediate_size=512, num_hidden_layers=2,
                 num_attention_heads=4, num_key_value_heads=2, head_dim=64,
                 vocab_size=128, max_position_embeddings=160, dtype="float16").save_pretrained(tmp_path)
+    scale_path = _write_fp8_scales(tmp_path, 2) if method == "fp8_kv" else None
     config = Config(model=str(tmp_path), sparse_method=method, max_model_len=160,
                     max_num_batched_tokens=256, engine_prefill_chunk_size=32,
                     max_num_seqs_in_batch=2, max_decoding_seqs=2, max_num_seqs_in_gpu=2,
-                    decode_graph=False)
+                    decode_graph=False, fp8_kv_scale_path=scale_path)
     group = ParallelGroup(None, (0,), 0, 1)
     from sparseengine.engine.startup.capacity import profiling_kv_budget_bytes, profiling_kv_slots
     config.startup_cache_phase = "profiling"
@@ -334,11 +352,26 @@ def test_manager_chunk_append_and_free_preserve_history(tmp_path, kernel_device,
         selection = SparseSelection(kind="full", req_indices=state.req_indices,
                                     context_lens=state.context_lens, max_context_len=end)
         view = manager.build_prefill_compute_view(0, key[start:end], value[start:end], selection)
-        torch.testing.assert_close(view.payload.k_cache[start:end], key[start:end], atol=0, rtol=0)
-        torch.testing.assert_close(view.payload.v_cache[start:end], value[start:end], atol=0, rtol=0)
-        if previous:
-            torch.testing.assert_close(view.payload.k_cache[:start], previous[0].half(), atol=0, rtol=0)
-            torch.testing.assert_close(view.payload.v_cache[:start], previous[1].half(), atol=0, rtol=0)
+        if method == "fp8_kv":
+            assert view.payload.format == "fp8_kv"
+            assert view.payload.raw_key.numel() == 0
+            assert (view.current_kv is not None) == (start == 0)
+            if start == 0:
+                assert view.current_kv.key.data_ptr() == key[start:end].data_ptr()
+            actual_k = torch.empty(end, 2, 64, device=kernel_device, dtype=torch.float16)
+            actual_v = torch.empty_like(actual_k)
+            materialize_sequence(view.payload, view.meta.active_slots,
+                                 manager.seq_id_to_row[seq.seq_id], end, actual_k, actual_v)
+            expected_k = (key[:end].float() / 0.02).clamp(-448, 448).to(torch.float8_e4m3fn).float() * 0.02
+            expected_v = (value[:end].float() / 0.02).clamp(-448, 448).to(torch.float8_e4m3fn).float() * 0.02
+            torch.testing.assert_close(actual_k.float(), expected_k.half().float(), atol=0.01, rtol=0)
+            torch.testing.assert_close(actual_v.float(), expected_v.half().float(), atol=0.01, rtol=0)
+        else:
+            torch.testing.assert_close(view.payload.k_cache[start:end], key[start:end], atol=0, rtol=0)
+            torch.testing.assert_close(view.payload.v_cache[start:end], value[start:end], atol=0, rtol=0)
+            if previous:
+                torch.testing.assert_close(view.payload.k_cache[:start], previous[0].half(), atol=0, rtol=0)
+                torch.testing.assert_close(view.payload.v_cache[:start], previous[1].half(), atol=0, rtol=0)
         seq.num_prefilled_tokens = end
     for step in range(31):
         seq.append_token(2)
@@ -362,7 +395,7 @@ def test_manager_chunk_append_and_free_preserve_history(tmp_path, kernel_device,
 
 
 @pytest.mark.parametrize("format,bits", [("kivi", 2), ("kivi", 4), ("turboquant", 2),
-                                         ("turboquant", 3), ("turboquant", 4), ("fp8_kv", 8)])
+                                         ("turboquant", 3), ("turboquant", 4)])
 @pytest.mark.parametrize("g,d,dtype", [(32, 64, torch.float16), (16, 128, torch.bfloat16),
                                       (128, 256, torch.bfloat16)])
 def test_packed_page_attention_matches_independent_reference(kernel_device, format, bits, g, d, dtype):
@@ -431,7 +464,7 @@ def test_packed_page_attention_matches_independent_reference(kernel_device, form
     assert sum(t.numel() * t.element_size() for t in page_tensors) == 8 * storage.bytes_per_page_per_layer()
 
 
-@pytest.mark.parametrize("method,bits", [("kivi", 4), ("turboquant", 3), ("fp8_kv", 8)])
+@pytest.mark.parametrize("method,bits", [("kivi", 4), ("turboquant", 3)])
 def test_gqa_head_shards_match_unsharded_quantization(kernel_device, method, bits):
     """Independent head shards must preserve encoding, rotation and GQA decoding."""
     device = kernel_device
@@ -478,7 +511,7 @@ def test_gqa_head_shards_match_unsharded_quantization(kernel_device, method, bit
 
 
 @pytest.mark.parametrize("method,bits,d", [("kivi", 4, 64), ("kivi", 4, 128),
-                                         ("kivi", 2, 256), ("turboquant", 3, 64), ("fp8_kv", 8, 64)])
+                                         ("kivi", 2, 256), ("turboquant", 3, 64)])
 def test_provider_graph_replay_reads_live_lengths_and_rows(kernel_device, method, bits, d):
     """Catch stale inactive splits when a large captured grid changes live lengths."""
     from sparseengine.operators.decode_attention import QuantizedPagesDecodeAttentionProvider

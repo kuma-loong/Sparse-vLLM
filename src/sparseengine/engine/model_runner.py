@@ -231,6 +231,7 @@ TP_RPC_STATUS_SYNC_METHODS = PREFIX_CACHE_CONTROL_RPC_METHODS | {
     "chain_validate_admission_plan",
     "debug_hidden_states_cpu",
     "debug_moe_states_cpu",
+    "export_fp8_kv_calibration",
     "free_slots",
     "free_slots_batch",
     "finish_slots_batch",
@@ -1939,6 +1940,24 @@ class ModelRunner:
                 "No debug logits are available. Set SPARSEENGINE_DEBUG_RUNTIME=1 before engine startup."
             )
         return logits.detach().cpu()
+
+    def export_fp8_kv_calibration(self) -> dict[str, object] | None:
+        """Combine local KV extrema across every participating model rank."""
+        observer = getattr(self.cache_manager, "fp8_kv_calibration", None)
+        if observer is None:
+            raise RuntimeError("FP8 KV calibration was not enabled for this runtime.")
+        maxima = torch.stack((observer.key_max, observer.value_max))
+        counts = observer.token_counts.clone()
+        if self.parallel_context.world_size > 1:
+            self.parallel_context.world.all_reduce(maxima, op=dist.ReduceOp.MAX)
+            self.parallel_context.world.all_reduce(counts, op=dist.ReduceOp.MAX)
+        if self.parallel_context.world_rank != 0:
+            return None
+        return {
+            "key_max": maxima[0].cpu().tolist(),
+            "value_max": maxima[1].cpu().tolist(),
+            "token_counts": counts.cpu().tolist(),
+        }
 
     def debug_hidden_states_cpu(self) -> dict[int, torch.Tensor] | None:
         model = getattr(getattr(self, "model", None), "model", None)

@@ -18,6 +18,7 @@ from sparseengine.utils.code_revision import code_revision_info
 from sparseengine.utils.log import logger
 import sys
 import time
+from pathlib import Path
 
 from sparseengine.configs.cuda_graph import build_decode_cuda_graph_startup_plan
 
@@ -1473,6 +1474,52 @@ class LLMEngine:
             raise RuntimeError(f"Rank 0 did not return MoE snapshots: {snapshots!r}.")
         return snapshots
 
+    def export_fp8_kv_scales(self, path: str | os.PathLike[str], *, safety_margin: float = 1.05) -> dict:
+        """Export offline per-layer scales measured from dense K/V writes."""
+        import math
+
+        from sparseengine.configs.fp8_kv_scales import CONVENTION, SCHEME, model_config_sha256
+
+        if not math.isfinite(safety_margin) or safety_margin < 1.0:
+            raise ValueError("FP8 KV calibration safety_margin must be finite and >= 1.")
+        measured = self.model_runner.call("export_fp8_kv_calibration")
+        if not isinstance(measured, dict):
+            raise RuntimeError("Rank 0 did not return FP8 KV calibration data.")
+        layer_indices = tuple(self.config.runtime_layout.kv_idx_to_layer_idx)
+        keys = measured["key_max"]
+        values = measured["value_max"]
+        counts = measured["token_counts"]
+        if not (len(keys) == len(values) == len(counts) == len(layer_indices)):
+            raise RuntimeError("FP8 KV calibration layer count differs from the model layout.")
+        if any(count <= 0 or k <= 0 or v <= 0 for count, k, v in zip(counts, keys, values)):
+            raise RuntimeError("FP8 KV calibration has unobserved layers or zero extrema.")
+        result = {
+            "schema_version": 1,
+            "scheme": SCHEME,
+            "scale_convention": CONVENTION,
+            "checkpoint_id": Path(self.config.model).name,
+            "model_config_sha256": model_config_sha256(self.config.model),
+            "calibration": {
+                "safety_margin": safety_margin,
+                "token_counts_per_layer": counts,
+                "attention_tp_size": self.config.attn_tp_size,
+                "formula": "scale = safety_margin * max_abs / 448",
+            },
+            "layers": {
+                str(layer_idx): {
+                    "k": safety_margin * float(keys[kv_idx]) / 448.0,
+                    "v": safety_margin * float(values[kv_idx]) / 448.0,
+                }
+                for kv_idx, layer_idx in enumerate(layer_indices)
+            },
+        }
+        destination = Path(path)
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        temporary = destination.with_name(f".{destination.name}.{os.getpid()}.tmp")
+        temporary.write_text(json.dumps(result, indent=2) + "\n", encoding="utf-8")
+        os.replace(temporary, destination)
+        return result
+
     def worker_info(
         self,
         served_model_name: str | None = None,
@@ -1554,6 +1601,8 @@ class LLMEngine:
             "prefix_kv_bytes_per_block",
             "prefix_kv_block_capacity",
             "kv_allocatable_bytes",
+            "kv_quant_page_size",
+            "fp8_kv_scale_path",
         )
 
         def jsonable(value):
@@ -1596,6 +1645,14 @@ class LLMEngine:
             ),
             "prefix_cache_block_size": getattr(config, "prefix_cache_block_size", None),
             "code_revision": code_revision_info(),
+            "fp8_kv_scales": (
+                {
+                    "source": config.resolved_fp8_kv_scales.source,
+                    "file_sha256": config.resolved_fp8_kv_scales.file_sha256,
+                }
+                if getattr(config, "resolved_fp8_kv_scales", None) is not None
+                else None
+            ),
             "benchmark_config": {
                 key: jsonable(getattr(config, key))
                 for key in benchmark_config_keys

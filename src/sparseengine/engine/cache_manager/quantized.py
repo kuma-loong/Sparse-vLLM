@@ -1,6 +1,7 @@
 """Token-preserving compressed pages with shared eager/graph decode updates."""
 
 import math
+from dataclasses import replace
 
 import numpy as np
 import torch
@@ -27,7 +28,8 @@ class QuantizedCacheManager(StandardCacheManager):
         self.attention_cache_storage = storage
         available, _ = self._get_available_slots_info()
         h, d, g = self.num_kv_heads, self.head_dim, self.page_size
-        self.prefill_capacity = int(config.max_num_seqs_in_batch) * self.max_model_len
+        self.prefill_capacity = (0 if method == "fp8_kv"
+                                 else int(config.max_num_seqs_in_batch) * self.max_model_len)
         fixed = quantized_kv_reserved_bytes(config, num_layers=self.num_kv_layers, num_heads=h, head_dim=d)
         page_bytes = self.num_kv_layers * storage.bytes_per_page_per_layer() + g * 4
         num_pages = (available - fixed) // page_bytes
@@ -48,8 +50,12 @@ class QuantizedCacheManager(StandardCacheManager):
         self.prefill_rotated = (torch.empty(2, self.prefill_capacity, h, d,
                                             dtype=torch.float32, device=self.device)
                                 if method == "turboquant" else None)
-        self.prefill_slot_map = torch.arange(self.prefill_capacity, dtype=torch.int32, device=self.device).reshape(
-            int(config.max_num_seqs_in_batch), self.max_model_len)
+        self.prefill_slot_map = (
+            torch.empty((0, 0), dtype=torch.int32, device=self.device)
+            if method == "fp8_kv"
+            else torch.arange(self.prefill_capacity, dtype=torch.int32, device=self.device).reshape(
+                int(config.max_num_seqs_in_batch), self.max_model_len)
+        )
         self._write_plan = []
         self._prefill_active = False
 
@@ -117,7 +123,8 @@ class QuantizedCacheManager(StandardCacheManager):
             pages = self.page_pool.pages[seq.seq_id]
             start = end - count
             full_start, full_end = start // self.page_size, end // self.page_size
-            page_ids = torch.tensor(pages[full_start:full_end], dtype=torch.int32, device=self.device)
+            page_ids = (None if self.attention_cache_storage.format == "fp8_kv"
+                        else torch.tensor(pages[full_start:full_end], dtype=torch.int32, device=self.device))
             self._write_plan.append((row, start, end, offset, page_ids))
             offset += count
 
@@ -145,6 +152,9 @@ class QuantizedCacheManager(StandardCacheManager):
                                     state.req_indices, state.context_lens, state.slot_mapping)
             return state.slot_mapping
         k, v = k[:expected[0]], v[:expected[0]]
+        if layer.format == "fp8_kv":
+            write_fp8_kv(k, v, layer, self.layer_batch_state.slot_mapping[:expected[0]])
+            return self.layer_batch_state.slot_mapping
         # Standard prefill consumes exact current K/V, including pages just encoded.
         for index, (row, start, end, offset, _) in enumerate(self._write_plan):
             base = index * self.max_model_len
@@ -162,9 +172,6 @@ class QuantizedCacheManager(StandardCacheManager):
         if layer.rotation is not None:
             k = (k.float() @ layer.rotation).to(self.hf_config.dtype)
             v = (v.float() @ layer.rotation).to(self.hf_config.dtype)
-        if layer.format == "fp8_kv":
-            write_fp8_kv(k, v, layer, self.layer_batch_state.slot_mapping[:expected[0]])
-            return self.layer_batch_state.slot_mapping
         for row, start, end, offset, page_ids in self._write_plan:
             current_k, current_v = k[offset:offset + end - start], v[offset:offset + end - start]
             previous = start % self.page_size
@@ -182,10 +189,26 @@ class QuantizedCacheManager(StandardCacheManager):
 
     def get_prefill_compute_payload(self, layer_idx, k_current, v_current, selection,
                                     active_slots, req_indices, context_lens):
+        if self.attention_cache_storage.format == "fp8_kv":
+            return (self.attention_cache_storage.layer_payload(self.kv_layer_index(layer_idx)),
+                    active_slots, req_indices, context_lens)
         batch = len(self._write_plan)
         rows = torch.arange(batch, dtype=torch.int32, device=self.device)
         return (ExplicitKVPayload(k_cache=self.prefill_kv[0], v_cache=self.prefill_kv[1]),
                 self.prefill_slot_map[:batch], rows, context_lens)
+
+    def build_prefill_compute_view(self, layer_idx, k_current, v_current, selection):
+        view = super().build_prefill_compute_view(layer_idx, k_current, v_current, selection)
+        if (
+            self.attention_cache_storage.format == "fp8_kv"
+            and self._prefill_active
+            and self._write_plan
+            and all(start == 0 for _, start, _, _, _ in self._write_plan)
+            and view.meta.temp_slots is None
+            and view.meta.active_slots is self.buffer_req_to_token_slots
+        ):
+            return replace(view, current_kv=ExplicitKVWrite(k_current, v_current))
+        return view
 
     def get_layer_kv_cache(self, layer_idx):
         raise RuntimeError("Quantized cache requires a typed compressed compute payload.")

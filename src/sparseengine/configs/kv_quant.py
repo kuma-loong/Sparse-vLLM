@@ -7,6 +7,9 @@ from sparseengine.models.layout import resolve_attention_qk_head_dim
 
 
 def validate_quantized_kv(config) -> None:
+    if getattr(config, "fp8_kv_calibration", False):
+        if config.sparse_method or config.attention_cache_layout != "explicit_kv":
+            raise ValueError("FP8 KV calibration requires dense explicit KV storage.")
     if config.sparse_method not in QUANTIZED_KV_METHODS:
         return
     for name, allowed in (("kivi_bits", {2, 4}), ("turboquant_bits", {2, 3, 4})):

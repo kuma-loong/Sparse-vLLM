@@ -19,9 +19,9 @@ def quantized_kv_reserved_bytes(config, *, num_layers, num_heads, head_dim):
     item = torch.empty((), dtype=config.hf_config.dtype).element_size()
     capacity = int(config.max_num_seqs_in_batch) * int(config.max_model_len)
     rows = int(config.max_num_seqs_in_gpu)
-    workspace = 2 * capacity * h * d * (item + (8 if config.sparse_method == "turboquant" else 0))
+    workspace = 0 if config.sparse_method == "fp8_kv" else 2 * capacity * h * d * (item + (8 if config.sparse_method == "turboquant" else 0))
     tail = 0 if config.sparse_method == "fp8_kv" else 2 * num_layers * rows * g * h * d * item
-    maps = (rows * int(config.max_model_len) + capacity) * 4
+    maps = (rows * int(config.max_model_len) + (0 if config.sparse_method == "fp8_kv" else capacity)) * 4
     scratch = 2 * (int(config.max_num_batched_tokens) + g) * h * d * (item + 4)
     return workspace + tail + maps + scratch + d * d * 4 + 64
 

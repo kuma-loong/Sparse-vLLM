@@ -26,13 +26,15 @@ def _kv_dtype(spec: DecodeAttentionOpSpec) -> torch.dtype:
 class FlashInferPagedDecodeState:
     """Provider-owned eager plan state for FlashInfer paged decode."""
 
-    def __init__(self, device: torch.device) -> None:
+    def __init__(self, device: torch.device, *, fp8_kv: bool = False) -> None:
         self.workspace = torch.empty(
             128 * 1024 * 1024,
             dtype=torch.uint8,
             device=device,
         )
-        self.wrapper = make_flashinfer_paged_decode_wrapper(self.workspace)
+        self.wrapper = make_flashinfer_paged_decode_wrapper(
+            self.workspace, fp8_kv=fp8_kv
+        )
         self.plan_key: tuple[object, ...] | None = None
         self.indices = torch.empty(0, dtype=torch.int32, device=device)
 
@@ -161,6 +163,7 @@ class FlashInferPagedDecodeGraphState:
             paged_kv_indptr_buffer=self.indptr,
             paged_kv_indices_buffer=self.indices,
             paged_kv_last_page_len_buffer=self.last_page_len,
+            fp8_kv=spec.kv_storage_format == "fp8_kv",
         )
         self.sparse_indptr: torch.Tensor | None = None
         self.sparse_indices: torch.Tensor | None = None

@@ -1,10 +1,14 @@
 from __future__ import annotations
 
 import copy
+import math
 
 import torch
 
 from sparseengine.engine.cache_manager.standard import StandardCacheManager
+from sparseengine.engine.cache_manager.quantized import QuantizedCacheManager
+from sparseengine.engine.cache_manager.quantized_pages import QuantizedPagePool
+from sparseengine.engine.cache_manager.storage.quantized_kv import QuantizedKVStorage
 from sparseengine.engine.cache_manager.storage.low_rank_kv import LowRankKVStorage
 from sparseengine.engine.cache_manager.storage import (
     ExplicitKVStorage,
@@ -59,6 +63,38 @@ class PrefillHistoryCacheManager(StandardCacheManager):
         self._allocate(seq.seq_id, int(seq.num_prefilled_tokens))
 
 
+class PrefillHistoryFP8CacheManager(QuantizedCacheManager):
+    """Bounded FP8 pages for startup's synthetic-history prefill measurement."""
+
+    def allocate_kv_cache(self) -> None:
+        config = self.config
+        self.page_size = int(config.kv_quant_page_size)
+        num_pages = math.ceil(int(config.num_kvcache_slots) / self.page_size) + int(config.max_num_seqs_in_batch)
+        config.num_kvcache_slots = num_pages * self.page_size
+        self.page_pool = QuantizedPagePool(num_pages, self.page_size, self.max_model_len)
+        storage = QuantizedKVStorage(
+            format="fp8_kv", bits=8, page_size=self.page_size,
+            num_kv_heads=self.num_kv_heads, head_dim=self.head_dim,
+            dtype=self.hf_config.dtype, seed=0,
+            fp8_scales=config.resolved_fp8_kv_scales,
+        )
+        storage.allocate(num_layers=self.num_kv_layers, num_slots=config.num_kvcache_slots,
+                         num_rows=self.max_buffer_rows, device=self.device)
+        storage.data.zero_()
+        self.attention_cache_storage = storage
+        self.kv_cache = None
+        self.prefill_capacity = 0
+        self.prefill_kv = torch.empty((2, 0, self.num_kv_heads, self.head_dim),
+                                      dtype=self.hf_config.dtype, device=self.device)
+        self.prefill_rotated = None
+        self.prefill_slot_map = torch.empty((0, 0), dtype=torch.int32, device=self.device)
+        self._write_plan = []
+        self._prefill_active = False
+
+    def seed_history(self, seq: Sequence) -> None:
+        self._allocate(seq.seq_id, int(seq.num_prefilled_tokens))
+
+
 @torch.inference_mode()
 def profile_prefill_history(runner):
     """Measure a full token batch with one maximum-context request in one step.
@@ -71,14 +107,17 @@ def profile_prefill_history(runner):
     context_len = int(config.max_model_len) - 1
     chunk_lengths = profiling_prefill_chunk_lengths(config)
     prompt_lengths = (context_len, *chunk_lengths[1:])
-    config.sparse_method = ""
+    fp8_kv = config.sparse_method == "fp8_kv"
+    if not fp8_kv:
+        config.sparse_method = ""
     config.prefill_sparse_method = None
     config.enable_prefix_caching = False
     config.enable_prefix_cache_offload = False
     config.resolved_prefix_cache_mode = "disabled"
     config.startup_cache_phase = "profiling"
     config.num_kvcache_slots = sum(prompt_lengths)
-    manager = PrefillHistoryCacheManager(config, runner.parallel_context)
+    manager_class = PrefillHistoryFP8CacheManager if fp8_kv else PrefillHistoryCacheManager
+    manager = manager_class(config, runner.parallel_context)
     controller = SparseController(config, manager)
     runtime = RuntimeState(config, manager, runner.recurrent_state_manager)
     seqs = []

@@ -574,7 +574,8 @@ class FlashInferPagedDecodeAttentionProvider(DecodeAttentionProvider):
             )
         if not spec.cuda_graph:
             self._state = _FlashInferPagedDecodeState(
-                torch.device("cuda", int(device_index))
+                torch.device("cuda", int(device_index)),
+                fp8_kv=spec.kv_storage_format == "fp8_kv",
             )
 
     def close(self) -> None:

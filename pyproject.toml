@@ -74,6 +74,7 @@ include = ["sparseengine*"]
 [tool.setuptools.package-data]
 sparseengine = [
     "configs/profiles/*.json",
+    "configs/profiles/fp8_kv_scales/*.json",
     "kernels/triton/profiles/*.json",
     "operators/profiles/*.json",
 ]

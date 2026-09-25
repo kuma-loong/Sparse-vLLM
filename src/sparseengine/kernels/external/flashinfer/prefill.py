@@ -124,8 +124,15 @@ def _paged_prefill_wrapper_type(backend: str):
     return wrapper_type, reason
 
 
-def flashinfer_paged_prefill_support(backend: str) -> tuple[bool, str]:
-    _, reason = _paged_prefill_wrapper_type(backend)
+def flashinfer_paged_prefill_support(backend: str, *, fp8_kv: bool = False) -> tuple[bool, str]:
+    wrapper_type, reason = _paged_prefill_wrapper_type(backend)
+    if fp8_kv:
+        _require_parameters(
+            wrapper_type.run,
+            frozenset({"k_scale", "v_scale"}),
+            feature="FP8 paged prefill",
+            entrypoint="BatchPrefillWithPagedKVCacheWrapper.run",
+        )
     return True, reason
 
 
